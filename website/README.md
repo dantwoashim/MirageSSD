@@ -22,6 +22,6 @@ After the custom hostname serves all pages publicly over HTTPS:
 - Terms: `https://miragessd.prabinghimire1.com.np/terms`
 - Authorized domain: `prabinghimire1.com.np`
 
-Verify domain ownership in Google Search Console using the OAuth project's authorized account and Google's exact TXT value. Add that TXT record; never replace unrelated TXT records. Vercel hostname verification is not Google domain verification. Publish the OAuth app only after its configuration is complete. Update the homepage's sign-in notice after production access has been verified.
+Verify domain ownership in Google Search Console using the OAuth project's authorized account and Google's exact TXT value. Add that TXT record; never replace unrelated TXT records. Vercel hostname verification is not Google domain verification. The maintainer reported production OAuth publishing on 5 September 2026; the homepage reflects that status, not a claim of Google brand verification.
 
 Keep policy text consistent with shipped behavior. Do not describe ordinary writable-drive files as client-side encrypted or imply that the website receives Drive data.

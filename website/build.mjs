@@ -1,6 +1,7 @@
 import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, copyFile } from 'node:fs/promises';
+import { Layout, Home } from './components.mjs';
 
 const origin = 'https://miragessd.prabinghimire1.com.np';
 const repo = 'https://github.com/dantwoashim/MirageSSD';
@@ -8,62 +9,10 @@ const updated = '5 September 2026';
 const link = (href, text, className = 'underline hover:text-leaf') => h('a', { href, className }, text);
 const p = (...children) => h('p', { className: 'max-w-[65ch] text-muted leading-relaxed' }, ...children);
 const section = (title, ...children) => h('section', { className: 'space-y-4 border-t border-ink/15 py-8' }, h('h2', { className: 'text-xl font-semibold tracking-tight' }, title), ...children);
-const button = (href, label, secondary = false) => link(href, label, `inline-flex items-center justify-center rounded-full px-6 py-3 font-medium transition-transform active:scale-[.98] ${secondary ? 'border border-ink/25 hover:border-leaf' : 'bg-leaf text-white hover:bg-ink'}`);
 
-function Layout({ title, description, path, children }) {
-  return h('html', { lang: 'en' },
-    h('head', null, h('meta', { charSet: 'utf-8' }), h('meta', { name: 'viewport', content: 'width=device-width, initial-scale=1' }),
-      h('title', null, title), h('meta', { name: 'description', content: description }),
-      h('link', { rel: 'canonical', href: `${origin}${path}` }), h('link', { rel: 'stylesheet', href: '/site.css' }),
-      h('meta', { property: 'og:title', content: title }), h('meta', { property: 'og:description', content: description }),
-      h('meta', { property: 'og:type', content: 'website' }), h('meta', { property: 'og:url', content: `${origin}${path}` })),
-    h('body', null,
-      link('#main', 'Skip to content', 'sr-only focus:not-sr-only focus:block focus:p-4'),
-      h('header', { className: 'mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-5 border-b border-ink/15 px-6 py-6 sm:px-10' },
-        link('/', 'MirageSSD', 'text-xl font-semibold tracking-tight'),
-        h('nav', { 'aria-label': 'Main navigation', className: 'flex flex-wrap gap-5 text-sm' }, link('/#how-it-works', 'How it works'), link('/privacy', 'Privacy'), link(repo, 'Source code'))),
-      h('main', { id: 'main', className: 'mx-auto max-w-6xl px-6 sm:px-10' }, children),
-      h('footer', { className: 'mx-auto mt-14 flex max-w-6xl flex-wrap justify-between gap-6 border-t border-ink/15 px-6 py-8 text-sm text-muted sm:px-10' },
-        h('p', null, 'MirageSSD · An independent open-source project'),
-        h('nav', { 'aria-label': 'Legal and support', className: 'flex flex-wrap gap-5' }, link('/privacy', 'Privacy policy'), link('/terms', 'Terms of use'), link(`${repo}/issues`, 'Support')))));
-}
-
-function Home() {
-  return h('div', null,
-    h('section', { className: 'grid gap-12 py-16 md:grid-cols-[1.35fr_1fr] md:items-center md:py-24' },
-      h('div', { className: 'space-y-7' }, h('p', { className: 'text-xs font-semibold uppercase tracking-[.2em] text-leaf' }, 'Windows 11 · Engineering preview'),
-        h('h1', { className: 'max-w-xl text-4xl font-semibold leading-[1.08] tracking-tight sm:text-6xl' }, 'Your cloud storage.', h('br'), 'A familiar drive.'),
-        p('MirageSSD mounts an application-owned folder in your Google Drive as a writable Windows drive. Open files, save downloads, and move folders from Explorer—with a local cache for recently used data.'),
-        h('div', { className: 'flex flex-wrap gap-3' }, button(`${repo}#get-started`, 'Get started'), button('/#how-it-works', 'Understand the cache', true)),
-        h('p', { className: 'text-sm text-muted' }, 'Open source. Your Google account. Your existing storage quota.')),
-      h('figure', { className: 'rounded-3xl border border-ink/15 bg-white p-7 shadow-sm sm:p-9' },
-        h('figcaption', { className: 'mb-8 text-xs uppercase tracking-[.18em] text-muted' }, 'The storage path · illustration'),
-        ...[['01', 'Windows Explorer', 'Read and write through a drive letter.'], ['02', 'Your local cache', 'Stage writes. Reuse downloaded content.'], ['03', 'Your Google Drive', 'Upload in the background. Fetch when needed.']].map(([n, title, text]) =>
-          h('div', { key: n, className: 'flex gap-5 border-t border-ink/10 py-6' }, h('span', { className: 'font-mono text-sm text-leaf' }, n), h('div', null, h('p', { className: 'mb-1 font-semibold' }, title), h('p', { className: 'text-sm leading-relaxed text-muted' }, text)))))),
-    h('section', { id: 'how-it-works', className: 'grid gap-8 border-t border-ink/15 py-12 md:grid-cols-[1fr_1.6fr]' },
-      h('div', null, h('p', { className: 'mb-4 text-xs uppercase tracking-[.18em] text-leaf' }, 'Built around your disk'), h('h2', { className: 'text-3xl font-semibold tracking-tight' }, 'Fast where cached.', h('br'), 'Honest everywhere.')),
-      h('div', { className: 'space-y-7' }, p('Cached reads use local storage. New writes are staged locally before they reach Google Drive. Uncached reads and completed uploads still depend on your connection and Google’s service limits.'),
-        p('The cache uses real disk space. Pending uploads cannot safely be evicted. A completed copy into the drive is not confirmation that the cloud upload has finished.'),
-        link(`${repo}/blob/main/docs/architecture.md`, 'Read the architecture'))),
-    h('section', { className: 'grid gap-8 border-t border-ink/15 py-12 md:grid-cols-[1fr_1.6fr]' },
-      h('h2', { className: 'text-3xl font-semibold tracking-tight' }, 'A narrow permission.', h('br'), 'A clear boundary.'),
-      h('div', { className: 'space-y-6' }, p('Sign-in happens with Google in your system browser. MirageSSD requests drive.file access to create and manage app-authorized files—not blanket access to all of My Drive. File contents travel between your PC and Google Drive, not through this website.'),
-        p('The writable drive does not add client-side encryption to ordinary files. Local cached files and logs remain on your device. Separate encrypted repository and backup features are distinct from the Explorer drive.'), link('/privacy', 'Read the privacy policy'))),
-    h('section', { className: 'rounded-3xl bg-ink px-7 py-10 text-white sm:px-10' },
-      h('h2', { className: 'mb-4 text-2xl font-semibold tracking-tight' }, 'Try it with files you can afford to replace.'),
-      h('p', { className: 'max-w-[65ch] leading-relaxed text-white/80' }, 'This is a Windows 11 x64 preview, not a certified backup product or a physical SSD replacement. Keep originals until you have verified the remote copy and a restore. Games, databases, and virtual machines should run on native storage.'),
-      h('p', { className: 'mt-5 text-sm text-white/80' }, 'Requires internet, an NTFS volume with at least 12 GiB free, and permission to install WinFsp. macOS and Linux desktop mounting are not supported.')),
-    h('section', { className: 'py-12' }, h('h2', { className: 'mb-6 text-2xl font-semibold tracking-tight' }, 'Before you connect'),
-      ...[
-        ['Does MirageSSD include Google Drive storage?', 'No. It uses the quota of the Google account you connect. It does not provide or increase your storage subscription.'],
-        ['Can I access every existing file in My Drive?', 'No. The preview uses the drive.file scope and an application-owned folder. This is not a full mirror of your existing Drive.'],
-        ['Is sign-in open to everyone yet?', 'Public OAuth setup is being completed. Until the Google project is published, sign-in can remain limited to approved test users.'],
-        ['Where do I get an installer?', 'Follow the repository’s build and installation guide, or use a preview installer supplied by a maintainer. This website does not currently host an installer.']
-      ].map(([question, answer]) => h('details', { key: question, className: 'border-t border-ink/15 py-5' }, h('summary', { className: 'cursor-pointer font-medium' }, question), h('div', { className: 'pt-4' }, p(answer))))));
-}
 
 function Legal({ title, intro, children }) {
-  return h('article', { className: 'mx-auto max-w-3xl py-14 sm:py-20' },
+  return h('article', { className: 'mx-auto max-w-3xl px-6 py-14 sm:py-20' },
     h('p', { className: 'mb-4 text-xs uppercase tracking-[.18em] text-leaf' }, `Last updated · ${updated}`),
     h('h1', { className: 'mb-6 text-4xl font-semibold tracking-tight sm:text-5xl' }, title),
     h('div', { className: 'mb-10' }, p(intro)), children);
@@ -93,6 +42,10 @@ const pages = [
   ['404.html', '/404', 'Page not found — MirageSSD', 'This page could not be found.', h(Legal, { title: 'Page not found', intro: 'That address does not point to a page on this site.' }, link('/', 'Return to MirageSSD'))]
 ];
 await mkdir('dist', { recursive: true });
+await copyFile('node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2', 'dist/geist-latin.woff2');
+await copyFile('node_modules/@fontsource-variable/geist/LICENSE', 'dist/geist-license.txt');
+await copyFile('node_modules/@phosphor-icons/react/LICENSE', 'dist/phosphor-license.txt');
+await writeFile('dist/favicon.svg', '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="10" fill="#202923"/><path d="m10 13 10-5 10 5-10 5zm0 7 10 5 10-5M10 27l10 5 10-5" fill="none" stroke="#e3ebe5" stroke-width="2" stroke-linejoin="round"/></svg>');
 for (const [filename, path, title, description, content] of pages) {
   await writeFile(`dist/${filename}`, '<!doctype html>' + renderToStaticMarkup(h(Layout, { title, description, path }, content)));
 }

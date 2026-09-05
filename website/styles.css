@@ -1,11 +1,30 @@
 @import "tailwindcss";
 @source "./build.mjs";
+@source "./components.mjs";
+@font-face { font-family: Geist; src: url('/geist-latin.woff2') format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }
 @theme {
-  --font-sans: "Segoe UI", system-ui, sans-serif;
+  --font-sans: Geist, "Segoe UI", system-ui, sans-serif;
   --color-ink: #202923;
-  --color-paper: #f6f7f4;
+  --color-paper: #f8f9f7;
+  --color-line: #dfe4df;
   --color-leaf: #30694b;
   --color-muted: #59655d;
+}
+@layer components {
+  .shell { @apply mx-auto max-w-[1200px] px-6 sm:px-10; }
+  .eyebrow { @apply text-[10px] font-medium uppercase tracking-[.18em] text-leaf; }
+  .button { @apply inline-flex min-h-12 items-center justify-center gap-3 rounded-lg border border-transparent bg-leaf px-5 py-3 text-sm font-medium text-white transition-colors hover:bg-ink active:translate-y-px; }
+  .button.secondary { @apply border-line bg-white text-ink hover:border-leaf; }
+  .text-link { @apply inline-flex items-center gap-2 text-sm font-medium text-leaf underline-offset-4 hover:underline; }
+  .brand-mark { @apply relative block h-7 w-7; }
+  .brand-mark i { position: absolute; width: 18px; height: 12px; border: 1.5px solid #30694b; transform: rotate(-30deg) skewX(30deg); left: 5px; top: 2px; border-radius: 2px; background: #f8f9f7; }
+  .brand-mark i:nth-child(1) { top: 14px; }
+  .brand-mark i:nth-child(2) { top: 8px; }
+  .explorer-scene { @apply relative rounded-3xl border border-line px-3 pb-14 pt-8 sm:px-6 sm:pt-12; background-color: #eaf0eb; background-image: radial-gradient(#8b9d8b44 .7px, transparent .7px); background-size: 14px 14px; }
+  .explorer-window { @apply relative overflow-hidden rounded-xl border border-ink/15 bg-white; box-shadow: 0 18px 35px -18px #233f2c55, 0 2px 6px #233f2c0a; }
+  .cache-label { @apply absolute bottom-5 left-6 right-6 flex items-center gap-3 rounded-lg border border-line bg-white px-4 py-3 shadow-sm sm:left-auto sm:right-10; }
+  .faq[open] summary svg { transform: rotate(45deg); }
+  .faq summary::-webkit-details-marker { display: none; }
 }
 @layer base {
   body { @apply bg-paper text-ink antialiased; }
