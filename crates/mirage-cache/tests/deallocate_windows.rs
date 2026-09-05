@@ -43,6 +43,7 @@ fn fill_evict_reclaims_sparse_allocation_and_accounting_stays_bounded() {
 }
 
 #[test]
+#[cfg(windows)]
 fn reports_physical_allocation_for_an_individual_slot() {
     let directory = tempfile::tempdir().expect("directory");
     let layout = CacheLayout {
@@ -68,4 +69,18 @@ fn reports_physical_allocation_for_an_individual_slot() {
         shard.reclaimable_slot_bytes(0).expect("deallocated slot"),
         0
     );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn unsupported_slot_accounting_fails_closed() {
+    let directory = tempfile::tempdir().expect("directory");
+    let layout = CacheLayout {
+        page_size: ByteCount::from_u64(1024 * 1024),
+        slot_count: 2,
+        db_journal_allowance: ByteCount::from_u64(8 * 1024 * 1024),
+        filesystem_reserve: ByteCount::from_u64(16 * 1024 * 1024),
+    };
+    let shard = ArenaShard::create(&directory.path().join("arena.bin"), layout).expect("shard");
+    assert!(shard.reclaimable_slot_bytes(0).is_err());
 }
