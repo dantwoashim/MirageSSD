@@ -1,0 +1,4 @@
+ipc-frame = bytes .size (0..1048576)
+request = { protocol_version: 1, request_id: uint, cancellation_id: uint / null, command: command }
+command = { command: tstr, body: any }
+response = { protocol_version: 1, request_id: uint, body: any }

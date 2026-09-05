@@ -1,0 +1,23 @@
+; Canonical immutable pack index v1. Frames and index entries are bounded by u32 page count.
+
+hash32 = bytes .size 32
+id16 = bytes .size 16
+
+pack-index-v1 = {
+  1: 1,                                      ; format_version
+  2: id16,                                   ; repository_id
+  3: id16,                                   ; pack_id
+  4: 1..4294967295,                          ; page_count
+  5: 1..1073741824,                          ; encoded pack length, max 1 GiB
+  6: hash32,                                 ; whole pack hash
+  7: [1*4294967295 pack-index-entry],
+}
+
+pack-index-entry = {
+  1: hash32,                                 ; plaintext page hash
+  2: 1..16777216,                            ; plaintext length
+  3: uint,                                   ; frame offset
+  4: 1..67108864,                            ; encoded length, max fetch window
+  5: 0..2,                                   ; codec
+  6: uint / null,                            ; encryption metadata index
+}

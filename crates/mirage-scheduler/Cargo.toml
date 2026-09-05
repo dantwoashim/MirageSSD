@@ -1,0 +1,27 @@
+[package]
+name = "mirage-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mirage-types.workspace = true
+mirage-backend.workspace = true
+mirage-cache.workspace = true
+mirage-db.workspace = true
+mirage-pack.workspace = true
+mirage-manifest.workspace = true
+bytes.workspace = true
+futures-executor.workspace = true
+tokio-util.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+mirage-backend-local.workspace = true
+tempfile.workspace = true
+proptest.workspace = true

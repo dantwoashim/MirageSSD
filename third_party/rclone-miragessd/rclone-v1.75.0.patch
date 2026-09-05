@@ -1,0 +1,616 @@
+diff --git a/cmd/cmount/fs.go b/cmd/cmount/fs.go
+index 47d23df..36812b3 100644
+--- a/cmd/cmount/fs.go
++++ b/cmd/cmount/fs.go
+@@ -24,22 +24,24 @@ const fhUnset = ^uint64(0)
+ 
+ // FS represents the top level filing system
+ type FS struct {
+-	VFS       *vfs.VFS
+-	f         fs.Fs
+-	opt       *mountlib.Options
+-	ready     chan (struct{})
+-	mu        sync.Mutex // to protect the below
+-	handles   []vfs.Handle
+-	destroyed atomic.Int32
++	VFS        *vfs.VFS
++	f          fs.Fs
++	opt        *mountlib.Options
++	attributes *attributeStore
++	ready      chan (struct{})
++	mu         sync.Mutex // to protect the below
++	handles    []vfs.Handle
++	destroyed  atomic.Int32
+ }
+ 
+ // NewFS makes a new FS
+ func NewFS(VFS *vfs.VFS, opt *mountlib.Options) *FS {
+ 	fsys := &FS{
+-		VFS:   VFS,
+-		f:     VFS.Fs(),
+-		opt:   opt,
+-		ready: make(chan (struct{})),
++		VFS:        VFS,
++		f:          VFS.Fs(),
++		opt:        opt,
++		attributes: newAttributeStoreFromEnvironment(),
++		ready:      make(chan (struct{})),
+ 	}
+ 	return fsys
+ }
+@@ -157,6 +159,7 @@ func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
+ 	stat.Blksize = 512
+ 	stat.Blocks = int64(Blocks)
+ 	stat.Birthtim = t
++	stat.Flags = fsys.attributes.get(node.Path())
+ 	// fs.Debugf(nil, "stat = %+v", *stat)
+ 	return 0
+ }
+@@ -173,6 +176,9 @@ func (fsys *FS) Init() {
+ func (fsys *FS) Destroy() {
+ 	defer log.Trace(fsys.f, "")("")
+ 	fsys.destroyed.Store(1)
++	if err := fsys.attributes.flush(); err != nil {
++		fs.Errorf(fsys.f, "failed to flush Windows attributes: %v", err)
++	}
+ }
+ 
+ // Getattr reads the attributes for path
+@@ -421,7 +427,13 @@ func (fsys *FS) Unlink(filePath string) (errc int) {
+ 	if errc != 0 {
+ 		return errc
+ 	}
+-	return translateError(parentDir.RemoveName(leaf))
++	err := parentDir.RemoveName(leaf)
++	if err == nil {
++		if attributeErr := fsys.attributes.remove(filePath); attributeErr != nil {
++			fs.Errorf(filePath, "failed to remove Windows attributes: %v", attributeErr)
++		}
++	}
++	return translateError(err)
+ }
+ 
+ // Mkdir creates a directory.
+@@ -442,13 +454,43 @@ func (fsys *FS) Rmdir(dirPath string) (errc int) {
+ 	if errc != 0 {
+ 		return errc
+ 	}
+-	return translateError(parentDir.RemoveName(leaf))
++	err := parentDir.RemoveName(leaf)
++	if err == nil {
++		if attributeErr := fsys.attributes.remove(dirPath); attributeErr != nil {
++			fs.Errorf(dirPath, "failed to remove Windows attributes: %v", attributeErr)
++		}
++	}
++	return translateError(err)
+ }
+ 
+ // Rename renames a file.
+ func (fsys *FS) Rename(oldPath string, newPath string) (errc int) {
+ 	defer log.Trace(oldPath, "newPath=%q", newPath)("errc=%d", &errc)
+-	return translateError(fsys.VFS.Rename(oldPath, newPath))
++	err := fsys.VFS.Rename(oldPath, newPath)
++	if err == nil {
++		if attributeErr := fsys.attributes.rename(oldPath, newPath); attributeErr != nil {
++			fs.Errorf(oldPath, "failed to rename Windows attributes: %v", attributeErr)
++		}
++	}
++	return translateError(err)
++}
++
++// Chflags persists Windows file attributes that cloud object stores do not
++// represent themselves. WinFsp maps these BSD-style flags to the native
++// read-only, hidden, system, and archive attributes shown by Explorer.
++func (fsys *FS) Chflags(filePath string, flags uint32) (errc int) {
++	defer log.Trace(filePath, "flags=0x%X", flags)("errc=%d", &errc)
++	if runtime.GOOS != "windows" {
++		return -fuse.ENOSYS
++	}
++	if _, errc = fsys.lookupNode(filePath); errc != 0 {
++		return errc
++	}
++	if err := fsys.attributes.set(filePath, flags); err != nil {
++		fs.Errorf(filePath, "failed to persist Windows attributes: %v", err)
++		return -fuse.EIO
++	}
++	return 0
+ }
+ 
+ // Windows sometimes seems to send times that are the epoch which is
+@@ -658,7 +700,7 @@ var (
+ 	_ fuse.FileSystemInterface = (*FS)(nil)
+ 	_ fuse.FileSystemOpenEx    = (*FS)(nil)
+ 	_ fuse.FileSystemGetpath   = (*FS)(nil)
+-	//_ fuse.FileSystemChflags    = (*FS)(nil)
++	_ fuse.FileSystemChflags   = (*FS)(nil)
+ 	//_ fuse.FileSystemSetcrtime  = (*FS)(nil)
+ 	//_ fuse.FileSystemSetchgtime = (*FS)(nil)
+ )
+diff --git a/cmd/cmount/attributes.go b/cmd/cmount/attributes.go
+new file mode 100644
+index 0000000..a3d1571
+--- /dev/null
++++ b/cmd/cmount/attributes.go
+@@ -0,0 +1,374 @@
++//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
++
++package cmount
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++)
++
++const (
++	attributeStoreEnvironment    = "MIRAGESSD_ATTRIBUTES_FILE"
++	attributeStoreVersion        = 2
++	maximumAttributeStoreSize    = 256 << 20
++	attributeCompactionThreshold = 32 << 20
++)
++
++type attributeStoreRecord struct {
++	FormatVersion int `json:"format_version"`
++}
++
++type legacyAttributeStoreRecord struct {
++	FormatVersion int               `json:"format_version"`
++	Entries       map[string]uint32 `json:"entries"`
++}
++
++type attributeOperation struct {
++	Operation string            `json:"op"`
++	Path      string            `json:"path,omitempty"`
++	NewPath   string            `json:"new_path,omitempty"`
++	Flags     uint32            `json:"flags,omitempty"`
++	Entries   map[string]uint32 `json:"entries,omitempty"`
++}
++
++type attributeStore struct {
++	mu          sync.RWMutex
++	path        string
++	entries     map[string]uint32
++	initialized bool
++	loadErr     error
++}
++
++func newAttributeStoreFromEnvironment() *attributeStore {
++	store := &attributeStore{entries: make(map[string]uint32)}
++	store.path = os.Getenv(attributeStoreEnvironment)
++	if store.path == "" {
++		return store
++	}
++	info, err := os.Stat(store.path)
++	if errors.Is(err, os.ErrNotExist) {
++		return store
++	}
++	if err != nil {
++		store.loadErr = err
++		return store
++	}
++	if info.Size() > maximumAttributeStoreSize {
++		store.loadErr = errors.New("attribute store exceeds size limit")
++		return store
++	}
++	data, err := os.ReadFile(store.path)
++	if err != nil {
++		store.loadErr = err
++		return store
++	}
++	if store.loadLegacy(data) {
++		if err := store.compactLocked(); err != nil {
++			store.loadErr = err
++		}
++		return store
++	}
++	if err := store.loadJournal(data); err != nil {
++		store.loadErr = err
++		return store
++	}
++	store.initialized = true
++	if info.Size() >= attributeCompactionThreshold {
++		if err := store.compactLocked(); err != nil {
++			store.loadErr = err
++		}
++	}
++	return store
++}
++
++func (store *attributeStore) loadLegacy(data []byte) bool {
++	var record legacyAttributeStoreRecord
++	if json.Unmarshal(data, &record) != nil || record.FormatVersion != 1 || record.Entries == nil {
++		return false
++	}
++	store.entries = record.Entries
++	return true
++}
++
++func (store *attributeStore) loadJournal(data []byte) error {
++	lines := bytes.Split(data, []byte{'\n'})
++	if len(lines) == 0 || len(bytes.TrimSpace(lines[0])) == 0 {
++		return errors.New("attribute journal is empty")
++	}
++	var header attributeStoreRecord
++	if err := json.Unmarshal(lines[0], &header); err != nil {
++		return err
++	}
++	if header.FormatVersion != attributeStoreVersion {
++		return errors.New("unsupported attribute store format")
++	}
++	for index, line := range lines[1:] {
++		if len(bytes.TrimSpace(line)) == 0 {
++			continue
++		}
++		var operation attributeOperation
++		if err := json.Unmarshal(line, &operation); err != nil {
++			if index == len(lines)-2 && !bytes.HasSuffix(data, []byte{'\n'}) {
++				break
++			}
++			return err
++		}
++		if err := store.replayLocked(operation); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func normalizeAttributePath(value string) string {
++	value = strings.TrimSuffix(strings.ReplaceAll(value, `\`, "/"), "/")
++	if value == "" {
++		value = "/"
++	}
++	if !strings.HasPrefix(value, "/") {
++		value = "/" + value
++	}
++	if runtime.GOOS == "windows" {
++		value = strings.ToLower(value)
++	}
++	return value
++}
++
++func (store *attributeStore) get(filePath string) uint32 {
++	if store == nil || store.path == "" || store.loadErr != nil {
++		return 0
++	}
++	store.mu.RLock()
++	defer store.mu.RUnlock()
++	return store.entries[normalizeAttributePath(filePath)]
++}
++
++func (store *attributeStore) set(filePath string, flags uint32) error {
++	if store == nil || store.path == "" {
++		return nil
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.loadErr != nil {
++		return store.loadErr
++	}
++	key := normalizeAttributePath(filePath)
++	previous, existed := store.entries[key]
++	if flags == 0 {
++		delete(store.entries, key)
++	} else {
++		store.entries[key] = flags
++	}
++	err := store.appendLocked(attributeOperation{
++		Operation: "set",
++		Path:      key,
++		Flags:     flags,
++	})
++	if err != nil {
++		if existed {
++			store.entries[key] = previous
++		} else {
++			delete(store.entries, key)
++		}
++	}
++	return err
++}
++
++func (store *attributeStore) remove(filePath string) error {
++	if store == nil || store.path == "" {
++		return nil
++	}
++	if store.loadErr != nil {
++		return store.loadErr
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	prefix := normalizeAttributePath(filePath)
++	store.removePrefixLocked(prefix)
++	return store.appendLocked(attributeOperation{Operation: "remove", Path: prefix})
++}
++
++func (store *attributeStore) rename(oldPath string, newPath string) error {
++	if store == nil || store.path == "" {
++		return nil
++	}
++	if store.loadErr != nil {
++		return store.loadErr
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	oldPrefix := normalizeAttributePath(oldPath)
++	newPrefix := normalizeAttributePath(newPath)
++	store.renamePrefixLocked(oldPrefix, newPrefix)
++	return store.appendLocked(attributeOperation{
++		Operation: "rename",
++		Path:      oldPrefix,
++		NewPath:   newPrefix,
++	})
++}
++
++func (store *attributeStore) replayLocked(operation attributeOperation) error {
++	switch operation.Operation {
++	case "snapshot":
++		if operation.Entries == nil {
++			return errors.New("attribute snapshot has no entries")
++		}
++		store.entries = operation.Entries
++	case "set":
++		if operation.Path == "" {
++			return errors.New("attribute set has no path")
++		}
++		if operation.Flags == 0 {
++			delete(store.entries, operation.Path)
++		} else {
++			store.entries[operation.Path] = operation.Flags
++		}
++	case "remove":
++		if operation.Path == "" {
++			return errors.New("attribute removal has no path")
++		}
++		store.removePrefixLocked(operation.Path)
++	case "rename":
++		if operation.Path == "" || operation.NewPath == "" {
++			return errors.New("attribute rename has an incomplete path")
++		}
++		store.renamePrefixLocked(operation.Path, operation.NewPath)
++	default:
++		return errors.New("attribute journal contains an unknown operation")
++	}
++	return nil
++}
++
++func (store *attributeStore) removePrefixLocked(prefix string) {
++	childPrefix := prefix + "/"
++	for key := range store.entries {
++		if key == prefix || strings.HasPrefix(key, childPrefix) {
++			delete(store.entries, key)
++		}
++	}
++}
++
++func (store *attributeStore) renamePrefixLocked(oldPrefix string, newPrefix string) {
++	childPrefix := oldPrefix + "/"
++	moved := make(map[string]uint32)
++	for key, flags := range store.entries {
++		if key == oldPrefix {
++			moved[newPrefix] = flags
++			delete(store.entries, key)
++		} else if strings.HasPrefix(key, childPrefix) {
++			moved[newPrefix+strings.TrimPrefix(key, oldPrefix)] = flags
++			delete(store.entries, key)
++		}
++	}
++	for key, flags := range moved {
++		store.entries[key] = flags
++	}
++}
++
++func (store *attributeStore) appendLocked(operation attributeOperation) error {
++	if !store.initialized {
++		if err := store.compactLocked(); err != nil {
++			return err
++		}
++	}
++	data, err := json.Marshal(operation)
++	if err != nil {
++		return err
++	}
++	data = append(data, '\n')
++	file, err := os.OpenFile(store.path, os.O_APPEND|os.O_WRONLY, 0o600)
++	if err != nil {
++		return err
++	}
++	_, err = file.Write(data)
++	closeErr := file.Close()
++	if err != nil {
++		return err
++	}
++	return closeErr
++}
++
++// flush makes the attribute journal durable at a clean unmount. Individual
++// updates deliberately use the Windows write cache: forcing a physical flush
++// for every SetFileAttributes call serializes Explorer's small-file copy path.
++func (store *attributeStore) flush() error {
++	if store == nil || store.path == "" {
++		return nil
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.loadErr != nil {
++		return store.loadErr
++	}
++	if !store.initialized {
++		return nil
++	}
++	file, err := os.OpenFile(store.path, os.O_WRONLY, 0o600)
++	if err != nil {
++		return err
++	}
++	syncErr := file.Sync()
++	closeErr := file.Close()
++	if syncErr != nil {
++		return syncErr
++	}
++	return closeErr
++}
++
++func (store *attributeStore) compactLocked() error {
++	header, err := json.Marshal(attributeStoreRecord{FormatVersion: attributeStoreVersion})
++	if err != nil {
++		return err
++	}
++	snapshot, err := json.Marshal(attributeOperation{
++		Operation: "snapshot",
++		Entries:   store.entries,
++	})
++	if err != nil {
++		return err
++	}
++	data := make([]byte, 0, len(header)+len(snapshot)+2)
++	data = append(data, header...)
++	data = append(data, '\n')
++	data = append(data, snapshot...)
++	data = append(data, '\n')
++	if len(data) > maximumAttributeStoreSize {
++		return errors.New("attribute store exceeds size limit")
++	}
++	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
++		return err
++	}
++	temporary, err := os.CreateTemp(filepath.Dir(store.path), ".miragessd-attributes-*.tmp")
++	if err != nil {
++		return err
++	}
++	temporaryPath := temporary.Name()
++	committed := false
++	defer func() {
++		_ = temporary.Close()
++		if !committed {
++			_ = os.Remove(temporaryPath)
++		}
++	}()
++	if _, err = temporary.Write(data); err != nil {
++		return err
++	}
++	if err = temporary.Sync(); err != nil {
++		return err
++	}
++	if err = temporary.Close(); err != nil {
++		return err
++	}
++	if err = os.Rename(temporaryPath, store.path); err != nil {
++		return err
++	}
++	committed = true
++	store.initialized = true
++	return nil
++}
+diff --git a/cmd/cmount/attributes_test.go b/cmd/cmount/attributes_test.go
+new file mode 100644
+index 0000000..ff85ea7
+--- /dev/null
++++ b/cmd/cmount/attributes_test.go
+@@ -0,0 +1,102 @@
++//go:build cmount && windows
++
++package cmount
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestAttributeStoreJournalRoundTrip(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "attributes.jsonl")
++	t.Setenv(attributeStoreEnvironment, path)
++	store := newAttributeStoreFromEnvironment()
++	if err := store.set(`/Folder/Hidden.txt`, 0x9800); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.set(`/Folder/Second.txt`, 0x800); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.rename(`/Folder`, `/Renamed`); err != nil {
++		t.Fatal(err)
++	}
++	if got := store.get(`/RENAMED/HIDDEN.TXT`); got != 0x9800 {
++		t.Fatalf("renamed flags = 0x%X", got)
++	}
++	reloaded := newAttributeStoreFromEnvironment()
++	if got := reloaded.get(`/renamed/hidden.txt`); got != 0x9800 {
++		t.Fatalf("reloaded flags = 0x%X", got)
++	}
++	if err := reloaded.remove(`/renamed`); err != nil {
++		t.Fatal(err)
++	}
++	if err := reloaded.flush(); err != nil {
++		t.Fatal(err)
++	}
++	if got := newAttributeStoreFromEnvironment().get(`/renamed/hidden.txt`); got != 0 {
++		t.Fatalf("removed flags = 0x%X", got)
++	}
++}
++
++func TestAttributeStoreMigratesLegacySnapshot(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "attributes.jsonl")
++	t.Setenv(attributeStoreEnvironment, path)
++	legacy := `{"format_version":1,"entries":{"/hidden":32768}}`
++	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	store := newAttributeStoreFromEnvironment()
++	if store.loadErr != nil {
++		t.Fatal(store.loadErr)
++	}
++	if got := store.get(`/hidden`); got != 32768 {
++		t.Fatalf("migrated flags = %d", got)
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.HasPrefix(string(data), `{"format_version":2}`+"\n") {
++		t.Fatalf("legacy store was not migrated: %s", data)
++	}
++}
++
++func TestAttributeStoreIgnoresOnlyTruncatedFinalRecord(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "attributes.jsonl")
++	t.Setenv(attributeStoreEnvironment, path)
++	data := fmt.Sprintf(
++		"%s\n%s\n%s",
++		`{"format_version":2}`,
++		`{"op":"set","path":"/kept","flags":32768}`,
++		`{"op":"set","path":"/truncated"`,
++	)
++	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	store := newAttributeStoreFromEnvironment()
++	if store.loadErr != nil {
++		t.Fatal(store.loadErr)
++	}
++	if got := store.get(`/kept`); got != 32768 {
++		t.Fatalf("flags before truncated tail = %d", got)
++	}
++}
++
++func BenchmarkAttributeStoreSet(b *testing.B) {
++	path := filepath.Join(b.TempDir(), "attributes.jsonl")
++	b.Setenv(attributeStoreEnvironment, path)
++	store := newAttributeStoreFromEnvironment()
++	b.ResetTimer()
++	for index := 0; index < b.N; index++ {
++		if err := store.set(fmt.Sprintf(`/file-%d`, index), 0x8000); err != nil {
++			b.Fatal(err)
++		}
++	}
++	b.StopTimer()
++	if err := store.flush(); err != nil {
++		b.Fatal(err)
++	}
++}

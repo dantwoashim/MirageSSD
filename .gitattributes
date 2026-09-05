@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.patch whitespace=-blank-at-eol,-space-before-tab
+*.bin binary
+*.cbor binary
+*.midx binary
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=lf

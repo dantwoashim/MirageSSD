@@ -1,0 +1,52 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="MirageSSD">
+        <Directory Id="UIROOT" Name="ui">
+          <Directory Id="UIASSETS" Name="assets" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="MirageSSD" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAROOT" Name="MirageSSD" />
+    </StandardDirectory>
+  </Fragment>
+  <Fragment>
+    <ComponentGroup Id="MirageComponents" Directory="INSTALLFOLDER">
+      <Component Id="CliComponent" Guid="B73D6501-06FD-4D30-B3DE-2DC6B9B4077D" Bitness="always64">
+        <File Id="MirageCli" Source="$(var.BinDir)\mirage.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ServiceComponent" Guid="2D6E93D1-3FCA-4EC6-A6B1-F99C40548A32" Bitness="always64">
+        <File Id="MirageService" Source="$(var.BinDir)\mirage-service.exe" KeyPath="yes" />
+        <ServiceInstall Id="MirageServiceInstall" Name="MirageSSD" DisplayName="MirageSSD Service" Description="MirageSSD repository and mount coordinator" Start="auto" Type="ownProcess" ErrorControl="normal" Account="LocalSystem">
+          <PermissionEx Sddl="D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;BA)" />
+        </ServiceInstall>
+        <ServiceControl Id="MirageServiceControl" Name="MirageSSD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="FilesystemHostComponent" Guid="B4DD6030-12F7-4C33-85B2-C315DB9B0F66" Bitness="always64">
+        <File Id="MirageFilesystemHost" Source="$(var.BinDir)\mirage-fs.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="UiHostComponent" Guid="731D5096-1959-4482-9F57-9219BC9680D2" Bitness="always64">
+        <File Id="MirageUiHost" Source="$(var.BinDir)\mirage-ui.exe" KeyPath="yes">
+          <Shortcut Id="MirageStartMenuShortcut" Directory="ApplicationProgramsFolder" Name="MirageSSD" Description="Open MirageSSD management" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+      </Component>
+      <Component Id="UiIndexComponent" Directory="UIROOT" Guid="382888AB-4D47-47EB-BAFB-2476320F632D" Bitness="always64">
+        <File Id="MirageUiIndex" Source="$(var.UiDir)\index.html" KeyPath="yes" />
+      </Component>
+      <Component Id="UiAssetsComponent" Directory="UIASSETS" Guid="34BF76B1-FA0C-4541-8060-7A23FA93AC81" Bitness="always64">
+        <File Id="MirageUiJavaScript" Source="$(var.UiDir)\assets\mirage-ui.js" KeyPath="yes" />
+        <File Id="MirageUiStyles" Source="$(var.UiDir)\assets\mirage-ui.css" />
+      </Component>
+      <Component Id="DataRootComponent" Directory="DATAROOT" Guid="865888DE-20BB-409F-9A81-C6694ED48671" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

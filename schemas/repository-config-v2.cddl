@@ -1,0 +1,21 @@
+; MirageSSD repository configuration v2. Unknown fields are rejected.
+; Global bounds: identifiers <= 1024 UTF-8 bytes, labels <= 255 bytes.
+
+hash32 = bytes .size 32
+id16 = bytes .size 16
+
+repository-config-v2 = {
+  1: 2,                              ; format_version
+  2: id16,                           ; repository_id
+  3: uint,                           ; page_size, 64 KiB..16 MiB power of two
+  4: uint,                           ; created_utc_ns, <= 2^63-1
+  5: tstr .size (1..255),            ; display label (not object identity)
+  6: [1*8 backend-descriptor],       ; ordered immutable-object sources
+  7: hash32,                         ; repository signing-key fingerprint
+}
+
+backend-descriptor = {
+  1: tstr .size (1..64),             ; backend_id
+  2: tstr .size (1..64),             ; backend_kind
+  3: bool,                           ; writable on this device
+}

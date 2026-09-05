@@ -1,0 +1,13 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <Property Id="WINFSP_INSTALLED">
+      <RegistrySearch Id="FindWinFsp" Root="HKLM" Key="SOFTWARE\WOW6432Node\WinFsp" Name="InstallDir" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="WINFSP_VERSION">
+      <RegistrySearch Id="FindWinFspVersion" Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{C79D9B29-3AF0-45B3-9DB9-226F3C2D2204}" Name="DisplayVersion" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="WINDOWS_BUILD">
+      <RegistrySearch Id="FindWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
+    </Property>
+  </Fragment>
+</Wix>

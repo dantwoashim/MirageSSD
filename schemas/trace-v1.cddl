@@ -1,0 +1,3 @@
+trace-header = { 1: 1, 2: bstr .size 16, 3: uint, 4: uint, 5: tstr, 6: uint }
+trace-block = { 1: uint, 2: [* trace-event] }
+trace-event = [uint, uint, uint, uint, uint]

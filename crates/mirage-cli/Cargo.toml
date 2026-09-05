@@ -1,0 +1,48 @@
+[package]
+name = "mirage-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+clap = { workspace = true }
+futures-executor.workspace = true
+getrandom.workspace = true
+mirage-backend.workspace = true
+mirage-backend-local.workspace = true
+mirage-backend-drive.workspace = true
+mirage-cache.workspace = true
+mirage-config = { workspace = true }
+mirage-crypto.workspace = true
+mirage-db = { workspace = true }
+mirage-engine.workspace = true
+mirage-index.workspace = true
+mirage-ipc.workspace = true
+mirage-manifest = { workspace = true, features = ["test-signing"] }
+mirage-pack = { workspace = true }
+mirage-predictor.workspace = true
+mirage-simulator.workspace = true
+mirage-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-util.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "mirage"
+path = "src/main.rs"

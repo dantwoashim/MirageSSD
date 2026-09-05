@@ -1,0 +1,57 @@
+; Canonical manifest v2. Integer keys are emitted in ascending order.
+; Exact maps reject unknown and duplicate keys.
+
+hash32 = bytes .size 32
+id16 = bytes .size 16
+
+manifest-v2 = {
+  1: 2,                                      ; format_version
+  2: id16,                                   ; repository_id
+  3: uint,                                   ; generation_id
+  4: 65536..16777216,                        ; page_size
+  5: [1*1000000 directory-record],
+  6: [0*1000000 file-record],
+  7: [0*16000000 extent-record],
+  8: [0*16000000 page-record],
+  9: [0*16000000 remote-location],
+}
+
+directory-record = {
+  1: uint / null,                            ; parent index; root uses null
+  2: tstr .size (0..255),                    ; one safe path component; root empty
+}
+
+file-record = {
+  1: uint,                                   ; parent directory index
+  2: tstr .size (1..255),                    ; one safe path component
+  3: 0..9223372036854775807,                 ; logical byte length
+  4: uint,                                   ; stable file id
+  5: 0..5,                                   ; file class
+  6: uint,                                   ; extent_start
+  7: uint,                                   ; extent_count
+}
+
+extent-record = {
+  1: uint,                                   ; logical offset
+  2: 1..9223372036854775807,                 ; logical length
+  3: uint,                                   ; page_start
+  4: 1..4294967295,                          ; page_count
+}
+
+page-record = {
+  1: hash32,                                 ; plaintext logical page hash
+  2: 1..16777216,                            ; plaintext logical length
+  3: uint,                                   ; remote location index
+}
+
+remote-location = {
+  1: tstr .size (1..64),                     ; backend id
+  2: tstr .size (1..1024),                   ; provider object id
+  3: tstr .size (1..512) / null,             ; immutable revision identity
+  4: 1..18446744073709551615,                ; immutable object byte length
+  5: hash32,                                 ; whole encoded object hash
+  6: 0..4,                                   ; immutable object kind
+  7: uint,                                   ; encoded range offset
+  8: 1..18446744073709551615,                ; encoded range length
+  9: 0..2,                                   ; codec
+}

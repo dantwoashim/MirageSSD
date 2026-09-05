@@ -1,0 +1,12 @@
+capsule-v1 = {
+  capsule_id: bstr .size 16,
+  repository_id: bstr .size 16,
+  generation_id: bstr .size 16,
+  profile_key: tstr,
+  page_size: uint,
+  pages: [* uint],
+  mandatory: [* uint],
+  frontier: [* uint],
+  risk: { held_out: uint, unseen_branch: uint, data_quality: uint, transfer_confidence: uint },
+  reasons: [* { cluster_id: uint, kind: tstr, pages: [* uint], evidence: uint }]
+}

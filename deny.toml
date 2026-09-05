@@ -1,0 +1,35 @@
+[graph]
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[licenses]
+unlicensed = "deny"
+# Accepted licenses for MirageSSD dependencies
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "ISC",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+# Note on WinFsp:
+# WinFsp native user-mode library and driver distribution/licensing (GPLv3 with FLOSS exception)
+# is tracked separately from Rust crates and will be reviewed under a dedicated native adapter ADR.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

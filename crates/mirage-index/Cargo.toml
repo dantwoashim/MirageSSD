@@ -1,0 +1,32 @@
+[package]
+name = "mirage-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+fixture-gen = []
+
+[dependencies]
+blake3.workspace = true
+memmap2.workspace = true
+mirage-backend.workspace = true
+mirage-manifest.workspace = true
+mirage-types.workspace = true
+smallvec.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+memory-stats = "1.2"
+
+[[bin]]
+name = "generate-index-fixture"
+path = "src/bin/generate_index_fixture.rs"
+required-features = ["fixture-gen"]

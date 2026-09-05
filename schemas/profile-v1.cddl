@@ -1,0 +1,27 @@
+; Deterministic access profile v1. Unknown fields and unbounded event streams are rejected.
+
+hash32 = bytes .size 32
+id16 = bytes .size 16
+
+profile-v1 = {
+  1: 1,                                      ; format_version
+  2: id16,                                   ; repository_id
+  3: hash32,                                 ; manifest hash
+  4: tstr .size (1..255),                    ; profile label
+  5: [1*10000000 page-observation],
+  6: [0*1000000 process-record],
+  7: 0..18446744073709551615,                ; dropped event count
+}
+
+page-observation = {
+  1: uint,                                   ; file index
+  2: uint,                                   ; page ordinal
+  3: uint,                                   ; first-touch timestamp delta us
+  4: 0..6,                                   ; source/priority class
+}
+
+process-record = {
+  1: uint,                                   ; process-local stable index
+  2: 0..6,                                   ; process role
+  3: tstr .size (0..32767),                  ; redacted logical image path
+}

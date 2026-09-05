@@ -1,0 +1,39 @@
+[package]
+name = "mirage-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+mirage-backend.workspace = true
+mirage-manifest.workspace = true
+mirage-pack.workspace = true
+mirage-cache.workspace = true
+mirage-scheduler.workspace = true
+mirage-index.workspace = true
+mirage-predictor.workspace = true
+roaring.workspace = true
+mirage-db.workspace = true
+mirage-types.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+mirage-crypto.workspace = true
+mirage-backend-local.workspace = true
+mirage-fault-inject = { path = "../../tools/fault-inject" }
+mirage-manifest = { workspace = true, features = ["test-signing"] }
+tempfile.workspace = true
+
+[[bench]]
+name = "read_engine"
+harness = false

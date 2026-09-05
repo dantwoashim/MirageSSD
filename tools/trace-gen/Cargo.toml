@@ -1,0 +1,18 @@
+[package]
+name = "mirage-trace-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+mirage-predictor.workspace = true
+mirage-types.workspace = true
+
+[[bin]]
+name = "mirage-trace-gen"
+path = "src/main.rs"

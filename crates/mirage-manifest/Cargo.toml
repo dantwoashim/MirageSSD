@@ -1,0 +1,33 @@
+[package]
+name = "mirage-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+test-signing = []
+fixture-gen = []
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+minicbor.workspace = true
+mirage-backend.workspace = true
+mirage-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+same-file.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "generate-manifest-fixtures"
+path = "src/bin/generate_manifest_fixtures.rs"
+required-features = ["fixture-gen"]

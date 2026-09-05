@@ -1,0 +1,37 @@
+; Signed append-only repository commit v1. LATEST is intentionally absent.
+
+hash32 = bytes .size 32
+id16 = bytes .size 16
+
+commit-v1 = {
+  1: unsigned-commit-body,
+  2: signature-envelope,
+}
+
+unsigned-commit-body = {
+  1: 1,                                      ; format_version
+  2: id16,                                   ; repository_id
+  3: uint,                                   ; sequence
+  4: hash32 / null,                          ; parent commit hash
+  5: hash32,                                 ; canonical manifest hash
+  6: remote-object-ref,                      ; immutable manifest object
+  7: hash32,                                 ; referenced pack-set hash
+  8: -9223372036854775808..9223372036854775807, ; created_utc_ns
+  9: id16,                                   ; writer_device_id
+  10: id16 / null,                           ; update journal id
+}
+
+remote-object-ref = {
+  1: tstr .size (1..64),
+  2: tstr .size (1..1024),
+  3: tstr .size (1..512) / null,
+  4: 1..18446744073709551615,
+  5: hash32,
+  6: 0..4,
+}
+
+signature-envelope = {
+  1: uint,                                   ; registered algorithm id
+  2: id16,                                   ; signing key id
+  3: bytes .size (1..128),                   ; signature
+}

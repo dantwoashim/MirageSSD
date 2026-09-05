@@ -1,0 +1,18 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="MirageSSD" Manufacturer="MirageSSD" Version="$(var.ProductVersion)" ProductCode="$(var.ProductCode)" UpgradeCode="D9208A1A-218D-4C80-AB41-704DFF8B3485" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer MirageSSD version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <PropertyRef Id="WINDOWS_BUILD" />
+    <PropertyRef Id="WINFSP_INSTALLED" />
+    <PropertyRef Id="WINFSP_VERSION" />
+    <Launch Condition="WINDOWS_BUILD &gt;= 22000" Message="MirageSSD requires Windows 11 build 22000 or newer." />
+    <Launch Condition="WINFSP_INSTALLED AND WINFSP_VERSION = &quot;2.1.25156&quot;" Message="MirageSSD requires the signed WinFsp 2.1.25156 runtime." />
+    <Feature Id="Main" Title="MirageSSD" Level="1">
+      <ComponentGroupRef Id="MirageComponents" />
+    </Feature>
+    <CustomAction Id="BlockUnsafeUninstall" FileRef="MirageService" ExeCommand="--uninstall-check &quot;[CommonAppDataFolder]MirageSSD&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="BlockUnsafeUninstall" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

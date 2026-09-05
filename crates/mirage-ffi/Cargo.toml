@@ -1,0 +1,26 @@
+[package]
+name="mirage-ffi"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+rust-version.workspace=true
+publish=false
+[lib]
+crate-type=["rlib","staticlib","cdylib"]
+[lints]
+workspace=true
+[dependencies]
+mirage-types.workspace=true
+mirage-index.workspace=true
+mirage-pack.workspace=true
+mirage-crypto.workspace=true
+mirage-cache.workspace=true
+mirage-db.workspace=true
+[dev-dependencies]
+mirage-manifest.workspace=true
+mirage-types.workspace=true
+tempfile.workspace=true
+blake3.workspace=true
+memmap2.workspace=true
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

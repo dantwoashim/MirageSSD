@@ -1,0 +1,110 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/mirage-types",
+    "crates/mirage-config",
+    "crates/mirage-backend",
+    "crates/mirage-backend-local",
+    "crates/mirage-cache",
+    "crates/mirage-engine",
+    "crates/mirage-manifest",
+    "crates/mirage-index",
+    "crates/mirage-db",
+    "crates/mirage-pack",
+    "crates/mirage-predictor",
+    "crates/mirage-simulator",
+    "crates/mirage-scheduler",
+    "crates/mirage-ffi",
+    "crates/mirage-service",
+    "crates/mirage-crypto",
+    "crates/mirage-backend-drive",
+    "crates/mirage-etw",
+    "crates/mirage-ipc",
+    "crates/mirage-observability",
+    "crates/mirage-cli",
+    "crates/mirage-ui-host",
+    "tools/corpus-gen",
+    "tools/trace-gen",
+    "tools/fault-inject",
+    "tools/bench-runner",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["MirageSSD Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/dantwoashim/MirageSSD"
+rust-version = "1.94.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+# Workspace internal crates
+mirage-types = { path = "crates/mirage-types", version = "0.1.0" }
+mirage-config = { path = "crates/mirage-config", version = "0.1.0" }
+mirage-backend = { path = "crates/mirage-backend", version = "0.1.0" }
+mirage-backend-local = { path = "crates/mirage-backend-local", version = "0.1.0" }
+mirage-cache = { path = "crates/mirage-cache", version = "0.1.0" }
+mirage-engine = { path = "crates/mirage-engine", version = "0.1.0" }
+mirage-manifest = { path = "crates/mirage-manifest", version = "0.1.0" }
+mirage-index = { path = "crates/mirage-index", version = "0.1.0" }
+mirage-db = { path = "crates/mirage-db", version = "0.1.0" }
+mirage-pack = { path = "crates/mirage-pack", version = "0.1.0" }
+mirage-predictor = { path = "crates/mirage-predictor", version = "0.1.0" }
+mirage-simulator = { path = "crates/mirage-simulator", version = "0.1.0" }
+mirage-scheduler = { path = "crates/mirage-scheduler", version = "0.1.0" }
+mirage-ffi = { path = "crates/mirage-ffi", version = "0.1.0" }
+mirage-service = { path = "crates/mirage-service", version = "0.1.0" }
+mirage-crypto = { path = "crates/mirage-crypto", version = "0.1.0" }
+mirage-backend-drive = { path = "crates/mirage-backend-drive", version = "0.1.0" }
+mirage-etw = { path = "crates/mirage-etw", version = "0.1.0" }
+mirage-ipc = { path = "crates/mirage-ipc", version = "0.1.0" }
+mirage-observability = { path = "crates/mirage-observability", version = "0.1.0" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+futures-core = "0.3"
+futures-executor = "0.3"
+futures-util = "0.3"
+tokio-util = "0.7"
+minicbor = { version = "2.3", features = ["std"] }
+walkdir = "2.5"
+same-file = "1.0"
+memmap2 = "0.9"
+smallvec = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# Cryptography & Hashing
+blake3 = "1.5"
+crc32fast = "1.4"
+ed25519-dalek = "2.2"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Testing
+proptest = "1.6"
+tempfile = "3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-service = "0.8.1"
+base64 = "0.22"
+zeroize = { version = "1.8", features = ["derive"] }
+getrandom = "0.3"
+sha2 = "0.10"
+url = "2.5"
+roaring = { version = "0.11.5", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

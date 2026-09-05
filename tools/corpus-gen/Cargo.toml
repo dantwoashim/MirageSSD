@@ -1,0 +1,20 @@
+[package]
+name = "mirage-corpus-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+blake3.workspace = true
+mirage-pack.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

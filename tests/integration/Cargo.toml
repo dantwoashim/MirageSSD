@@ -1,0 +1,30 @@
+[package]
+name = "mirage-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+mirage-backend-local.workspace = true
+mirage-corpus-gen = { path = "../../tools/corpus-gen" }
+mirage-engine.workspace = true
+mirage-cache.workspace = true
+mirage-db.workspace = true
+mirage-index.workspace = true
+mirage-manifest = { workspace = true, features = ["test-signing"] }
+mirage-pack.workspace = true
+mirage-predictor.workspace = true
+mirage-simulator.workspace = true
+mirage-types.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
+mirage-fault-inject = { path = "../../tools/fault-inject" }
+async-trait.workspace = true
+roaring.workspace = true
+tokio-util.workspace = true
