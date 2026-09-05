@@ -1,0 +1,16 @@
+{
+  "name": "miragessd-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs && tailwindcss -i styles.css -o dist/site.css --minify"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "tailwindcss": "4.3.3",
+    "@tailwindcss/cli": "4.3.3"
+  }
+}

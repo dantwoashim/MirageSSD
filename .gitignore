@@ -6,6 +6,7 @@ out/
 node_modules/
 .npm-cache/
 .tools/
+.vercel/
 CMakeFiles/
 CMakeCache.txt
 CMakeUserPresets.json

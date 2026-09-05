@@ -1,0 +1,15 @@
+@import "tailwindcss";
+@source "./build.mjs";
+@theme {
+  --font-sans: "Segoe UI", system-ui, sans-serif;
+  --color-ink: #202923;
+  --color-paper: #f6f7f4;
+  --color-leaf: #30694b;
+  --color-muted: #59655d;
+}
+@layer base {
+  body { @apply bg-paper text-ink antialiased; }
+  a { @apply underline-offset-4; }
+  a:focus-visible, summary:focus-visible { outline: 3px solid #30694b; outline-offset: 5px; }
+  ::selection { background: #d6e7d9; }
+}
