@@ -16,16 +16,10 @@ impl RootFilter {
         })
     }
     pub fn include(&self, path: &Path) -> Option<PathBuf> {
-        let absolute = path.canonicalize().ok().or_else(|| {
-            #[cfg(windows)]
-            {
-                self.translate_kernel_path(path)?.canonicalize().ok()
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        })?;
+        let absolute = path.canonicalize().ok();
+        #[cfg(windows)]
+        let absolute = absolute.or_else(|| self.translate_kernel_path(path)?.canonicalize().ok());
+        let absolute = absolute?;
         absolute
             .strip_prefix(&self.root)
             .ok()

@@ -60,7 +60,7 @@ fn mounted_provider_matches_one_hundred_thousand_random_bytes() {
         std::iter::once(runtime_bin).chain(std::env::split_paths(&inherited_path)),
     )
     .expect("runtime PATH");
-    let mut host = Command::new(executable)
+    let mut host = Command::new(&executable)
         .arg(&mount_arg)
         .arg(&index)
         .arg(objects.path())
@@ -163,20 +163,17 @@ fn mounted_provider_matches_one_hundred_thousand_random_bytes() {
     host.kill().expect("stop host");
     let _ = host.wait();
 
-    let mut async_host = Command::new(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/native-winfsp/Debug/mirage-fs.exe"),
-    )
-    .arg(&mount_arg)
-    .arg(&index)
-    .arg(objects.path())
-    .arg("S-1-1-0")
-    .env("PATH", &search_path)
-    .env("MIRAGE_TEST_ASYNC_DELAY_MS", "100")
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .expect("start async host");
+    let mut async_host = Command::new(&executable)
+        .arg(&mount_arg)
+        .arg(&index)
+        .arg(objects.path())
+        .arg("S-1-1-0")
+        .env("PATH", &search_path)
+        .env("MIRAGE_TEST_ASYNC_DELAY_MS", "100")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start async host");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !mounted_file.is_file() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));

@@ -315,18 +315,19 @@ impl RepositoryCapacitySource {
     }
 
     pub(crate) fn plan(&self, requested_bytes: u64) -> Result<SpaceLeasePlan, MirageError> {
+        plan_space_lease(&self.capacity_snapshot()?, requested_bytes)
+    }
+
+    fn capacity_snapshot(&self) -> Result<CapacitySnapshot, MirageError> {
         let at_ns = now_ns()?;
-        plan_space_lease(
-            &CapacitySnapshot {
-                physical_free_bytes: self.physical_free_bytes()?,
-                filesystem_reserve_bytes: self.filesystem_reserve_bytes()?,
-                outstanding_space_lease_bytes: self
-                    .database
-                    .active_space_lease_bytes_for_volume(&self.target.volume_id, at_ns)?,
-                candidates: self.reclaim_candidates()?,
-            },
-            requested_bytes,
-        )
+        Ok(CapacitySnapshot {
+            physical_free_bytes: self.physical_free_bytes()?,
+            filesystem_reserve_bytes: self.filesystem_reserve_bytes()?,
+            outstanding_space_lease_bytes: self
+                .database
+                .active_space_lease_bytes_for_volume(&self.target.volume_id, at_ns)?,
+            candidates: self.reclaim_candidates()?,
+        })
     }
 
     pub(crate) fn cache_on_target_volume(&self) -> bool {
@@ -1129,9 +1130,11 @@ mod tests {
         let source = RepositoryCapacitySource::open(&database, repository_id, None)
             .expect("capacity source");
         assert!(source.cache_on_target_volume());
-        let baseline = source.plan(1).expect("baseline plan");
-        let plan = source
-            .plan(baseline.immediately_available_bytes + 1)
+        // Free space can change between queries as unrelated processes write or
+        // delete files. Plan both requests from the same measured snapshot.
+        let snapshot = source.capacity_snapshot().expect("capacity snapshot");
+        let baseline = plan_space_lease(&snapshot, 1).expect("baseline plan");
+        let plan = plan_space_lease(&snapshot, baseline.immediately_available_bytes + 1)
             .expect("reclaim plan");
         assert!(plan.grantable());
         assert_eq!(plan.selected.len(), 1);

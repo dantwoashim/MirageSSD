@@ -65,7 +65,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Configure CMake Native Adapter
-        run: cmake --preset windows-msvc-debug
+        run: cmake -S . -B build/windows-msvc-debug -A x64 "-DWINFSP_SDK_ROOT=${{ github.workspace }}/target/winfsp-sdk" -DMIRAGE_RUST_PROFILE=debug
 
       - name: Build CMake Native Adapter
         run: cmake --build --preset windows-msvc-debug
