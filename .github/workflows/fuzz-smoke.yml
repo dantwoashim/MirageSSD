@@ -15,9 +15,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-08-25
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly-2026-08-25 install cargo-fuzz --version 0.13.2 --locked
       - working-directory: fuzz
         run: |
           for target in manifest commit midx pack_frame ipc_frame windows_path; do
-            cargo fuzz run "$target" -- -max_total_time=10
+            cargo +nightly-2026-08-25 fuzz run "$target" -- -max_total_time=10
           done

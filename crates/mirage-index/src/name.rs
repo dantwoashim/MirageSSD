@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 use mirage_manifest::MAX_COMPONENT_BYTES;
 use mirage_types::MirageError;
+#[cfg(windows)]
 use smallvec::SmallVec;
 
 #[must_use]

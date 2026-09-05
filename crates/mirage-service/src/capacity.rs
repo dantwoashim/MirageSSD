@@ -794,11 +794,14 @@ fn last_write_sequence(path: &Path) -> Result<u64, MirageError> {
     Ok(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
 }
 
+type OpenExistingCacheResult =
+    Result<(Option<Arc<ArenaShard>>, Option<Arc<ResidentIndex>>, bool), MirageError>;
+
 fn open_existing_cache(
     database: &Database,
     index: &MountIndex,
     target: &VolumeSpace,
-) -> Result<(Option<Arc<ArenaShard>>, Option<Arc<ResidentIndex>>, bool), MirageError> {
+) -> OpenExistingCacheResult {
     let state_root = database
         .reads()
         .database_path()
