@@ -46,6 +46,8 @@ fn wrong_header_and_acl_or_share_failure_are_closed() {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("arena.bin");
     let shard = ArenaShard::create(&path, layout()).expect("create");
+    // Mandatory share-mode exclusion is provided by the Windows file handle.
+    #[cfg(windows)]
     assert!(
         ArenaShard::open(&path, layout()).is_err(),
         "restrictive sharing must reject a second writer"
