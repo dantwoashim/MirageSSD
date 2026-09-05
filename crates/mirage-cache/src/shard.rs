@@ -235,7 +235,7 @@ fn allocated_bytes_in_range(_file: &File, _offset: u64, _length: u64) -> Result<
 }
 #[cfg(not(windows))]
 fn deallocate(file: &File, offset: u64, length: u64) -> Result<(), MirageError> {
-    const ZERO_CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+    static ZERO_CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
     let mut remaining = length;
     let mut cursor = offset;
     while remaining != 0 {

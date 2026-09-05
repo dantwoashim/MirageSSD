@@ -85,6 +85,10 @@ Use disposable files. Check copy, edit, reopen, rename, attributes, and reconnec
 
 For Rust checks:
 
+On Windows, the full workspace suite includes a real mounted-volume test.
+Install WinFsp and build the native adapter using the commands below before
+running `cargo test`. Formatting and Clippy do not need a mounted filesystem.
+
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

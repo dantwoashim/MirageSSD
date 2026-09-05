@@ -2,6 +2,9 @@
 
 Keep changes focused, reproducible, and explicit about their effect on stored data. See the [build guide](docs/building.md) for prerequisites.
 
+On Windows, install WinFsp and build the native adapter before running the full
+workspace tests; the suite includes a real mounted-volume check.
+
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

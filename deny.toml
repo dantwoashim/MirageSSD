@@ -22,6 +22,23 @@ confidence-threshold = 0.8
 # WinFsp native user-mode library and driver distribution/licensing (GPLv3 with FLOSS exception)
 # is tracked separately from Rust crates and will be reviewed under a dedicated native adapter ADR.
 
+# Reviewed upstream notices for the exact locked dependency versions.
+# Keep exceptions narrow; unlisted licenses remain rejected.
+[[licenses.exceptions]]
+name = "foldhash"
+version = "=0.2.0"
+allow = ["Zlib"]
+
+[[licenses.exceptions]]
+name = "minicbor"
+version = "=2.3.0"
+allow = ["BlueOak-1.0.0"]
+
+[[licenses.exceptions]]
+name = "webpki-roots"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"

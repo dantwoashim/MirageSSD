@@ -47,11 +47,28 @@ jobs:
         shell: pwsh
         run: ./scripts/acquire-winfsp-sdk.ps1 -Output ./target/winfsp-sdk -WixExecutable ./.tools/wix/wix.exe
 
+      - name: Install verified WinFsp runtime
+        shell: pwsh
+        run: |
+          $uri = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
+          $path = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri $uri -OutFile $path
+          $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+          if ($actual -ne '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A') { throw 'WinFsp checksum mismatch.' }
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $path, '/qn', '/norestart') -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "WinFsp installation failed: $($process.ExitCode)" }
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Configure CMake Native Adapter
+        run: cmake --preset windows-msvc-debug
+
+      - name: Build CMake Native Adapter
+        run: cmake --build --preset windows-msvc-debug
 
       - name: Run tests
         run: cargo test --workspace --locked -- --nocapture
@@ -62,12 +79,6 @@ jobs:
           npm ci
           npm test
           npm run build
-
-      - name: Configure CMake Native Adapter
-        run: cmake --preset windows-msvc-debug
-
-      - name: Build CMake Native Adapter
-        run: cmake --build --preset windows-msvc-debug
 
       - name: Verify native host artifact
         shell: pwsh

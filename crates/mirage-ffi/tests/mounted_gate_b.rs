@@ -45,7 +45,7 @@ fn mounted_provider_matches_one_hundred_thousand_random_bytes() {
     let index = objects.path().join("mount.idx");
     mirage_index::compile_to_path(&imported.manifest, &index).expect("index");
     let executable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/native-winfsp/Debug/mirage-fs.exe");
+        .join("../../build/windows-msvc-debug/native/winfsp-adapter/Debug/mirage-fs.exe");
     assert!(executable.is_file(), "build native adapter before Gate B");
     let program_files = std::env::var_os("ProgramFiles(x86)").expect("ProgramFiles(x86)");
     let runtime_bin = std::fs::read_dir(std::path::PathBuf::from(program_files).join("WinFsp/SxS"))
