@@ -32,7 +32,7 @@ pub use control_plane::ControlPlaneHandler;
 pub use conversion::{ConversionAction, ConversionPhase, ConversionTransaction};
 pub use credential_broker::{AccessCapability, CredentialBroker};
 #[cfg(windows)]
-pub use ipc_server::{RequestHandler, serve_one, serve_one_named, wake_server};
+pub use ipc_server::{serve_one, serve_one_named, wake_server};
 pub use launch::{LaunchMode, LaunchPolicy, LaunchReadiness, NativeLaunch, launch_native};
 pub use mount_control::{MountControl, NativeMountControl};
 pub use process_tree::{ProcessIdentity, ProcessTracker, TrackedRole};
@@ -43,3 +43,12 @@ pub use rollback_point::{RollbackEntry, RollbackPoint};
 pub use supervisor::{
     HostExit, HostId, HostSpec, HostState, Launcher, ManagedChild, StdLauncher, Supervisor,
 };
+
+/// Handles authenticated control-plane requests independently of the transport.
+pub trait RequestHandler {
+    fn handle(
+        &self,
+        principal: &mirage_ipc::Principal,
+        request: mirage_ipc::Request,
+    ) -> mirage_ipc::ResponseBody;
+}

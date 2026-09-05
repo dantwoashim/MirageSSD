@@ -1,7 +1,6 @@
-use crate::authenticated_named_pipe_client_principal;
+use crate::{RequestHandler, authenticated_named_pipe_client_principal};
 use mirage_ipc::{
-    Authorization, MAX_FRAME_BYTES, PROTOCOL_VERSION, Principal, Request, Response, ResponseBody,
-    decode_frame, encode_frame,
+    Authorization, MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, Response, decode_frame, encode_frame,
 };
 use mirage_types::{MirageError, MirageErrorKind};
 use std::{
@@ -44,10 +43,6 @@ pub fn wake_server() {
             windows_sys::Win32::Foundation::CloseHandle(handle);
         }
     }
-}
-
-pub trait RequestHandler {
-    fn handle(&self, principal: &Principal, request: Request) -> ResponseBody;
 }
 
 pub fn serve_one(handler: &impl RequestHandler) -> Result<(), MirageError> {
