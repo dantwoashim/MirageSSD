@@ -149,14 +149,26 @@ fn repo_import_local_builds_verified_packs_without_touching_source() {
         ])
         .output()
         .expect("local import");
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    #[cfg(windows)]
+    {
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(output.join("base-manifest.cbor").exists());
+        assert!(output.join("import-report.json").exists());
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(!result.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&result.stderr).expect("error JSON");
+        assert_eq!(error["error"]["code"], "MIRAGE_UNSUPPORTED_LAYOUT");
+        assert_eq!(error["error"]["message"], "DPAPI requires Windows");
+        assert!(!output.join("base-manifest.cbor").exists());
+        assert!(!output.join("import-report.json").exists());
+    }
     assert_eq!(fs::read(asset).expect("asset after"), original);
-    assert!(output.join("base-manifest.cbor").exists());
-    assert!(output.join("import-report.json").exists());
 }
 
 #[test]
@@ -290,6 +302,7 @@ fn db_check_returns_failure_on_corrupted_database() {
 }
 
 #[test]
+#[cfg(windows)]
 fn local_repository_cli_round_trips_and_refuses_extract_overwrite() {
     let directory = tempfile::tempdir().expect("temp directory");
     let source = directory.path().join("source");
