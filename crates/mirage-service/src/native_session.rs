@@ -452,7 +452,8 @@ fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-#[cfg(test)]
+// This end-to-end fixture persists its repository key with Windows DPAPI.
+#[cfg(all(test, windows))]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};

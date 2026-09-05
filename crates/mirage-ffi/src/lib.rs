@@ -22,7 +22,7 @@ fn safe_object_id(value: &str) -> bool {
     let path = std::path::Path::new(value);
     if value.is_empty()
         || value.len() > 512
-        || value.contains(':')
+        || value.contains([':', '/', '\\'])
         || value.ends_with(['.', ' '])
         || path.is_absolute()
         || path.components().count() != 1
@@ -487,6 +487,8 @@ mod tests {
             "..",
             "../pack.bin",
             "sub\\pack.bin",
+            "pack.bin/",
+            "pack.bin\\",
             "C:pack.bin",
             "pack.bin:$DATA",
             "CON",
