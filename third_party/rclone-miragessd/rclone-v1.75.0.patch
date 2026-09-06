@@ -131,7 +131,7 @@ new file mode 100644
 index 0000000..a3d1571
 --- /dev/null
 +++ b/cmd/cmount/attributes.go
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,381 @@
 +//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
 +
 +package cmount
@@ -213,7 +213,9 @@ index 0000000..a3d1571
 +		return store
 +	}
 +	store.initialized = true
-+	if info.Size() >= attributeCompactionThreshold {
++	// Repair an unterminated tail before any append, including valid JSON
++	// missing its newline. Never concatenate the next operation onto it.
++	if info.Size() >= attributeCompactionThreshold || !bytes.HasSuffix(data, []byte{'\n'}) {
 +		if err := store.compactLocked(); err != nil {
 +			store.loadErr = err
 +		}
@@ -389,6 +391,9 @@ index 0000000..a3d1571
 +}
 +
 +func (store *attributeStore) renamePrefixLocked(oldPrefix string, newPrefix string) {
++	if oldPrefix == newPrefix {
++		return
++	}
 +	childPrefix := oldPrefix + "/"
 +	moved := make(map[string]uint32)
 +	for key, flags := range store.entries {
@@ -400,6 +405,8 @@ index 0000000..a3d1571
 +			delete(store.entries, key)
 +		}
 +	}
++	// Replacement inherits only the source metadata, never the old target's.
++	store.removePrefixLocked(newPrefix)
 +	for key, flags := range moved {
 +		store.entries[key] = flags
 +	}
@@ -511,7 +518,7 @@ new file mode 100644
 index 0000000..ff85ea7
 --- /dev/null
 +++ b/cmd/cmount/attributes_test.go
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,130 @@
 +//go:build cmount && windows
 +
 +package cmount
@@ -596,6 +603,34 @@ index 0000000..ff85ea7
 +	}
 +	if got := store.get(`/kept`); got != 32768 {
 +		t.Fatalf("flags before truncated tail = %d", got)
++	}
++	if err := store.set(`/new`, 2); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.flush(); err != nil {
++		t.Fatal(err)
++	}
++	reloaded := newAttributeStoreFromEnvironment()
++	if reloaded.loadErr != nil || reloaded.get(`/kept`) != 32768 || reloaded.get(`/new`) != 2 {
++		t.Fatalf("repaired journal did not survive append and reload: %v", reloaded.loadErr)
++	}
++}
++
++func TestAttributeStoreReplacementClearsDestination(t *testing.T) {
++	t.Setenv(attributeStoreEnvironment, filepath.Join(t.TempDir(), "attributes.jsonl"))
++	store := newAttributeStoreFromEnvironment()
++	if err := store.set(`/target`, 2); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.rename(`/source`, `/target`); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.flush(); err != nil {
++		t.Fatal(err)
++	}
++	reloaded := newAttributeStoreFromEnvironment()
++	if reloaded.loadErr != nil || store.get(`/target`) != 0 || reloaded.get(`/target`) != 0 {
++		t.Fatalf("replacement retained destination attributes: %v", reloaded.loadErr)
 +	}
 +}
 +

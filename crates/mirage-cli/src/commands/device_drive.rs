@@ -151,9 +151,9 @@ pub fn mount(options: MountOptions<'_>) -> Result<(), MirageError> {
         token.zeroize();
         refresh.zeroize();
         zeroize_optional(&mut client_secret);
-        return Err(MirageError::backend_unauthenticated(
-            "Drive-backed device folder could not be opened; refresh the MirageSSD login",
-        ));
+        return Err(MirageError::backend_unavailable(format!(
+            "Drive-backed device folder could not be opened ({created}); cause is unknown. Check the provider log before changing credentials"
+        )));
     }
 
     let attribute_store = default_attribute_store(options.remote_folder)?;
@@ -463,6 +463,17 @@ fn configured_command(
     token: &str,
 ) -> Command {
     let mut command = Command::new(rclone);
+    // Never inherit an RC listener, browser proxy, or unrelated account settings.
+    // This process receives only the explicit MirageSSD provider configuration.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("RCLONE_")
+        {
+            command.env_remove(key);
+        }
+    }
     command
         .env("RCLONE_CONFIG_MIRAGESSD_TYPE", "drive")
         .env("RCLONE_CONFIG_MIRAGESSD_CLIENT_ID", client_id);

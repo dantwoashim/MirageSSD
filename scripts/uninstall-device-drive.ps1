@@ -35,7 +35,8 @@ try {
   }
   # Delete only the named application payload, never a cache/data directory.
   $prefix = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
-  foreach ($name in @('mirage.exe','rclone.exe','mount-device.vbs','run-powershell-hidden.vbs','drive-letter.txt','device-install.json','uninstall-device-drive.ps1')) {
+  # Keep device-install.json alongside retained data for recovery/reinstallation.
+  foreach ($name in @('mirage.exe','rclone.exe','mount-device.vbs','run-powershell-hidden.vbs','drive-letter.txt','uninstall-device-drive.ps1')) {
     $path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $name))
     if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe application path.' }
     if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path }
