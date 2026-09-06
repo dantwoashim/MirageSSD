@@ -6,6 +6,14 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 
 **Status: Windows 11 x64 engineering preview.** This is not yet a production backup system or a replacement for a physical SSD.
 
+## Download for Windows
+
+**[Download MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.0-preview/MirageSSD-Setup-0.1.0-preview.exe)** · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.0-preview)
+
+Download the installer above, not GitHub's **Code → Download ZIP** (which contains source code). Run it as your normal Windows user, choose **Install and connect Google Drive**, and sign in with your own Google account. Administrator approval is needed if WinFsp must be installed.
+
+The installer is **unsigned**. Do not disable Windows security to run it. Google OAuth is in production, so manual tester-email registration is no longer required; organization account policies may still restrict access. A fresh non-tester account and clean-PC installation have not yet been verified end to end.
+
 [Build and install](docs/building.md) · [Architecture](docs/architecture.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
@@ -23,7 +31,7 @@ Files transfer to the Google account you connect. MirageSSD does not supply clou
 
 ### Use an installer
 
-If a maintainer has supplied a preview installer:
+Download the [Windows preview installer](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.0-preview/MirageSSD-Setup-0.1.0-preview.exe), then:
 
 1. Open `MirageSSD-Setup-*.exe` as your normal Windows user.
 2. Choose **Install and connect Google Drive**.
