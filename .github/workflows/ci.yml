@@ -109,8 +109,13 @@ jobs:
       - name: Install macFUSE SDK
         run: brew install --cask macfuse
 
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache: false
+
       - name: Build pinned provider
-        # Runner Go auto-downloads the toolchain pinned by rclone's go.mod.
+        # GOTOOLCHAIN=auto fetches the exact toolchain pinned by rclone's go.mod if newer.
         env:
           GOTOOLCHAIN: auto
         run: ./scripts/build-rclone-miragessd.sh
