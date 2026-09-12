@@ -1496,9 +1496,9 @@ impl CapsulePageStore for LocalCapsuleStore {
                     let path = self.import_root.join(object_id);
                     let reader = match &self.encryption {
                         Some(encryption) => {
-                            PackReader::open_verified_encrypted(&path, encryption.clone())?
+                            PackReader::open_indexed_encrypted(&path, encryption.clone())?
                         }
-                        None => PackReader::open_verified(&path)?,
+                        None => PackReader::open_indexed(&path)?,
                     };
                     readers.insert(object_id.to_owned(), reader);
                 }

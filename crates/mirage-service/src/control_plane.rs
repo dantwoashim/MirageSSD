@@ -100,6 +100,7 @@ impl ControlPlaneHandler {
                 })?;
             let capacity =
                 runtime::volume_capacity(&self.database, repository.repository_id, &index)?;
+            let origin_root = local_origin_root(&self.database, repository.repository_id)?;
             self.mounts
                 .lock()
                 .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
@@ -109,6 +110,7 @@ impl ControlPlaneHandler {
                     &index,
                     &state_root,
                     &owner_sid,
+                    origin_root.as_deref(),
                     capacity,
                 )?;
             restored += 1;
@@ -741,6 +743,7 @@ impl ControlPlaneHandler {
             .ok_or_else(|| MirageError::integrity_mismatch("repository owner SID is missing"))?;
         let (volume_total_bytes, volume_free_bytes) =
             runtime::volume_capacity(&self.database, repository_id, &index)?;
+        let origin_root = local_origin_root(&self.database, repository_id)?;
         self.database.set_repository_state(
             repository_id,
             state,
@@ -757,6 +760,7 @@ impl ControlPlaneHandler {
                 &index,
                 &state_root,
                 &owner_sid,
+                origin_root.as_deref(),
                 (volume_total_bytes, volume_free_bytes),
             );
         if let Err(error) = mounted {
@@ -1164,6 +1168,19 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::RepositoryRegister { .. }
         | Command::RepositoryAdopt { .. } => None,
     }
+}
+
+/// Immutable origin directory used for degraded read-through on a cache miss:
+/// the repository's import root when its origin is local; `None` for Drive origins.
+fn local_origin_root(
+    database: &Database,
+    repository_id: RepositoryId,
+) -> Result<Option<std::path::PathBuf>, MirageError> {
+    let config = runtime::load_config(database, repository_id)?;
+    Ok(match config.origin {
+        runtime::RuntimeOrigin::Local => Some(config.import_root),
+        runtime::RuntimeOrigin::Drive => None,
+    })
 }
 
 fn error_response(error: MirageError) -> ResponseBody {

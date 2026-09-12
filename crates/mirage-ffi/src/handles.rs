@@ -54,14 +54,17 @@ pub struct Entry {
 pub struct ViolationLog {
     path: PathBuf,
     count: AtomicU64,
+    origin_served: AtomicU64,
 }
 impl ViolationLog {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
             count: AtomicU64::new(0),
+            origin_served: AtomicU64::new(0),
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         file_index: u32,
@@ -70,10 +73,14 @@ impl ViolationLog {
         length: usize,
         caller_pid: u32,
         path: &str,
+        outcome: &str,
     ) {
         self.count.fetch_add(1, Ordering::Relaxed);
+        if outcome == "origin" {
+            self.origin_served.fetch_add(1, Ordering::Relaxed);
+        }
         self.append(&format!(
-            "{}\tfile={file_index}\tpage={page_ordinal}\toffset={offset}\tlen={length}\tpid={caller_pid}\timage={}\tpath={path}\n",
+            "{}\tfile={file_index}\tpage={page_ordinal}\toffset={offset}\tlen={length}\tpid={caller_pid}\timage={}\tpath={path}\toutcome={outcome}\n",
             unix_ns(),
             caller_image_name(caller_pid)
         ));
@@ -90,11 +97,15 @@ impl ViolationLog {
     pub fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
     }
+    pub fn origin_served(&self) -> u64 {
+        self.origin_served.load(Ordering::Relaxed)
+    }
     pub fn summary(&self) {
         self.append(&format!(
-            "{}\tsummary\tnon_resident_reads={}\n",
+            "{}\tsummary\tnon_resident_reads={}\torigin_served={}\n",
             unix_ns(),
-            self.count()
+            self.count(),
+            self.origin_served()
         ));
     }
     fn append(&self, line: &str) {
@@ -159,6 +170,7 @@ pub struct MirageEngineHandle {
     pub pages: Arc<Mutex<DecodedPageCache>>,
     pub resident: Option<Arc<ResidentIndex>>,
     pub violations: Option<Arc<ViolationLog>>,
+    pub trace_lookups: bool,
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -182,6 +194,7 @@ impl MirageEngineHandle {
             pages: Arc::new(Mutex::new(DecodedPageCache::bounded(128))),
             resident: None,
             violations: None,
+            trace_lookups: false,
         }
     }
 }
@@ -195,17 +208,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("seal-violations.log");
         let log = ViolationLog::new(path.clone());
-        log.record(7, 42, 44_040_192, 65_536, 0, "assets/pak0.pak");
-        log.record(0, 1, 0, 4096, 0, "assets/pak0.pak");
+        log.record(7, 42, 44_040_192, 65_536, 0, "assets/pak0.pak", "origin");
+        log.record(0, 1, 0, 4096, 0, "assets/pak0.pak", "failed");
         log.lookup(7, "assets/pak0.pak");
         log.summary();
         assert_eq!(log.count(), 2);
+        assert_eq!(log.origin_served(), 1);
         let text = std::fs::read_to_string(&path).expect("log readable");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("\tfile=7\tpage=42\toffset=44040192\tlen=65536"));
-        assert!(lines[0].ends_with("\tpid=0\timage=?\tpath=assets/pak0.pak"));
+        assert!(lines[0].ends_with("\tpid=0\timage=?\tpath=assets/pak0.pak\toutcome=origin"));
+        assert!(lines[1].ends_with("\toutcome=failed"));
         assert!(lines[2].contains("\tlookup\tfile=7\tpath=assets/pak0.pak\tpid=0"));
-        assert!(lines[3].ends_with("\tsummary\tnon_resident_reads=2"));
+        assert!(lines[3].ends_with("\tsummary\tnon_resident_reads=2\torigin_served=1"));
     }
 }

@@ -20,7 +20,7 @@ public:
     FileSystemHost() = default;
     FileSystemHost(const FileSystemHost&) = delete;
     FileSystemHost& operator=(const FileSystemHost&) = delete;
-    NTSTATUS mount(const std::wstring&, const std::wstring&, const std::wstring&, const std::wstring&, bool, std::uint64_t, std::uint64_t);
+    NTSTATUS mount(const std::wstring&, const std::wstring&, const std::wstring&, const std::wstring&, bool, std::uint64_t, std::uint64_t, const std::wstring& = {});
     NTSTATUS run();
     void stop() noexcept;
     MirageEngineHandle* engine() const noexcept { return engine_; }

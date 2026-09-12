@@ -42,6 +42,7 @@ fn spec() -> HostSpec {
         owner_sid: "S-1-5-21-111".into(),
         volume_total_bytes: 5 * 1024 * 1024 * 1024 * 1024,
         volume_free_bytes: 4 * 1024 * 1024 * 1024 * 1024,
+        origin_root: None,
     }
 }
 

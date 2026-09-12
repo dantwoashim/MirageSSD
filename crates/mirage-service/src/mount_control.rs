@@ -8,6 +8,7 @@ use std::{
 };
 
 pub trait MountControl: Send {
+    #[allow(clippy::too_many_arguments)]
     fn mount(
         &mut self,
         repository_id: RepositoryId,
@@ -15,6 +16,7 @@ pub trait MountControl: Send {
         index: &Path,
         state_root: &Path,
         owner_sid: &str,
+        origin_root: Option<&Path>,
         volume_capacity: (u64, u64),
     ) -> Result<(), MirageError>;
     fn unmount(&mut self, repository_id: RepositoryId) -> Result<(), MirageError>;
@@ -43,6 +45,7 @@ impl Drop for NativeMountControl {
 }
 
 impl MountControl for NativeMountControl {
+    #[allow(clippy::too_many_arguments)]
     fn mount(
         &mut self,
         repository_id: RepositoryId,
@@ -50,6 +53,7 @@ impl MountControl for NativeMountControl {
         index: &Path,
         state_root: &Path,
         owner_sid: &str,
+        origin_root: Option<&Path>,
         volume_capacity: (u64, u64),
     ) -> Result<(), MirageError> {
         let (volume_total_bytes, volume_free_bytes) = volume_capacity;
@@ -83,6 +87,7 @@ impl MountControl for NativeMountControl {
                     owner_sid: owner_sid.to_owned(),
                     volume_total_bytes,
                     volume_free_bytes,
+                    origin_root: origin_root.map(Path::to_path_buf),
                 },
             )
             .map_err(io_error)?;
@@ -206,6 +211,7 @@ impl MountControl for UnavailableMountControl {
         _: &Path,
         _: &Path,
         _: &str,
+        _: Option<&Path>,
         _: (u64, u64),
     ) -> Result<(), MirageError> {
         Err(MirageError::provider_unavailable(

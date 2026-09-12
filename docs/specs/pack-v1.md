@@ -25,3 +25,6 @@ explicit compatibility imports.
 ## Crash and recovery contract
 
 Each writer uses a cryptographically unique `pack-building-<id>.tmp` path, so concurrent import and update writers never delete or overwrite each other's work. An incomplete temporary file has no trusted footer and is never accepted as an immutable pack. Cancellation removes only the calling writer's own temporary file; completed verified packs remain resumable. Source data is never deleted or modified.
+
+
+"open_verified" hashes the entire pack body and object on open and is required wherever the pack's object identity must be attested (import, upload, Drive verification); open_indexed skips both whole-pack hashes and relies on per-page hash verification in ead_page, which is the correct mode for read serving and capsule materialization.

@@ -10,7 +10,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use mirage_cache::{ArenaShard, CacheLayout, ResidentIndex};
-use mirage_index::{FileView, MountIndex, NodeIndex};
+use mirage_index::{FileView, MountIndex, NodeIndex, PageView, ResolvedSpan};
 use mirage_pack::{PackReadEncryption, PackReader};
 use mirage_types::ByteCount;
 
@@ -110,6 +110,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             resident: None,
             violations: None,
+            trace_lookups: false,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -177,6 +178,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             resident: None,
             violations: None,
+            trace_lookups: false,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -193,6 +195,62 @@ pub unsafe extern "C" fn mirage_engine_create_cache(
     index_path_len: usize,
     state_root: *const u16,
     state_root_len: usize,
+    output: *mut *mut MirageEngineHandle,
+) -> MirageStatus {
+    unsafe {
+        create_cache_impl(
+            index_path,
+            index_path_len,
+            state_root,
+            state_root_len,
+            &[],
+            0,
+            output,
+        )
+    }
+}
+/// Like [`mirage_engine_create_cache`] but with a reachable local origin: on a
+/// cache miss the read falls through to the immutable pack directory
+/// (`origin_root`) instead of failing, and the violation record carries the
+/// outcome. Offline semantics are unchanged when no origin is configured.
+///
+/// # Safety
+/// Same contract as [`mirage_engine_create_cache`]; `origin_root` is a UTF-16
+/// path valid for `origin_root_len` units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_create_cache_with_origin(
+    index_path: *const u16,
+    index_path_len: usize,
+    state_root: *const u16,
+    state_root_len: usize,
+    origin_root: *const u16,
+    origin_root_len: usize,
+    output: *mut *mut MirageEngineHandle,
+) -> MirageStatus {
+    unsafe {
+        create_cache_impl(
+            index_path,
+            index_path_len,
+            state_root,
+            state_root_len,
+            if origin_root.is_null() {
+                &[]
+            } else {
+                std::slice::from_raw_parts(origin_root, origin_root_len)
+            },
+            origin_root_len,
+            output,
+        )
+    }
+}
+
+unsafe fn create_cache_impl(
+    index_path: *const u16,
+    index_path_len: usize,
+    state_root: *const u16,
+    state_root_len: usize,
+    origin_units: &[u16],
+    origin_root_len: usize,
     output: *mut *mut MirageEngineHandle,
 ) -> MirageStatus {
     contained(|| {
@@ -241,17 +299,48 @@ pub unsafe extern "C" fn mirage_engine_create_cache(
         else {
             return MirageStatus::IntegrityFailure;
         };
+        let (object_root, encryption) = if origin_root_len != 0 {
+            let Ok(origin_root) = String::from_utf16(origin_units) else {
+                return MirageStatus::InvalidArgument;
+            };
+            let root = std::path::PathBuf::from(origin_root);
+            if !root.is_dir() {
+                return MirageStatus::InvalidArgument;
+            }
+            let key_path = root.join("repository-key.dpapi");
+            let encryption = if key_path.is_file() {
+                let Ok(key) = mirage_crypto::repository_key_store::load_repository_key(
+                    &key_path,
+                    index.header().repository_id,
+                ) else {
+                    return MirageStatus::IntegrityFailure;
+                };
+                Some(PackReadEncryption {
+                    repository_id: index.header().repository_id,
+                    key: Arc::new(key),
+                })
+            } else {
+                None
+            };
+            (Some(Arc::new(root)), encryption)
+        } else {
+            (None, None)
+        };
         let handle = MirageEngineHandle {
             entries: Default::default(),
             index: Some(Arc::new(index)),
-            object_root: None,
-            encryption: None,
+            object_root,
+            encryption,
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
-            pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(1))),
+            pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(
+                if origin_root_len != 0 { 128 } else { 1 },
+            ))),
             resident: Some(Arc::new(resident)),
             violations: Some(Arc::new(ViolationLog::new(
                 state_root.join("seal-violations.log"),
             ))),
+            trace_lookups: std::env::var_os("MIRAGE_TRACE_LOOKUPS").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -304,7 +393,9 @@ pub unsafe extern "C" fn mirage_lookup(
                 Ok(None) => return MirageStatus::NotFound,
                 Err(_) => return MirageStatus::IntegrityFailure,
             };
-            if let (NodeIndex::File(ordinal), Some(log)) = (node, &engine.violations) {
+            if engine.trace_lookups
+                && let (NodeIndex::File(ordinal), Some(log)) = (node, &engine.violations)
+            {
                 log.lookup(u64::from(ordinal), &path);
             }
             let entry = match node {
@@ -483,100 +574,127 @@ unsafe fn read_impl(
             };
             let hash = page.plaintext_hash();
             if let Some(resident) = &handle.resident {
-                let Ok(Some(guard)) = resident.acquire(hash) else {
-                    if let (true, Some(log)) = (record_violations, &handle.violations) {
-                        log.record(
-                            file_ordinal,
-                            span.page_ordinal.as_u32(),
-                            offset,
-                            output_len,
-                            caller_pid,
-                            &file_path(index, file),
-                        );
+                match resident.acquire(hash) {
+                    Ok(Some(guard)) => {
+                        let dst = span.dst_offset as usize;
+                        let Some(dst_end) = dst.checked_add(span.len as usize) else {
+                            return MirageStatus::IntegrityFailure;
+                        };
+                        let Some(destination) = output.get_mut(dst..dst_end) else {
+                            return MirageStatus::IntegrityFailure;
+                        };
+                        if guard.read_exact(span.page_offset, destination).is_err() {
+                            return MirageStatus::IoError;
+                        }
+                        continue;
                     }
-                    return MirageStatus::BackendUnavailable;
-                };
-                let dst = span.dst_offset as usize;
-                let Some(dst_end) = dst.checked_add(span.len as usize) else {
-                    return MirageStatus::IntegrityFailure;
-                };
-                let Some(destination) = output.get_mut(dst..dst_end) else {
-                    return MirageStatus::IntegrityFailure;
-                };
-                if guard.read_exact(span.page_offset, destination).is_err() {
-                    return MirageStatus::IoError;
+                    _ => {
+                        if !record_violations {
+                            return MirageStatus::BackendUnavailable;
+                        }
+                        // Degraded read-through: a non-resident page falls back to
+                        // the immutable origin when one is configured, and the
+                        // violation record carries the outcome.
+                        let outcome = match read_span_from_origin(handle, page, span, output) {
+                            Ok(()) => "origin",
+                            Err(_) => "failed",
+                        };
+                        if let Some(log) = &handle.violations {
+                            log.record(
+                                file_ordinal,
+                                span.page_ordinal.as_u32(),
+                                offset,
+                                output_len,
+                                caller_pid,
+                                &file_path(index, file),
+                                outcome,
+                            );
+                        }
+                        if outcome == "origin" {
+                            continue;
+                        }
+                        return MirageStatus::BackendUnavailable;
+                    }
                 }
-                continue;
             }
-            let Some(root) = &handle.object_root else {
-                return MirageStatus::InvalidArgument;
-            };
-            let Ok(location) = page.remote_location() else {
-                return MirageStatus::IntegrityFailure;
-            };
-            let Ok(object_id) = location.provider_object_id() else {
-                return MirageStatus::IntegrityFailure;
-            };
-            if !safe_object_id(object_id) {
-                return MirageStatus::IntegrityFailure;
+            if let Err(status) = read_span_from_origin(handle, page, span, output) {
+                return status;
             }
-            let cached = match handle.pages.lock() {
-                Ok(cache) => cache.get(hash),
-                Err(_) => return MirageStatus::Internal,
-            };
-            let page_bytes = if let Some(bytes) = cached {
-                bytes
-            } else {
-                let Ok(mut readers) = handle.readers.lock() else {
-                    return MirageStatus::Internal;
-                };
-                if !readers.contains_key(object_id) {
-                    let opened = match &handle.encryption {
-                        Some(encryption) => PackReader::open_verified_encrypted(
-                            &root.join(object_id),
-                            encryption.clone(),
-                        ),
-                        None => PackReader::open_verified(&root.join(object_id)),
-                    };
-                    let Ok(reader) = opened else {
-                        return MirageStatus::IoError;
-                    };
-                    readers.insert(object_id.to_owned(), reader);
-                }
-                let Some(reader) = readers.get_mut(object_id) else {
-                    return MirageStatus::Internal;
-                };
-                let Ok(decoded) = reader.read_page(hash) else {
-                    return MirageStatus::IntegrityFailure;
-                };
-                let bytes: Arc<[u8]> = Arc::from(decoded.page.bytes.to_vec());
-                drop(readers);
-                let Ok(mut cache) = handle.pages.lock() else {
-                    return MirageStatus::Internal;
-                };
-                cache.insert(hash, Arc::clone(&bytes));
-                bytes
-            };
-            let start = span.page_offset as usize;
-            let Some(end) = start.checked_add(span.len as usize) else {
-                return MirageStatus::IntegrityFailure;
-            };
-            let dst = span.dst_offset as usize;
-            let Some(dst_end) = dst.checked_add(span.len as usize) else {
-                return MirageStatus::IntegrityFailure;
-            };
-            let Some(source) = page_bytes.get(start..end) else {
-                return MirageStatus::IntegrityFailure;
-            };
-            let Some(destination) = output.get_mut(dst..dst_end) else {
-                return MirageStatus::IntegrityFailure;
-            };
-            destination.copy_from_slice(source);
         }
         let bytes = spans.iter().map(|span| span.len as usize).sum();
         unsafe { ptr::write(transferred, bytes) };
         MirageStatus::Ok
     })
+}
+
+/// Serve one resolved span from the immutable origin pack directory. Shared by
+/// local-engine reads and cache-mode degraded read-through on a resident miss.
+fn read_span_from_origin(
+    handle: &MirageFileHandle,
+    page: PageView<'_>,
+    span: &ResolvedSpan,
+    output: &mut [u8],
+) -> Result<(), MirageStatus> {
+    let Some(root) = &handle.object_root else {
+        return Err(MirageStatus::InvalidArgument);
+    };
+    let hash = page.plaintext_hash();
+    let location = page
+        .remote_location()
+        .map_err(|_| MirageStatus::IntegrityFailure)?;
+    let object_id = location
+        .provider_object_id()
+        .map_err(|_| MirageStatus::IntegrityFailure)?;
+    if !safe_object_id(object_id) {
+        return Err(MirageStatus::IntegrityFailure);
+    }
+    let cached = match handle.pages.lock() {
+        Ok(cache) => cache.get(hash),
+        Err(_) => return Err(MirageStatus::Internal),
+    };
+    let page_bytes = if let Some(bytes) = cached {
+        bytes
+    } else {
+        let mut readers = handle.readers.lock().map_err(|_| MirageStatus::Internal)?;
+        if !readers.contains_key(object_id) {
+            let opened = match &handle.encryption {
+                Some(encryption) => {
+                    PackReader::open_indexed_encrypted(&root.join(object_id), encryption.clone())
+                }
+                None => PackReader::open_indexed(&root.join(object_id)),
+            };
+            let reader = opened.map_err(|_| MirageStatus::IoError)?;
+            readers.insert(object_id.to_owned(), reader);
+        }
+        let reader = readers.get_mut(object_id).ok_or(MirageStatus::Internal)?;
+        let decoded = reader
+            .read_page(hash)
+            .map_err(|_| MirageStatus::IntegrityFailure)?;
+        let bytes: Arc<[u8]> = Arc::from(decoded.page.bytes.to_vec());
+        drop(readers);
+        handle
+            .pages
+            .lock()
+            .map_err(|_| MirageStatus::Internal)?
+            .insert(hash, Arc::clone(&bytes));
+        bytes
+    };
+    let start = span.page_offset as usize;
+    let end = start
+        .checked_add(span.len as usize)
+        .ok_or(MirageStatus::IntegrityFailure)?;
+    let dst = span.dst_offset as usize;
+    let dst_end = dst
+        .checked_add(span.len as usize)
+        .ok_or(MirageStatus::IntegrityFailure)?;
+    let source = page_bytes
+        .get(start..end)
+        .ok_or(MirageStatus::IntegrityFailure)?;
+    let destination = output
+        .get_mut(dst..dst_end)
+        .ok_or(MirageStatus::IntegrityFailure)?;
+    destination.copy_from_slice(source);
+    Ok(())
 }
 
 #[cfg(test)]

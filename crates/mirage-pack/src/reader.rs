@@ -17,7 +17,7 @@ use crate::index::{PackEntry, decode_index};
 pub struct PackReader {
     file: File,
     file_length: u64,
-    object_hash: ContentHash,
+    object_hash: Option<ContentHash>,
     entries: Vec<PackEntry>,
     encrypted: bool,
     pack_id: [u8; 16],
@@ -32,19 +32,35 @@ pub struct PackReadEncryption {
 
 impl PackReader {
     pub fn open_verified(path: &Path) -> Result<Self, MirageError> {
-        Self::open_inner(path, None)
+        Self::open_inner(path, None, true)
     }
 
     pub fn open_verified_encrypted(
         path: &Path,
         encryption: PackReadEncryption,
     ) -> Result<Self, MirageError> {
-        Self::open_inner(path, Some(encryption))
+        Self::open_inner(path, Some(encryption), true)
+    }
+
+    /// Index-only open: validates header/footer/index and entry layout but skips
+    /// the two whole-pack hashes. Per-page `read_page` verification still guards
+    /// every served frame, so this is safe for read serving but cannot attest
+    /// the pack's object identity.
+    pub fn open_indexed(path: &Path) -> Result<Self, MirageError> {
+        Self::open_inner(path, None, false)
+    }
+
+    pub fn open_indexed_encrypted(
+        path: &Path,
+        encryption: PackReadEncryption,
+    ) -> Result<Self, MirageError> {
+        Self::open_inner(path, Some(encryption), false)
     }
 
     fn open_inner(
         path: &Path,
         encryption: Option<PackReadEncryption>,
+        verify_content: bool,
     ) -> Result<Self, MirageError> {
         let mut file = File::open(path).map_err(MirageError::from)?;
         let file_length = file.metadata().map_err(MirageError::from)?.len();
@@ -85,13 +101,17 @@ impl PackReader {
                 "pack index hash is invalid",
             ));
         }
-        let body_hash = hash_prefix(&mut file, file_length - FOOTER_LEN as u64)?;
-        if body_hash != footer.content_hash {
-            return Err(MirageError::integrity_mismatch(
-                "pack content hash is invalid",
-            ));
-        }
-        let object_hash = hash_prefix(&mut file, file_length)?;
+        let object_hash = if verify_content {
+            let body_hash = hash_prefix(&mut file, file_length - FOOTER_LEN as u64)?;
+            if body_hash != footer.content_hash {
+                return Err(MirageError::integrity_mismatch(
+                    "pack content hash is invalid",
+                ));
+            }
+            Some(hash_prefix(&mut file, file_length)?)
+        } else {
+            None
+        };
         let entries = decode_index(&index_bytes, header.entry_count)?;
         validate_entries(&entries, header.index_offset, header.page_size)?;
         if entries
@@ -113,9 +133,12 @@ impl PackReader {
         })
     }
 
+    /// Whole-object content hash. Computed only by `open_verified*`; panics on
+    /// an `open_indexed*` reader.
     #[must_use]
-    pub const fn content_hash(&self) -> ContentHash {
+    pub fn content_hash(&self) -> ContentHash {
         self.object_hash
+            .expect("content hash is computed only by open_verified readers")
     }
 
     #[must_use]

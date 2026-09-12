@@ -47,6 +47,29 @@ fn random_physical_order_is_hash_lookupable_and_exact() {
 }
 
 #[test]
+fn indexed_open_serves_pages_but_per_page_verification_still_rejects_corruption() {
+    let (_directory, complete, pages) = build_pack();
+    let mut reader = PackReader::open_indexed(&complete.path).expect("indexed reader");
+    for page in &pages {
+        assert_eq!(reader.read_page(page.hash).expect("read").page, *page);
+    }
+    // Flip one byte inside the first frame's body: the index-only open succeeds
+    // (no whole-pack hash), but read_page still fails on the per-page hash check.
+    let mut bytes = std::fs::read(&complete.path).expect("pack");
+    let entry = complete.entries[0];
+    let byte = (entry.frame_offset + entry.frame_length - 1) as usize;
+    bytes[byte] ^= 1;
+    let corrupt = complete.path.with_file_name("indexed-corrupt.bin");
+    std::fs::write(&corrupt, &bytes).expect("corrupt pack");
+    assert!(PackReader::open_verified(&corrupt).is_err());
+    let mut reader = PackReader::open_indexed(&corrupt).expect("indexed open must succeed");
+    let error = reader
+        .read_page(entry.page_hash)
+        .expect_err("corrupt frame");
+    assert_eq!(error.code, "MIRAGE_INTEGRITY_MISMATCH");
+}
+
+#[test]
 fn corrupted_index_and_truncation_are_rejected() {
     let (_directory, complete, _) = build_pack();
     let mut bytes = std::fs::read(&complete.path).expect("pack");

@@ -17,9 +17,11 @@ bool parse_capacity(const wchar_t* text, std::uint64_t& value) {
 }
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 5 && argc != 8) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache total-bytes free-bytes]\n"; return 2; }
-    const bool cache_mode = argc == 8 && std::wstring_view(argv[5]) == L"--cache";
-    if (argc == 8 && !cache_mode) { std::wcerr << L"unknown storage mode\n"; return 2; }
+    if (argc != 5 && argc != 8 && argc != 10) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache total-bytes free-bytes [--origin path]]\n"; return 2; }
+    const bool cache_mode = (argc == 8 || argc == 10) && std::wstring_view(argv[5]) == L"--cache";
+    if ((argc == 8 || argc == 10) && !cache_mode) { std::wcerr << L"unknown storage mode\n"; return 2; }
+    const std::wstring origin = (argc == 10 && std::wstring_view(argv[8]) == L"--origin") ? std::wstring(argv[9]) : std::wstring();
+    if (argc == 10 && origin.empty()) { std::wcerr << L"expected --origin <path>\n"; return 2; }
     std::uint64_t total_bytes{}; std::uint64_t free_bytes{};
     if (cache_mode) {
         if (!parse_capacity(argv[6], total_bytes) || !parse_capacity(argv[7], free_bytes) || total_bytes == 0 || free_bytes > total_bytes) { std::wcerr << L"invalid volume capacity\n"; return 2; }
@@ -32,7 +34,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool drive_mount = mount.native().size() == 2 && mount.native()[1] == L':';
     if (!drive_mount && std::filesystem::exists(mount) && (!std::filesystem::is_directory(mount) || !std::filesystem::is_empty(mount))) { std::wcerr << L"mount path must be a free drive letter, absent path, or empty directory\n"; return 2; }
     mirage::FileSystemHost host; active = &host; SetConsoleCtrlHandler(stop_handler, TRUE);
-    const auto status = host.mount(mount.wstring(), argv[2], argv[3], argv[4], cache_mode, total_bytes, free_bytes);
+    const auto status = host.mount(mount.wstring(), argv[2], argv[3], argv[4], cache_mode, total_bytes, free_bytes, origin);
     if (!NT_SUCCESS(status)) { std::wcerr << L"mount failed status=0x" << std::hex << static_cast<unsigned long>(status) << L"\n"; return 1; }
     std::thread control;
     if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE) {

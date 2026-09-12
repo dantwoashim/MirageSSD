@@ -38,6 +38,9 @@ pub struct HostSpec {
     pub owner_sid: String,
     pub volume_total_bytes: u64,
     pub volume_free_bytes: u64,
+    /// Immutable origin pack directory used for degraded read-through on a
+    /// cache miss; `None` keeps strict offline semantics.
+    pub origin_root: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExit {
@@ -135,7 +138,11 @@ impl Launcher for StdLauncher {
             .arg(&spec.owner_sid)
             .arg("--cache")
             .arg(spec.volume_total_bytes.to_string())
-            .arg(spec.volume_free_bytes.to_string())
+            .arg(spec.volume_free_bytes.to_string());
+        if let Some(origin_root) = &spec.origin_root {
+            command.arg("--origin").arg(origin_root);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

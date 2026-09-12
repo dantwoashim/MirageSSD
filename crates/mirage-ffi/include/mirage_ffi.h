@@ -12,6 +12,8 @@ MirageStatus mirage_engine_create_empty(MirageEngineHandle **output);
 MirageStatus mirage_engine_create_index(const uint16_t *path,size_t path_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_local(const uint16_t *index_path,size_t index_path_len,const uint16_t *object_root,size_t object_root_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_cache(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,MirageEngineHandle **output);
+/* Same as mirage_engine_create_cache but non-resident pages fall back to the immutable origin pack directory; violation records carry outcome=origin|failed. */
+MirageStatus mirage_engine_create_cache_with_origin(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,const uint16_t *origin_root,size_t origin_root_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_destroy(MirageEngineHandle *handle);
 MirageStatus mirage_lookup(const MirageEngineHandle *engine,const uint16_t *path,size_t path_len,MirageFileHandle **output);
 MirageStatus mirage_file_close(MirageFileHandle *handle);
