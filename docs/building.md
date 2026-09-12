@@ -116,3 +116,7 @@ cmake --build --preset windows-msvc-debug
 ```
 
 Tagged MSI builds use `scripts/build-release.ps1` with a clean checkout and exact version tag. That is separate from the one-click writable-drive package.
+
+## macOS
+
+The macOS preview app is built with `scripts/build-rclone-miragessd.sh` and `scripts/build-macos-app.sh` on a Mac with Xcode Command Line Tools, Go, and macFUSE. It reuses the Google configuration from step 2. See the [macOS guide](macos.md).

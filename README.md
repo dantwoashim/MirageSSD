@@ -4,7 +4,7 @@
 
 MirageSSD exposes an application-owned folder in Google Drive as a writable Windows drive. Open files, save downloads, and copy folders through ordinary filesystem paths. Recently used data stays on the local disk; uploads run in the background.
 
-**Status: Windows 11 x64 engineering preview.** This is not yet a production backup system or a replacement for a physical SSD.
+**Status: Windows 11 x64 engineering preview, with a macOS 12+ preview app.** This is not yet a production backup system or a replacement for a physical SSD.
 
 ## Download for Windows
 
@@ -14,7 +14,7 @@ Download the installer above, not GitHub's **Code → Download ZIP** (which cont
 
 The installer is **unsigned**. Do not disable Windows security to run it. Google OAuth is in production, so manual tester-email registration is no longer required; organization account policies may still restrict access. A fresh non-tester account and clean-PC installation have not yet been verified end to end.
 
-[Build and install](docs/building.md) · [Architecture](docs/architecture.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md)
+[Build and install](docs/building.md) · [macOS preview](docs/macos.md) · [Architecture](docs/architecture.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -67,6 +67,17 @@ Create a Google **Desktop app** OAuth configuration, then package the binaries:
 
 Use your downloaded configuration's actual filename and keep it outside the checkout. The [build guide](docs/building.md) covers OAuth setup, prerequisites, package verification, and optional developer components.
 
+### macOS
+
+The macOS preview mounts the same Drive folder at `~/MirageSSD` in Finder through [macFUSE](https://macfuse.github.io/) and the same pinned rclone provider. With Xcode Command Line Tools, Go, and macFUSE installed:
+
+```sh
+./scripts/build-rclone-miragessd.sh
+./scripts/build-macos-app.sh --credentials ~/Downloads/desktop-oauth.json
+```
+
+This produces an ad-hoc-signed `MirageSSD.app` as a ZIP and DMG with checksums. Install, sign-in, uninstall, and troubleshooting steps are in the [macOS guide](docs/macos.md). Preview builds are not notarized: right-click → **Open** on first launch instead of lowering Gatekeeper.
+
 ## Performance: what to expect
 
 | Operation | What determines its speed |
@@ -88,7 +99,7 @@ Setup chooses a cache budget from available local space. That budget is a cleanu
 - Ordinary files on the writable drive are **not client-side encrypted by MirageSSD**. Encrypted repositories and backups are separate paths.
 - Offline reads require cached content. Windows attributes are stored locally and do not automatically follow files to another PC.
 - Games, launchers, databases, virtual machines, and anti-cheat components belong on native storage. Use the mount for archiving, not as a zero-lag execution guarantee.
-- macOS, Linux desktop mounting, signed installers, and clean-machine certification are not delivered by this preview.
+- Linux desktop mounting, signed or notarized installers, and clean-machine certification are not delivered by this preview. The macOS app is ad-hoc signed and requires macFUSE; Windows attribute metadata does not apply on macOS.
 
 Uninstall through **Settings → Apps → Installed apps → MirageSSD**. Removal checks for known pending writes and retains cached data, credentials, attribute metadata, cloud files, and shared WinFsp.
 
@@ -97,10 +108,11 @@ Uninstall through **Settings → Apps → Installed apps → MirageSSD**. Remova
 | Path | Responsibility |
 | --- | --- |
 | `crates/` | Rust CLI, Drive authentication, engine, cache, persistence, service, and IPC |
-| `scripts/` | Windows setup, provider build, packaging, and optional backup helpers |
+| `scripts/` | Windows and macOS setup, provider build, packaging, and optional backup helpers |
 | `third_party/rclone-miragessd/` | Pinned provider patch and provenance |
 | `native/winfsp-adapter/` | Native adapter for the separate immutable-repository path |
 | `apps/mirage-ui/` | Experimental service-management interface |
+| `apps/mirage-macos/` | macOS preview app (AppKit front end over the rclone + macFUSE mount) |
 | `migrations/`, `schemas/` | Database migrations and persistent protocol formats |
 | `tests/`, `fuzz/`, `tools/` | Fixtures, integration checks, fuzz targets, and test tools |
 | `docs/` | Build instructions, architecture, specifications, and design decisions |

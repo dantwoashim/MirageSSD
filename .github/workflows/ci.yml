@@ -96,6 +96,32 @@ jobs:
             build/windows-msvc-debug/CMakeFiles/CMakeOutput.log
           if-no-files-found: ignore
 
+  macos-gate:
+    name: macOS Preview App Gates
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install macFUSE SDK
+        run: brew install --cask macfuse
+
+      - name: Build pinned provider
+        # Runner Go auto-downloads the toolchain pinned by rclone's go.mod.
+        env:
+          GOTOOLCHAIN: auto
+        run: ./scripts/build-rclone-miragessd.sh
+
+      - name: Package app with CI placeholder registration
+        # Never a real client: exercises compile, bundle, sign, and --check-package only.
+        run: |
+          printf '{"installed":{"client_id":"ci-placeholder.apps.googleusercontent.com","client_secret":"ci-placeholder","redirect_uris":["http://localhost"]}}' > "$RUNNER_TEMP/oauth-desktop.json"
+          ./scripts/build-macos-app.sh --credentials "$RUNNER_TEMP/oauth-desktop.json" --output "$RUNNER_TEMP/packages"
+          ls -l "$RUNNER_TEMP/packages"
+
   linux-gate:
     name: Linux Platform-Independent Gates
     runs-on: ubuntu-latest
