@@ -4,8 +4,15 @@ use std::io;
 #[cfg(windows)]
 pub(crate) fn open_restrictive(path: &std::path::Path, create_new: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).share_mode(0);
+    // The service (materialize/admit) and the WinFsp host (mirage-fs.exe) hold the arena open
+    // concurrently; an exclusive open made sealed admission fail with a sharing violation.
+    options
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     if create_new {
         options.create_new(true);
     }

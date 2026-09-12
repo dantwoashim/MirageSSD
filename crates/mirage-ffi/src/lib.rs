@@ -2,7 +2,7 @@
 pub mod handles;
 pub mod namespace;
 pub mod status;
-use handles::{DecodedPageCache, Entry};
+use handles::{DecodedPageCache, Entry, ViolationLog};
 pub use handles::{MirageEngineHandle, MirageFileHandle};
 pub use status::MirageStatus;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -10,7 +10,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use mirage_cache::{ArenaShard, CacheLayout, ResidentIndex};
-use mirage_index::{MountIndex, NodeIndex};
+use mirage_index::{FileView, MountIndex, NodeIndex};
 use mirage_pack::{PackReadEncryption, PackReader};
 use mirage_types::ByteCount;
 
@@ -109,6 +109,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             resident: None,
+            violations: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -175,6 +176,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             resident: None,
+            violations: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -247,6 +249,9 @@ pub unsafe extern "C" fn mirage_engine_create_cache(
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(1))),
             resident: Some(Arc::new(resident)),
+            violations: Some(Arc::new(ViolationLog::new(
+                state_root.join("seal-violations.log"),
+            ))),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -259,9 +264,11 @@ pub unsafe extern "C" fn mirage_engine_create_cache(
 pub unsafe extern "C" fn mirage_engine_destroy(handle: *mut MirageEngineHandle) -> MirageStatus {
     contained(|| {
         if !handle.is_null() {
-            unsafe {
-                drop(Box::from_raw(handle));
+            let engine = unsafe { Box::from_raw(handle) };
+            if let Some(log) = &engine.violations {
+                log.summary();
             }
+            drop(engine);
         }
         MirageStatus::Ok
     })
@@ -297,6 +304,9 @@ pub unsafe extern "C" fn mirage_lookup(
                 Ok(None) => return MirageStatus::NotFound,
                 Err(_) => return MirageStatus::IntegrityFailure,
             };
+            if let (NodeIndex::File(ordinal), Some(log)) = (node, &engine.violations) {
+                log.lookup(u64::from(ordinal), &path);
+            }
             let entry = match node {
                 NodeIndex::Directory(ordinal) => Entry {
                     index: u64::from(ordinal),
@@ -324,6 +334,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         readers: Arc::clone(&engine.readers),
                         pages: Arc::clone(&engine.pages),
                         resident: engine.resident.clone(),
+                        violations: engine.violations.clone(),
                     })),
                 )
             };
@@ -344,6 +355,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     readers: Arc::clone(&engine.readers),
                     pages: Arc::clone(&engine.pages),
                     resident: engine.resident.clone(),
+                    violations: engine.violations.clone(),
                 })),
             )
         };
@@ -362,6 +374,88 @@ pub unsafe extern "C" fn mirage_read(
     output: *mut u8,
     output_len: usize,
     transferred: *mut usize,
+) -> MirageStatus {
+    unsafe { read_impl(handle, offset, output, output_len, transferred, true, 0) }
+}
+
+/// Same as [`mirage_read`] but records the calling process id in seal-violation
+/// records so violations can be attributed to the process that issued the read.
+///
+/// # Safety
+/// Same contract as [`mirage_read`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_read_ex(
+    handle: *const MirageFileHandle,
+    offset: u64,
+    output: *mut u8,
+    output_len: usize,
+    transferred: *mut usize,
+    caller_pid: u32,
+) -> MirageStatus {
+    unsafe {
+        read_impl(
+            handle,
+            offset,
+            output,
+            output_len,
+            transferred,
+            true,
+            caller_pid,
+        )
+    }
+}
+
+/// Speculative read issued by the host's own read-ahead rather than by an application.
+///
+/// Identical to [`mirage_read`] except that a non-resident page is not recorded as a seal
+/// violation: only application-initiated reads count against ADR 0002's zero-violation gate.
+///
+/// # Safety
+/// Same contract as [`mirage_read`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_read_speculative(
+    handle: *const MirageFileHandle,
+    offset: u64,
+    output: *mut u8,
+    output_len: usize,
+    transferred: *mut usize,
+) -> MirageStatus {
+    unsafe { read_impl(handle, offset, output, output_len, transferred, false, 0) }
+}
+
+/// Best-effort `a/b/file` path for a mount-index file, resolved only on the
+/// violation path so a record can be attributed to the file that was actually
+/// opened rather than just its ordinal.
+fn file_path(index: &MountIndex, file: FileView<'_>) -> String {
+    let mut parts = vec![file.name().unwrap_or("?").to_owned()];
+    let mut dir = file.parent_index();
+    for _ in 0..64 {
+        let Ok(view) = index.directory_by_index(dir) else {
+            break;
+        };
+        if let Ok(name) = view.name()
+            && !name.is_empty()
+        {
+            parts.push(name.to_owned());
+        }
+        let parent = view.parent_index();
+        if parent == dir {
+            break;
+        }
+        dir = parent;
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+unsafe fn read_impl(
+    handle: *const MirageFileHandle,
+    offset: u64,
+    output: *mut u8,
+    output_len: usize,
+    transferred: *mut usize,
+    record_violations: bool,
+    caller_pid: u32,
 ) -> MirageStatus {
     contained(|| {
         if handle.is_null() || transferred.is_null() || (output.is_null() && output_len != 0) {
@@ -390,6 +484,16 @@ pub unsafe extern "C" fn mirage_read(
             let hash = page.plaintext_hash();
             if let Some(resident) = &handle.resident {
                 let Ok(Some(guard)) = resident.acquire(hash) else {
+                    if let (true, Some(log)) = (record_violations, &handle.violations) {
+                        log.record(
+                            file_ordinal,
+                            span.page_ordinal.as_u32(),
+                            offset,
+                            output_len,
+                            caller_pid,
+                            &file_path(index, file),
+                        );
+                    }
                     return MirageStatus::BackendUnavailable;
                 };
                 let dst = span.dst_offset as usize;

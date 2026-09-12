@@ -852,6 +852,32 @@ pub fn plan(
                 )?);
             }
         }
+        // Always pin the first and last page of every file: open-time probes
+        // (AV signature scans, indexers, cache-manager sniffing) read file heads
+        // and tails through the game's own handles and would otherwise record
+        // seal violations on pages no profile observed.
+        for ordinal in 0..index.file_count() {
+            let file =
+                index
+                    .file_by_index(u32::try_from(ordinal).map_err(|_| {
+                        MirageError::unsupported_layout("file ordinal exceeds u32")
+                    })?)?;
+            let size = file.logical_size();
+            if size == 0 {
+                continue;
+            }
+            let last = u32::try_from((size - 1) / index.header().page_size)
+                .map_err(|_| MirageError::unsupported_layout("file page ordinal exceeds u32"))?;
+            for page_ordinal in [0, last] {
+                all.insert(global_page_ordinal(
+                    &index,
+                    PageKey {
+                        file_index: file.ordinal(),
+                        page_ordinal,
+                    },
+                )?);
+            }
+        }
     }
     let mut mandatory = RoaringBitmap::new();
     for page in hard {
@@ -1021,7 +1047,13 @@ pub fn admit(
         RepositoryEvent::BeginAdmission,
         now_ns(),
     )?;
-    let store = LocalCapsuleStore::open(database, repository_id, &plan, None)?;
+    let store = match LocalCapsuleStore::open(database, repository_id, &plan, None) {
+        Ok(store) => store,
+        Err(error) => {
+            recover_to_mounted(database, repository_id, RepositoryState::AdmittingSession);
+            return Err(error);
+        }
+    };
     let result = futures_executor::block_on(admit_sealed_session(&plan, &store));
     let admitted = match result {
         Ok(admitted) => admitted,
@@ -1252,6 +1284,10 @@ struct LocalCapsuleStore {
     drive_transport: Option<Arc<RetryingHttpTransport>>,
     provider_ready: bool,
     encryption: Option<PackReadEncryption>,
+    /// Verified pack readers keyed by pack object ID. `PackReader::open_verified` hashes the
+    /// whole pack, so opening once per pack instead of once per page keeps materialization
+    /// from paying that cost for every page.
+    pack_readers: Mutex<BTreeMap<String, PackReader>>,
     reservations: Mutex<BTreeMap<mirage_types::PageHash, CacheSlotRecord>>,
     created_session: Mutex<Option<SessionId>>,
     checkpoint_path: PathBuf,
@@ -1345,6 +1381,7 @@ impl LocalCapsuleStore {
             drive_transport,
             provider_ready,
             encryption,
+            pack_readers: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(BTreeMap::new()),
             created_session: Mutex::new(None),
             checkpoint_path: repository_state_root(database, repository_id)?
@@ -1450,14 +1487,27 @@ impl CapsulePageStore for LocalCapsuleStore {
         validate_single_component(object_id, "pack object ID")?;
         let bytes = match self.origin {
             RuntimeOrigin::Local => {
-                let path = self.import_root.join(object_id);
-                let mut reader = match &self.encryption {
-                    Some(encryption) => {
-                        PackReader::open_verified_encrypted(&path, encryption.clone())?
-                    }
-                    None => PackReader::open_verified(&path)?,
-                };
-                reader.read_page(hash)?.page.bytes.to_vec()
+                // Synchronous section only: the std mutex guard must never be held across an
+                // `.await` (clippy `await_holding_lock`).
+                let mut readers = self.pack_readers.lock().map_err(|_| {
+                    MirageError::internal_invariant("pack reader cache lock poisoned")
+                })?;
+                if !readers.contains_key(object_id) {
+                    let path = self.import_root.join(object_id);
+                    let reader = match &self.encryption {
+                        Some(encryption) => {
+                            PackReader::open_verified_encrypted(&path, encryption.clone())?
+                        }
+                        None => PackReader::open_verified(&path)?,
+                    };
+                    readers.insert(object_id.to_owned(), reader);
+                }
+                let reader = readers.get_mut(object_id).ok_or_else(|| {
+                    MirageError::internal_invariant("pack reader vanished from cache")
+                })?;
+                let bytes = reader.read_page(hash)?.page.bytes.to_vec();
+                drop(readers);
+                bytes
             }
             RuntimeOrigin::Drive => {
                 if location.codec() != Codec::None {

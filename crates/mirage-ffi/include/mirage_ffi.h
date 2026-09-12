@@ -18,6 +18,10 @@ MirageStatus mirage_file_close(MirageFileHandle *handle);
 typedef struct MirageFileInfo { uint64_t stable_index; uint64_t size; uint8_t directory; uint8_t reserved[7]; } MirageFileInfo;
 MirageStatus mirage_file_stat(const MirageFileHandle *handle,MirageFileInfo *output);
 MirageStatus mirage_read(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred);
+/* Same as mirage_read but records the calling process id in seal-violation records. */
+MirageStatus mirage_read_ex(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred,uint32_t caller_pid);
+/* Host read-ahead: same as mirage_read but a non-resident page is not recorded as a seal violation. */
+MirageStatus mirage_read_speculative(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred);
 typedef uint8_t (*MirageEnumerateCallback)(void *context,const uint16_t *name,size_t name_len,MirageFileInfo info);
 MirageStatus mirage_enumerate(const MirageFileHandle *handle,const uint16_t *marker,size_t marker_len,size_t limit,void *context,MirageEnumerateCallback callback);
 #ifdef __cplusplus

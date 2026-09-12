@@ -77,7 +77,7 @@ impl MountControl for NativeMountControl {
                 id.clone(),
                 &HostSpec {
                     executable: self.executable.clone(),
-                    mount_point: mount_point.to_path_buf(),
+                    mount_point: winfsp_mount_point(mount_point),
                     index: index.to_path_buf(),
                     state_root: state_root.to_path_buf(),
                     owner_sid: owner_sid.to_owned(),
@@ -162,6 +162,26 @@ fn wait_for_mount_response(
     }
 }
 
+/// Converts a canonical (`\\?\`-prefixed) directory path into the plain form WinFsp accepts.
+///
+/// Registration stores canonical mount roots, but `FspFileSystemSetMountPoint` rejects verbatim
+/// paths with `STATUS_OBJECT_NAME_INVALID` when the host runs without elevation. `\\?\C:\dir`
+/// becomes `C:\dir` and `\\?\UNC\server\share` becomes `\\server\share`; anything else is returned
+/// unchanged.
+fn winfsp_mount_point(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.len() >= 3 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None => path.to_path_buf(),
+        },
+        None => path.to_path_buf(),
+    }
+}
+
 fn drive_root(path: &Path) -> Option<PathBuf> {
     let value = path.to_str()?;
     let bytes = value.as_bytes();
@@ -199,5 +219,28 @@ impl MountControl for UnavailableMountControl {
     }
     fn is_running(&mut self, _: RepositoryId) -> Result<bool, MirageError> {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::winfsp_mount_point;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_for_winfsp() {
+        assert_eq!(
+            winfsp_mount_point(Path::new(r"\\?\D:\Games\Example\assets")),
+            PathBuf::from(r"D:\Games\Example\assets")
+        );
+        assert_eq!(
+            winfsp_mount_point(Path::new(r"\\?\UNC\server\share\assets")),
+            PathBuf::from(r"\\server\share\assets")
+        );
+        assert_eq!(
+            winfsp_mount_point(Path::new(r"D:\Games\Example\assets")),
+            PathBuf::from(r"D:\Games\Example\assets")
+        );
+        assert_eq!(winfsp_mount_point(Path::new("M:")), PathBuf::from("M:"));
     }
 }

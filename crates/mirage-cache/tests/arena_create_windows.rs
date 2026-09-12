@@ -42,16 +42,15 @@ fn create_reopen_and_validate_sparse_logical_layout() {
 }
 
 #[test]
-fn wrong_header_and_acl_or_share_failure_are_closed() {
+fn wrong_header_is_rejected_and_concurrent_open_is_shared() {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("arena.bin");
     let shard = ArenaShard::create(&path, layout()).expect("create");
-    // Mandatory share-mode exclusion is provided by the Windows file handle.
-    #[cfg(windows)]
-    assert!(
-        ArenaShard::open(&path, layout()).is_err(),
-        "restrictive sharing must reject a second writer"
-    );
+    // The service (materialize/admit) and the WinFsp host hold the arena concurrently; sharing
+    // is deliberately permitted.
+    let concurrent =
+        ArenaShard::open(&path, layout()).expect("service and filesystem host share the arena");
+    drop(concurrent);
     drop(shard);
     let mut file = std::fs::OpenOptions::new()
         .read(true)
