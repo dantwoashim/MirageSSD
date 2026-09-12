@@ -2,7 +2,9 @@
 
 MirageSSD on macOS mounts your application-owned Google Drive folder at `~/MirageSSD` in Finder using the same pinned, patched rclone provider as Windows, with [macFUSE](https://macfuse.github.io/) in place of WinFsp. It is an **engineering preview** with the same data-safety limits as the Windows build: keep originals until the remote copy is verified.
 
-Requirements: **macOS 12 Monterey or newer** (Apple Silicon or Intel; download the build matching your Mac), **macFUSE**, at least **25 GiB free** on the startup disk (20 GiB cache budget plus a 5 GiB floor), internet, and a Google account.
+**[Download MirageSSD 0.1.2 preview (.dmg, Apple Silicon)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.2-preview/MirageSSD-0.1.2-preview-macos-arm64.dmg)** · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.2-preview)
+
+Requirements: **macOS 12 Monterey or newer** (published builds are Apple Silicon only; Intel Macs [build from source](#build-the-app-yourself)), **macFUSE**, at least **25 GiB free** on the startup disk (20 GiB cache budget plus a 5 GiB floor), internet, and a Google account.
 
 ## Install
 
@@ -58,5 +60,7 @@ cd MirageSSD
 The provider script checks out rclone `v1.75.0` at the pinned commit, applies the published patch, runs the `cmd/cmount` tests, and builds `v1.75.0-miragessd2` with CGO against the installed macFUSE SDK. The app script compiles `apps/mirage-macos/main.swift`, bundles the provider under `Contents/MacOS`, the OAuth Desktop-app registration under `Contents/Resources`, and upstream notices, then signs, verifies with `--check-package`, and writes `MirageSSD-<version>-macos-<arch>.{zip,dmg,sha256}` to `~/MirageSSD-Packages`.
 
 Create the Desktop-app OAuth client as described in [Configure Google sign-in](building.md#2-configure-google-sign-in). The registration must be kept outside the checkout. Build once per architecture; the script does not produce universal binaries.
+
+Published builds come from the `release-macos` GitHub Actions workflow, which runs on tag push or manually against an existing tag. It reads the Desktop-app registration from the `DRIVE_OAUTH_DESKTOP_JSON` repository secret, runs the two scripts above on a macOS runner, and attaches the DMG, ZIP, and `.sha256` to the release.
 
 For a Gatekeeper-clean release, pass `--sign "Developer ID Application: <team>"` and notarize the resulting DMG with `xcrun notarytool submit --wait` followed by `xcrun stapler staple`. The default `--sign -` produces an ad-hoc signature suitable only for previews.

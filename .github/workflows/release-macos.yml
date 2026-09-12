@@ -1,0 +1,78 @@
+name: release-macos
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the macOS build to (for example v0.1.2-preview)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-macos-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, arch: arm64 }
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Require the OAuth registration secret
+        env:
+          REGISTRATION: ${{ secrets.DRIVE_OAUTH_DESKTOP_JSON }}
+        run: |
+          if [ -z "$REGISTRATION" ]; then
+            echo '::error::DRIVE_OAUTH_DESKTOP_JSON secret is not set; cannot package a redistributable macOS build.'
+            exit 1
+          fi
+          printf '%s' "$REGISTRATION" > "$RUNNER_TEMP/oauth-desktop.json"
+          chmod 600 "$RUNNER_TEMP/oauth-desktop.json"
+
+      - name: Install macFUSE SDK
+        run: brew install --cask macfuse
+
+      - name: Build pinned provider
+        env:
+          GOTOOLCHAIN: auto
+        run: ./scripts/build-rclone-miragessd.sh
+
+      - name: Package MirageSSD.app
+        run: |
+          ./scripts/build-macos-app.sh \
+            --credentials "$RUNNER_TEMP/oauth-desktop.json" \
+            --output "$RUNNER_TEMP/packages" \
+            --version "${TAG#v}"
+          rm -f "$RUNNER_TEMP/oauth-desktop.json"
+          ls -l "$RUNNER_TEMP/packages"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: miragessd-macos-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/packages/
+          if-no-files-found: error
+
+      - name: Attach to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --title "MirageSSD ${TAG#v}" --generate-notes
+          fi
+          gh release upload "$TAG" "$RUNNER_TEMP"/packages/* --clobber

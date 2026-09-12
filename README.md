@@ -6,13 +6,15 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 
 **Status: Windows 11 x64 engineering preview, with a macOS 12+ preview app.** This is not yet a production backup system or a replacement for a physical SSD.
 
-## Download for Windows
+## Download
 
-**[Download MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.0-preview/MirageSSD-Setup-0.1.0-preview.exe)** · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.0-preview)
+**Windows:** [MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.0-preview/MirageSSD-Setup-0.1.0-preview.exe) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.0-preview)
 
-Download the installer above, not GitHub's **Code → Download ZIP** (which contains source code). Run it as your normal Windows user, choose **Install and connect Google Drive**, and sign in with your own Google account. Administrator approval is needed if WinFsp must be installed.
+**macOS (Apple Silicon):** [MirageSSD 0.1.2 preview (.dmg)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.2-preview/MirageSSD-0.1.2-preview-macos-arm64.dmg) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.2-preview) · [Install guide](docs/macos.md). Requires [macFUSE](https://macfuse.github.io/). Intel Macs: [build from source](docs/macos.md#build-the-app-yourself).
 
-The installer is **unsigned**. Do not disable Windows security to run it. Google OAuth is in production, so manual tester-email registration is no longer required; organization account policies may still restrict access. A fresh non-tester account and clean-PC installation have not yet been verified end to end.
+Download an installer above, not GitHub's **Code → Download ZIP** (which contains source code). On Windows, run it as your normal user, choose **Install and connect Google Drive**, and sign in with your own Google account. Administrator approval is needed if WinFsp must be installed.
+
+Both previews are **unsigned** (the macOS app is ad-hoc signed, not notarized). Do not disable Windows security or Gatekeeper to run them; on macOS, right-click the app → **Open** once. Google OAuth is in production, so manual tester-email registration is no longer required; organization account policies may still restrict access. A fresh non-tester account and clean-PC installation have not yet been verified end to end.
 
 [Build and install](docs/building.md) · [macOS preview](docs/macos.md) · [Architecture](docs/architecture.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md)
 
