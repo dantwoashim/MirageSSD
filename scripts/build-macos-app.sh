@@ -108,7 +108,13 @@ if [[ "$make_dmg" -eq 1 ]]; then
   mkdir -p "$dmg_root"
   cp -R "$app" "$dmg_root/"
   ln -s /Applications "$dmg_root/Applications"
-  hdiutil create -quiet -volname "MirageSSD $version" -srcfolder "$dmg_root" -ov -format UDZO "$base.dmg"
+  # hdiutil intermittently fails with "Resource busy" on shared CI runners; retry briefly.
+  for attempt in 1 2 3 4 5; do
+    if hdiutil create -volname "MirageSSD $version" -srcfolder "$dmg_root" -ov -format UDZO "$base.dmg"; then break; fi
+    [[ "$attempt" -lt 5 ]] || fail 'Disk image creation failed after 5 attempts.'
+    echo "hdiutil attempt $attempt failed; retrying..." >&2
+    sleep 5
+  done
   artifacts+=("$(basename "$base").dmg")
 fi
 (cd "$output" && shasum -a 256 "${artifacts[@]}" > "$(basename "$base").sha256")

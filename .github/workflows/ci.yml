@@ -122,9 +122,10 @@ jobs:
 
       - name: Package app with CI placeholder registration
         # Never a real client: exercises compile, bundle, sign, and --check-package only.
+        # The DMG is produced by release-macos; skipping it here avoids hdiutil flakiness.
         run: |
           printf '{"installed":{"client_id":"ci-placeholder.apps.googleusercontent.com","client_secret":"ci-placeholder","redirect_uris":["http://localhost"]}}' > "$RUNNER_TEMP/oauth-desktop.json"
-          ./scripts/build-macos-app.sh --credentials "$RUNNER_TEMP/oauth-desktop.json" --output "$RUNNER_TEMP/packages"
+          ./scripts/build-macos-app.sh --credentials "$RUNNER_TEMP/oauth-desktop.json" --output "$RUNNER_TEMP/packages" --no-dmg
           ls -l "$RUNNER_TEMP/packages"
 
   linux-gate:

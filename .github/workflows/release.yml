@@ -1,7 +1,9 @@
 name: release
 on:
   push:
-    tags: ['v*']
+    # MSI releases require an exact major.minor.patch version (build-release.ps1).
+    # Pre-release tags such as v0.1.2-preview are published by release-macos and by hand.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
 permissions:
   contents: read
 concurrency:
@@ -27,6 +29,23 @@ jobs:
         run: |
           dotnet tool install wix --tool-path .tools/wix --version 4.0.6
           ".tools/wix" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Acquire verified WinFsp SDK
+        shell: pwsh
+        run: ./scripts/acquire-winfsp-sdk.ps1 -Output ./target/winfsp-sdk -WixExecutable ./.tools/wix/wix.exe
+      - name: Install verified WinFsp runtime
+        shell: pwsh
+        run: |
+          $uri = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
+          $path = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri $uri -OutFile $path
+          $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+          if ($actual -ne '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A') { throw 'WinFsp checksum mismatch.' }
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $path, '/qn', '/norestart') -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "WinFsp installation failed: $($process.ExitCode)" }
+      - name: Build native adapter for mounted tests
+        run: |
+          cmake -S . -B build/windows-msvc-debug -A x64 "-DWINFSP_SDK_ROOT=${{ github.workspace }}/target/winfsp-sdk" -DMIRAGE_RUST_PROFILE=debug
+          cmake --build --preset windows-msvc-debug
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
