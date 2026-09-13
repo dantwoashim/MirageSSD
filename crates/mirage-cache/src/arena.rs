@@ -72,6 +72,60 @@ pub(crate) fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) 
     Ok(())
 }
 
+/// Read-only arena handle without cache-manager buffering. The mounted volume
+/// is already kernel-cached, so buffering arena reads here would hold every hot
+/// page in the cache manager twice.
+#[cfg(windows)]
+pub(crate) fn open_unbuffered_read(path: &std::path::Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_unbuffered_read(path: &std::path::Path) -> io::Result<File> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+/// 4096-aligned scratch buffer; `FILE_FLAG_NO_BUFFERING` requires the transfer
+/// buffer to be sector-aligned.
+pub(crate) struct AlignedBuf {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+#[allow(unsafe_code)]
+impl AlignedBuf {
+    pub fn new(size: usize) -> io::Result<Self> {
+        let layout = std::alloc::Layout::from_size_align(size, 4096)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: layout was just constructed as valid; a null allocation is
+        // checked immediately below.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        let ptr = std::ptr::NonNull::new(ptr).ok_or(io::ErrorKind::OutOfMemory)?;
+        Ok(Self { ptr, layout })
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` owns `layout.size()` bytes for the lifetime of self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`layout` came from the `alloc` call in `new` and are
+        // released exactly once here.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;

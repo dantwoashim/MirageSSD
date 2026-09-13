@@ -67,3 +67,29 @@ fn wrong_header_is_rejected_and_concurrent_open_is_shared() {
     drop(file);
     assert!(ArenaShard::open(&path, layout()).is_err());
 }
+
+#[test]
+#[cfg(windows)]
+fn unbuffered_shard_reads_unaligned_windows_exactly() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("arena.bin");
+    let shard = ArenaShard::create(&path, layout()).expect("create");
+    let page: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+    shard.write_slot(0, &page).expect("write slot");
+    shard.flush().expect("flush");
+    drop(shard);
+
+    let shard = ArenaShard::open_read_unbuffered(&path, layout()).expect("unbuffered open");
+    let cases: &[(u32, usize)] = &[(1, 1), (4095, 2), (0, 1024 * 1024), (1024 * 1024 - 7, 7)];
+    for &(offset, length) in cases {
+        let mut output = vec![0_u8; length];
+        shard
+            .read_slot(0, 1024 * 1024, offset, &mut output)
+            .expect("unbuffered read");
+        assert_eq!(
+            output.as_slice(),
+            &page[offset as usize..offset as usize + length],
+            "window at {offset} len {length}"
+        );
+    }
+}

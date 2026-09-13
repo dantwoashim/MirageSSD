@@ -92,6 +92,9 @@ NTSTATUS FileSystemHost::mount(const std::wstring& path,const std::wstring& inde
     // a fresh FileContext per open and free it in Close, so UserContext2 semantics are required;
     // node semantics would let a second open see a stale/freed context.
     params.UmFileContextIsUserContext2=1;
+    // INFINITE FileInfoTimeout is what enables kernel data caching and read-ahead in WinFsp;
+    // safe here because a mounted generation is immutable. Volume/dir info stay finite.
+    params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeout=1000;params.DirInfoTimeout=1000;
     auto status=FspFileSystemCreate(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME),&params,&interface_table,&fs_);if(!NT_SUCCESS(status))return status;fs_->UserContext=this;status=FspFileSystemSetMountPoint(fs_,const_cast<PWSTR>(path.c_str()));if(!NT_SUCCESS(status)){FspFileSystemDelete(fs_);fs_=nullptr;}return status;
 }
 NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;const auto status=FspFileSystemStartDispatcher(fs_,0);if(!NT_SUCCESS(status))return status;std::cout<<"MIRAGE_READY\n"<<std::flush;WaitForSingleObject(stop_event_,INFINITE);return STATUS_SUCCESS;}

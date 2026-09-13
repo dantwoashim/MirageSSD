@@ -289,9 +289,10 @@ unsafe fn create_cache_impl(
             db_journal_allowance: ByteCount::ZERO,
             filesystem_reserve: ByteCount::ZERO,
         };
-        let Ok(shard) =
-            ArenaShard::open(&state_root.join("cache").join(&spec.relative_path), layout)
-        else {
+        let Ok(shard) = ArenaShard::open_read_unbuffered(
+            &state_root.join("cache").join(&spec.relative_path),
+            layout,
+        ) else {
             return MirageStatus::IntegrityFailure;
         };
         let Ok(resident) =

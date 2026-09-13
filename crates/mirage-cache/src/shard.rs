@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use mirage_types::MirageError;
 
-use crate::arena::{open_restrictive, read_exact_at, write_exact_at};
+use crate::arena::{
+    AlignedBuf, open_restrictive, open_unbuffered_read, read_exact_at, write_exact_at,
+};
 use crate::format::{
     ARENA_HEADER_BYTES, ArenaHeader, CacheLayout, SLOT_METADATA_BYTES, SlotMetadata, SlotState,
 };
@@ -19,6 +21,7 @@ pub struct ArenaShard {
     file: File,
     metadata: File,
     layout: CacheLayout,
+    unbuffered: bool,
 }
 
 impl ArenaShard {
@@ -57,10 +60,29 @@ impl ArenaShard {
             file,
             metadata,
             layout,
+            unbuffered: false,
         })
     }
     pub fn open(path: &Path, expected: CacheLayout) -> Result<Self, MirageError> {
+        Self::open_inner(path, expected, false)
+    }
+    /// Read-only handle with `FILE_FLAG_NO_BUFFERING` (Windows). For the WinFsp host:
+    /// mounted volume data is already kernel-cached, so buffering the arena file here
+    /// would double-cache every hot page. Requires a 4096-multiple page size.
+    pub fn open_read_unbuffered(path: &Path, expected: CacheLayout) -> Result<Self, MirageError> {
+        Self::open_inner(path, expected, true)
+    }
+    fn open_inner(
+        path: &Path,
+        expected: CacheLayout,
+        unbuffered: bool,
+    ) -> Result<Self, MirageError> {
         expected.validate()?;
+        if unbuffered && !expected.page_size.as_u64().is_multiple_of(4096) {
+            return Err(MirageError::unsupported_layout(
+                "unbuffered cache reads require a 4096-multiple page size",
+            ));
+        }
         let file = open_restrictive(path, false).map_err(MirageError::from)?;
         let mut bytes = [0_u8; ARENA_HEADER_BYTES];
         read_exact_at(&file, &mut bytes, 0).map_err(MirageError::from)?;
@@ -84,11 +106,19 @@ impl ArenaShard {
                 "cache metadata sidecar does not match arena",
             ));
         }
+        // The header/metadata checks above used a buffered handle; swap in the
+        // unbuffered data handle only for the returned shard.
+        let file = if unbuffered {
+            open_unbuffered_read(path).map_err(MirageError::from)?
+        } else {
+            file
+        };
         Ok(Self {
             path: path.to_path_buf(),
             file,
             metadata,
             layout: expected,
+            unbuffered,
         })
     }
     #[must_use]
@@ -133,6 +163,9 @@ impl ArenaShard {
                 "cache read exceeds resident logical length",
             ));
         }
+        if self.unbuffered {
+            return self.read_slot_unbuffered(slot, offset, output);
+        }
         read_exact_at(
             &self.file,
             output,
@@ -141,6 +174,35 @@ impl ArenaShard {
                 .ok_or_else(|| MirageError::invalid_argument("cache read offset overflows"))?,
         )
         .map_err(MirageError::from)
+    }
+    /// `FILE_FLAG_NO_BUFFERING` read path: the requested window is rounded out to
+    /// 4096 inside the slot (the slot base and page size keep file offsets aligned;
+    /// the aligned end is clamped to the slot end, never past the arena's length),
+    /// read into an aligned scratch, then copied to the caller's window.
+    fn read_slot_unbuffered(
+        &self,
+        slot: u32,
+        offset: u32,
+        output: &mut [u8],
+    ) -> Result<(), MirageError> {
+        const ALIGN: u64 = 4096;
+        let start = u64::from(offset) & !(ALIGN - 1);
+        let slot_end = self.layout.page_size.as_u64();
+        let want_end = u64::from(offset) + output.len() as u64;
+        let end = ((want_end + ALIGN - 1) & !(ALIGN - 1)).min(slot_end);
+        let window = usize::try_from(end - start)
+            .map_err(|_| MirageError::internal_invariant("unaligned read window overflows"))?;
+        let mut scratch = AlignedBuf::new(window).map_err(MirageError::from)?;
+        read_exact_at(
+            &self.file,
+            scratch.as_mut_slice(),
+            self.slot_offset(slot)? + start,
+        )
+        .map_err(MirageError::from)?;
+        let rel = usize::try_from(u64::from(offset) - start)
+            .map_err(|_| MirageError::internal_invariant("unaligned read window overflows"))?;
+        output.copy_from_slice(&scratch.as_mut_slice()[rel..rel + output.len()]);
+        Ok(())
     }
     pub fn flush(&self) -> Result<(), MirageError> {
         self.file.sync_data().map_err(MirageError::from)
