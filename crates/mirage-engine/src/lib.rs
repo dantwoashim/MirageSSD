@@ -35,6 +35,7 @@ pub mod seal;
 pub mod space_lease;
 pub mod update;
 pub mod volume;
+pub mod workspace;
 
 pub use admission::{AdmissionStore, AdmittedSession, admit_sealed_session};
 pub use api::{EngineResult, ReadEngine};

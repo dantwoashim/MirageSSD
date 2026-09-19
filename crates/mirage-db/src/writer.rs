@@ -124,6 +124,9 @@ enum Command {
         i64,
         Reply<()>,
     ),
+    LeaseDeclare(crate::workspace_lease::WorkspaceLease, Reply<[u8; 16]>),
+    LeaseVerify([u8; 16], u64, u64, Vec<u8>, i64, Reply<()>),
+    LeaseRevoke([u8; 16], i64, Reply<()>),
     UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
     UploadSessionAdvance(
         [u8; 16],
@@ -487,6 +490,31 @@ impl DbWriter {
                                     status,
                                     now,
                                 ),
+                            );
+                        }
+                        Command::LeaseDeclare(lease, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::declare(&mut connection, &lease),
+                            );
+                        }
+                        Command::LeaseVerify(lease_id, bytes, pages, evidence, now, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::mark_verified(
+                                    &mut connection,
+                                    &lease_id,
+                                    bytes,
+                                    pages,
+                                    evidence,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::LeaseRevoke(lease_id, now, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::revoke(&mut connection, &lease_id, now),
                             );
                         }
                         Command::UploadSessionCreate(session, reply) => {
@@ -959,6 +987,40 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<(), MirageError> {
         self.request(|reply| Command::DivergenceResolve(volume_id, status, now_ns, reply))
+    }
+
+    /// Declares a workspace lease (idempotent on prefix).
+    pub fn lease_declare(
+        &self,
+        lease: crate::workspace_lease::WorkspaceLease,
+    ) -> Result<[u8; 16], MirageError> {
+        self.request(|reply| Command::LeaseDeclare(lease, reply))
+    }
+
+    /// Marks a lease verified with measured coverage and evidence.
+    pub fn lease_verify(
+        &self,
+        lease_id: [u8; 16],
+        bytes_verified: u64,
+        pages_pinned: u64,
+        evidence: Vec<u8>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::LeaseVerify(
+                lease_id,
+                bytes_verified,
+                pages_pinned,
+                evidence,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    /// Revokes a lease; covered pages become eviction candidates.
+    pub fn lease_revoke(&self, lease_id: [u8; 16], now_ns: i64) -> Result<(), MirageError> {
+        self.request(|reply| Command::LeaseRevoke(lease_id, now_ns, reply))
     }
 
     /// Creates a durable upload session before the first remote call.

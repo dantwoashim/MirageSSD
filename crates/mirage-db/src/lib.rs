@@ -24,6 +24,7 @@ pub mod uninstall;
 pub mod update;
 pub mod upload_session;
 mod value;
+pub mod workspace_lease;
 mod writer;
 
 use std::path::Path;
@@ -55,6 +56,7 @@ pub use space_lease::{NewSpaceLease, SpaceLeaseEvent, SpaceLeaseRecord, SpaceLea
 pub use uninstall::{UninstallSafetyReport, check_uninstall_safety};
 pub use update::{ActiveUpdate, NativeSnapshot, NewUpdateJournal, OverlayPage};
 pub use upload_session::{SessionKind, SessionPhase, UploadSession as PublicationSession};
+pub use workspace_lease::{LeaseStatus, WorkspaceLease};
 pub use writer::DbWriter;
 
 #[derive(Debug, Clone)]
