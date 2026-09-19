@@ -172,7 +172,36 @@ impl ControlPlaneHandler {
             .into_iter()
             .find(|item| item.repository_id == repository_id)
             .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
-        Ok(ResponseBody::Json(summary_json(&repository)))
+        let mut summary = summary_json(&repository);
+        // Truthful durability state: pending journal depth, live divergence,
+        // and verified workspace coverage — never optimistic.
+        let volume = repository_id;
+        let pending_operations = self
+            .database
+            .replayable_operations(volume)
+            .map(|operations| operations.len())
+            .unwrap_or(0);
+        let diverged = self
+            .database
+            .live_divergence(volume)
+            .ok()
+            .flatten()
+            .is_some_and(|divergence| divergence.status == mirage_db::DivergenceStatus::Diverged);
+        let verified_workspace_bytes: u64 = self
+            .database
+            .workspace_leases(volume)
+            .map(|leases| {
+                leases
+                    .iter()
+                    .filter(|lease| lease.status == mirage_db::LeaseStatus::Verified)
+                    .map(|lease| lease.bytes_verified)
+                    .sum()
+            })
+            .unwrap_or(0);
+        summary["pending_local_operations"] = json!(pending_operations);
+        summary["diverged"] = json!(diverged);
+        summary["verified_workspace_bytes"] = json!(verified_workspace_bytes);
+        Ok(ResponseBody::Json(summary))
     }
 
     fn reap_completed_launches(&self) -> Result<(), MirageError> {
@@ -835,6 +864,11 @@ impl ControlPlaneHandler {
             .map_or(database_mount_root.as_path(), |record| {
                 record.mount_point.as_path()
             });
+        // Lifecycle ordering: quiesce → flush fence over committed journal
+        // operations → unmount. A flush failure blocks the unmount rather
+        // than silently dropping the durability boundary.
+        mirage_engine::journal::LocalJournal::new(self.database.clone(), repository_id)
+            .flush_fence(now_ns())?;
         let unmounted = self
             .mounts
             .lock()

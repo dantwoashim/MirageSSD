@@ -221,7 +221,7 @@ fn load_session(
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, 0))?,
                     total_bytes: row
                         .get::<_, Option<i64>>(10)?
-                        .map(|bytes| u64::try_from(bytes))
+                        .map(u64::try_from)
                         .transpose()
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, 0))?,
                     next_ops: row.get::<_, Option<Vec<u8>>>(11)?.unwrap_or_default(),
@@ -239,6 +239,7 @@ fn load_session(
 
 /// Advances the session phase; transitions are forward-only except
 /// `uploading`→`initiated`/`created` restarts allowed by recovery.
+#[allow(clippy::too_many_arguments)]
 pub fn advance_phase(
     connection: &mut Connection,
     session_id: &[u8; 16],

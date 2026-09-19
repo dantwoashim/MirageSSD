@@ -5,7 +5,7 @@
 //! block the export rather than writing placeholders.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mirage_types::MirageError;
 

@@ -36,6 +36,7 @@ impl<'a> Reconciler<'a> {
     ///
     /// On `Diverged` a divergence record is written and both heads stay
     /// visible — publication must not silently overwrite the remote.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe(
         &self,
         remote_head: RemoteHead,

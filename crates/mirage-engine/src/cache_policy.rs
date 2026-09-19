@@ -101,10 +101,10 @@ impl TwoQ {
             self.a1in_set.remove(&evicted);
             self.a1out.push_back(evicted);
             self.a1out_set.insert(evicted);
-            if self.a1out.len() > self.a1out_capacity {
-                if let Some(ghost) = self.a1out.pop_front() {
-                    self.a1out_set.remove(&ghost);
-                }
+            if self.a1out.len() > self.a1out_capacity
+                && let Some(ghost) = self.a1out.pop_front()
+            {
+                self.a1out_set.remove(&ghost);
             }
         }
         self.a1in.push_back(hash);
