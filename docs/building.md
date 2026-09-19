@@ -25,7 +25,7 @@ cargo build --release --locked -p mirage-cli
 
 Outputs: `target/release/mirage.exe` and `target/rclone-miragessd/rclone.exe`.
 
-The provider script checks out a fixed rclone `v1.75.0` commit, applies the published patch, tests `cmd/cmount`, and builds `v1.75.0-miragessd2`. An ordinary rclone binary is not a substitute.
+The provider script checks out a fixed rclone `v1.75.1` commit, applies the published patch, tests `cmd/cmount`, and builds `v1.75.1-miragessd3`. An ordinary rclone binary is not a substitute. The preserved shipping baseline remains selectable with `-Variant miragessd2` (rclone `v1.75.0` → `v1.75.0-miragessd2`); see `third_party/rclone-miragessd/README.md`.
 
 ## 2. Configure Google sign-in
 

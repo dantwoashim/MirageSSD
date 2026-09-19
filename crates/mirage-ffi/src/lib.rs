@@ -118,6 +118,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             coalesced: Arc::new(handles::CoalescedReads::default()),
             violations: None,
             trace_lookups: false,
+            coordinator: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -190,6 +191,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             coalesced: Arc::new(handles::CoalescedReads::default()),
             violations: None,
             trace_lookups: false,
+            coordinator: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -312,6 +314,20 @@ unsafe fn create_cache_impl(
         else {
             return MirageStatus::IntegrityFailure;
         };
+        // Acquire single-owner volume coordination before serving state: a
+        // second host on the same state root fails here instead of racing.
+        let coordinator = match mirage_engine::volume::VolumeCoordinator::acquire(
+            &state_root,
+            index.header().repository_id,
+        ) {
+            Ok(coordinator) => Arc::new(coordinator),
+            Err(error) => {
+                return match error.kind {
+                    MirageErrorKind::RepositoryConflict => MirageStatus::Conflict,
+                    _ => MirageStatus::IntegrityFailure,
+                };
+            }
+        };
         let (object_root, encryption) = if origin_root_len != 0 {
             let Ok(origin_root) = String::from_utf16(origin_units) else {
                 return MirageStatus::InvalidArgument;
@@ -358,6 +374,7 @@ unsafe fn create_cache_impl(
             ))),
             trace_lookups: std::env::var_os("MIRAGE_TRACE_LOOKUPS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
+            coordinator: Some(coordinator),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -377,6 +394,85 @@ pub unsafe extern "C" fn mirage_engine_destroy(handle: *mut MirageEngineHandle) 
             drop(engine);
         }
         MirageStatus::Ok
+    })
+}
+/// Report the volume ownership epoch for fencing service-side control
+/// requests against a restarted host.
+///
+/// # Safety
+/// `engine` must be a live engine handle; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_epoch(
+    engine: *const MirageEngineHandle,
+    output: *mut u64,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() || output.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let epoch = unsafe { &*engine }
+            .coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.epoch())
+            .unwrap_or(0);
+        unsafe { ptr::write(output, epoch) };
+        MirageStatus::Ok
+    })
+}
+/// Mark the volume mounted once the host's dispatcher is live. A coordinator
+/// adopted in `Recovering` is advanced through `Starting` first.
+///
+/// # Safety
+/// `engine` must be a live engine handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_mark_mounted(
+    engine: *const MirageEngineHandle,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let Some(coordinator) = &unsafe { &*engine }.coordinator else {
+            return MirageStatus::Ok;
+        };
+        use mirage_engine::volume::VolumeState;
+        let mark = || -> Result<(), MirageError> {
+            if coordinator.state() == VolumeState::Recovering {
+                coordinator.transition(VolumeState::Starting)?;
+            }
+            if coordinator.state() == VolumeState::Starting {
+                coordinator.transition(VolumeState::Mounted)?;
+            }
+            Ok(())
+        };
+        match mark() {
+            Ok(()) => MirageStatus::Ok,
+            Err(_) => MirageStatus::IntegrityFailure,
+        }
+    })
+}
+/// Quiesce the volume: stop admitting reads, drain active readers up to
+/// `timeout_ms`, then mark the volume unmounted. The coordinator is released
+/// by `mirage_engine_destroy`.
+///
+/// # Safety
+/// `engine` must be a live engine handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_quiesce(
+    engine: *const MirageEngineHandle,
+    timeout_ms: u32,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let Some(coordinator) = &unsafe { &*engine }.coordinator else {
+            return MirageStatus::Ok;
+        };
+        match coordinator.quiesce(std::time::Duration::from_millis(u64::from(timeout_ms))) {
+            Ok(()) => MirageStatus::Ok,
+            Err(_) => MirageStatus::WouldBlock,
+        }
     })
 }
 /// # Safety
@@ -447,6 +543,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         shard: engine.shard.clone(),
                         coalesced: Arc::clone(&engine.coalesced),
                         violations: engine.violations.clone(),
+                        coordinator: engine.coordinator.clone(),
                         logical_path: Default::default(),
                         caller_image: Default::default(),
                     })),
@@ -474,6 +571,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     shard: engine.shard.clone(),
                     coalesced: Arc::clone(&engine.coalesced),
                     violations: engine.violations.clone(),
+                    coordinator: engine.coordinator.clone(),
                     logical_path: Default::default(),
                     caller_image: Default::default(),
                 })),
@@ -597,6 +695,9 @@ unsafe fn read_impl(
             return MirageStatus::IntegrityFailure;
         };
         let output = unsafe { std::slice::from_raw_parts_mut(output, output_len) };
+        // Pages read under a mounted coordinator are leased for the duration
+        // of this call so live eviction can never take a slot mid-read.
+        let mut reader_leases = Vec::new();
         let mut span_index = 0;
         while span_index < spans.len() {
             let span = &spans[span_index];
@@ -604,6 +705,14 @@ unsafe fn read_impl(
                 return MirageStatus::IntegrityFailure;
             };
             let hash = page.plaintext_hash();
+            if let Some(coordinator) = &handle.coordinator
+                && coordinator.state() == mirage_engine::volume::VolumeState::Mounted
+            {
+                match coordinator.begin_read(hash) {
+                    Ok(lease) => reader_leases.push(lease),
+                    Err(_) => return MirageStatus::Conflict,
+                }
+            }
             if let Some(resident) = &handle.resident {
                 match resident.acquire(hash) {
                     Ok(Some(first_guard)) => {

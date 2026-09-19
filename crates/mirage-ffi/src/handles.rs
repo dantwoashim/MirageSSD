@@ -208,6 +208,9 @@ pub struct MirageEngineHandle {
     pub coalesced: Arc<CoalescedReads>,
     pub violations: Option<Arc<ViolationLog>>,
     pub trace_lookups: bool,
+    /// Single-owner coordinator for the mounted volume; `None` for the
+    /// legacy read-only engines that never own writable state.
+    pub coordinator: Option<Arc<mirage_engine::volume::VolumeCoordinator>>,
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -223,6 +226,9 @@ pub struct MirageFileHandle {
     pub shard: Option<Arc<ArenaShard>>,
     pub coalesced: Arc<CoalescedReads>,
     pub violations: Option<Arc<ViolationLog>>,
+    /// Shares the engine's volume coordinator so reads can lease pages
+    /// against live eviction.
+    pub coordinator: Option<Arc<mirage_engine::volume::VolumeCoordinator>>,
     pub logical_path: std::sync::OnceLock<String>,
     pub caller_image: Mutex<Option<(u32, Arc<str>)>>,
 }
@@ -257,6 +263,7 @@ impl MirageEngineHandle {
             coalesced: Arc::new(CoalescedReads::default()),
             violations: None,
             trace_lookups: false,
+            coordinator: None,
         }
     }
     /// Owner-side origin decodes performed by this engine.

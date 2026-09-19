@@ -15,7 +15,7 @@ pub mod path;
 pub mod signature;
 pub mod validate;
 
-pub use builder::{ManifestBuilder, ManifestFile, ManifestPage};
+pub use builder::{ManifestBuilder, ManifestFile, ManifestPage, NamespaceSeedEntry, namespace_seed};
 pub use chain::{ChainConflict, ChainValidationError, select_highest_valid_chain, validate_link};
 pub use classify::{ClassificationRuleSet, ClassificationVerdict};
 pub use codec::{DecodeLimits, decode_manifest_bounded, encode_manifest};

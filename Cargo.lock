@@ -1064,6 +1064,7 @@ dependencies = [
  "mirage-simulator",
  "mirage-types",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -1186,6 +1187,7 @@ dependencies = [
  "mirage-types",
  "roaring",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio-util",
 ]
@@ -1220,6 +1222,7 @@ dependencies = [
  "mirage-cache",
  "mirage-crypto",
  "mirage-db",
+ "mirage-engine",
  "mirage-index",
  "mirage-manifest",
  "mirage-pack",

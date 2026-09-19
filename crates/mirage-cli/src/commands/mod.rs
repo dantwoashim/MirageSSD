@@ -10,6 +10,7 @@ mod device_backup;
 mod device_drive;
 mod drive_gate;
 mod drive_live;
+mod recovery;
 mod repo_drive;
 mod repo_import_local;
 mod repo_local;
@@ -559,6 +560,56 @@ pub enum RepoCommand {
     Repair {
         repository_id: mirage_types::RepositoryId,
     },
+    /// Export, verify, or restore a portable recovery envelope.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Export an encrypted recovery envelope containing the repository content key.
+    Export {
+        /// Import directory holding the DPAPI-protected repository key record.
+        #[arg(long)]
+        import: std::path::PathBuf,
+        /// New file receiving the encrypted envelope. Refuses to overwrite.
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret. It is never logged or persisted elsewhere.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Optional DPAPI-protected signer record to include for authority recovery.
+        #[arg(long)]
+        signer_store: Option<std::path::PathBuf>,
+    },
+    /// Verify a recovery envelope decrypts to this repository's content key.
+    Verify {
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Import directory whose key record the envelope must match. When supplied,
+        /// a durable verification record is written for the reclamation gate.
+        #[arg(long)]
+        import: Option<std::path::PathBuf>,
+        /// Expected repository when --import is not available.
+        #[arg(long)]
+        repository_id: Option<mirage_types::RepositoryId>,
+    },
+    /// Restore envelope secrets into a fresh DPAPI-protected key store on this machine.
+    Import {
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Directory receiving the restored repository key record.
+        #[arg(long)]
+        destination: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -948,6 +999,37 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             RepoCommand::Repair { repository_id } => {
                 service::run(mirage_ipc::Command::Repair { repository_id }, json)
             }
+            RepoCommand::Recovery { command } => match command {
+                RecoveryCommand::Export {
+                    import,
+                    envelope,
+                    secret_file,
+                    signer_store,
+                } => recovery::export(
+                    &import,
+                    &envelope,
+                    &secret_file,
+                    signer_store.as_deref(),
+                    json,
+                ),
+                RecoveryCommand::Verify {
+                    envelope,
+                    secret_file,
+                    import,
+                    repository_id,
+                } => recovery::verify(
+                    &envelope,
+                    &secret_file,
+                    import.as_deref(),
+                    repository_id,
+                    json,
+                ),
+                RecoveryCommand::Import {
+                    envelope,
+                    secret_file,
+                    destination,
+                } => recovery::import(&envelope, &secret_file, &destination, json),
+            },
         },
         Command::Profile { command } => match command {
             ProfileCommand::Configure {

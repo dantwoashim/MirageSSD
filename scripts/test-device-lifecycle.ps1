@@ -150,6 +150,15 @@ class FakeMirage {
   Assert-True (($result -join "`n" | ConvertFrom-Json).Installed) 'Reinstall after uninstall failed.'
   Assert-True ((Get-Content -LiteralPath $token -Raw) -eq 'account-b') 'Reinstall changed the account.'
   $fixture.Cases++
+  # A pending upload must block uninstall without deleting anything.
+  New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($metadata)) -Force | Out-Null
+  '{"Dirty":true}' | Set-Content -LiteralPath $metadata
+  & (Join-Path $device 'uninstall-device-drive.ps1') -InstallRoot $device -Quiet -NoConfirm | Out-Null
+  Assert-True ($LASTEXITCODE -eq 1) 'Pending upload did not block uninstall.'
+  Assert-True (Test-Path -LiteralPath $installedBinary) 'Blocked uninstall removed the executable.'
+  Assert-True (((Get-Content -LiteralPath $metadata -Raw | ConvertFrom-Json).Dirty) -eq $true) 'Blocked uninstall removed pending uploads.'
+  '{"Dirty":false}' | Set-Content -LiteralPath $metadata
+  $fixture.Cases++
   # An open executable must fail safely without hiding the uninstall entry.
   $locked = [IO.File]::Open($installedBinary, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
   try {

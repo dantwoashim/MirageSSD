@@ -10,7 +10,7 @@ use mirage_types::{ByteCount, GenerationId, MirageError, PageHash, RepositoryId}
 use serde::{Deserialize, Serialize};
 
 use crate::index::PackEntry;
-use crate::pager::page_path;
+use crate::pager::page_path_streaming;
 use crate::reader::PackReader;
 use crate::writer::{CompletedPack, PackEncryption, PackWriter, PackWriterOptions};
 
@@ -108,9 +108,10 @@ pub fn import_local_with_cancel(
         virtual_bytes = virtual_bytes
             .checked_add(metadata.len())
             .ok_or_else(|| MirageError::invalid_argument("virtual byte count overflows"))?;
-        let pages = page_path(&source, plan.page_size)?;
-        let mut sequence = Vec::with_capacity(pages.len());
-        for page in pages {
+        let pager = page_path_streaming(&source, plan.page_size)?;
+        let mut sequence = Vec::with_capacity(pager.size_hint().0);
+        for page in pager {
+            let page = page?;
             sequence.push(page.hash);
             if locations.contains_key(&page.hash)
                 || writer

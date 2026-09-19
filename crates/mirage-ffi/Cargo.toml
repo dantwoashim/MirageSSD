@@ -16,6 +16,7 @@ mirage-pack.workspace=true
 mirage-crypto.workspace=true
 mirage-cache.workspace=true
 mirage-db.workspace=true
+mirage-engine.workspace=true
 mirage-scheduler.workspace=true
 [dev-dependencies]
 mirage-manifest.workspace=true

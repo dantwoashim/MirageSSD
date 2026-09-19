@@ -197,6 +197,61 @@ fn ensure_directories(
     Ok(parent_index)
 }
 
+/// One namespace seed node derived from a manifest path.
+#[derive(Debug, Clone)]
+pub struct NamespaceSeedEntry {
+    /// Normalized `/`-separated relative path, as stored in the manifest.
+    pub path: String,
+    pub is_directory: bool,
+    pub size: u64,
+}
+
+/// Translates a verified manifest into namespace seed nodes: one entry per
+/// manifest directory and file, keyed by normalized relative path so the
+/// durable namespace can be seeded and the legacy translation map populated.
+#[must_use]
+pub fn namespace_seed(manifest: &RepositoryManifest) -> Vec<NamespaceSeedEntry> {
+    let mut directories = Vec::with_capacity(manifest.directories.len());
+    for (index, directory) in manifest.directories.iter().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let mut parts = vec![directory.name.clone()];
+        let mut parent = directory.parent;
+        while let Some(index) = parent {
+            let node = &manifest.directories[index as usize];
+            parts.push(node.name.clone());
+            parent = node.parent;
+        }
+        parts.reverse();
+        directories.push(NamespaceSeedEntry {
+            path: parts.join("/"),
+            is_directory: true,
+            size: 0,
+        });
+    }
+    let mut entries = directories;
+    entries.extend(manifest.files.iter().map(|file| {
+        let parent = &manifest.directories[file.parent_directory as usize];
+        let mut parts = vec![file.name.clone()];
+        let mut cursor = parent.parent;
+        let mut chain = vec![parent.name.clone()];
+        while let Some(index) = cursor {
+            let node = &manifest.directories[index as usize];
+            chain.push(node.name.clone());
+            cursor = node.parent;
+        }
+        chain.reverse();
+        parts.splice(0..0, chain.into_iter().filter(|name| !name.is_empty()));
+        NamespaceSeedEntry {
+            path: parts.join("/"),
+            is_directory: false,
+            size: file.logical_size.as_u64(),
+        }
+    }));
+    entries
+}
+
 fn stable_id(path: &str) -> StableFileId {
     let hash = blake3::hash(path.to_ascii_lowercase().as_bytes());
     let mut bytes = [0_u8; 8];

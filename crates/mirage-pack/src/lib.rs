@@ -22,7 +22,7 @@ pub use frame::{DecodedFrame, decode_plain_frame, encode_plain_frame};
 pub use import::{ImportPlan, ImportReport, ImportedRepository, PlannedFile, import_local};
 pub use index::PackEntry;
 pub use page::PlainPage;
-pub use pager::{PageIter, page_file, page_path};
+pub use pager::{PageIter, SourcePager, page_file, page_path, page_path_streaming};
 pub use range_plan::{PlannedRange, plan_ranges};
 pub use reader::{PackReadEncryption, PackReader};
 pub use writer::{CompletedPack, PackEncryption, PackWriter, PackWriterOptions};

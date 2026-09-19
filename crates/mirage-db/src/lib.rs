@@ -8,6 +8,7 @@ pub mod generation;
 pub mod integrity;
 pub mod lease;
 mod migrate;
+pub mod namespace;
 mod open;
 pub mod pin;
 pub mod remote_object;
@@ -31,6 +32,7 @@ pub use cache::{
 pub use generation::{ActiveGeneration, VerifiedGeneration};
 pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;
+pub use namespace::{DirEntry, NamespaceNodeKind, NamespaceSeedNode, NamespaceStat};
 pub use open::{APPLICATION_ID, ReadPool};
 pub use pin::{CachePinRecord, PersistentPinReason};
 pub use remote_object::{

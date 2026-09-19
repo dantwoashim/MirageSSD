@@ -6,6 +6,7 @@ pub mod bytes;
 pub mod error;
 pub mod hash;
 pub mod id;
+pub mod inode;
 pub mod range;
 pub mod readiness;
 pub mod retry;
@@ -19,6 +20,7 @@ pub use id::{
     CapsuleId, DeviceId, GenerationId, PackId, RepositoryId, SessionId, SpaceLeaseId, StableFileId,
     UpdateId,
 };
+pub use inode::{InodeId, NAMING_POLICY_VERSION, ROOT_INODE_SEED, fold_name, root_inode};
 pub use range::{CheckedRange, PageSlice};
 pub use readiness::{
     FetchFailureCause, PresentationBackend, QualificationVersions, READINESS_SCHEMA_VERSION,

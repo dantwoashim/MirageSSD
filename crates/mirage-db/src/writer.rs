@@ -11,6 +11,8 @@ use crate::cache::{
 };
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
+use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
+use mirage_types::{InodeId, RepositoryId};
 use crate::pin::{self, PersistentPinReason};
 use crate::remote_object::{
     self, BackendAccount, RemoteObjectRecord, UploadAdvance, UploadSession,
@@ -57,6 +59,36 @@ enum Command {
     FinishSession(FinishSession, Reply<()>),
     CreateSpaceLease(NewSpaceLease, Reply<()>),
     TransitionSpaceLease(SpaceLeaseTransition, Reply<SpaceLeaseState>),
+    CreateNamespaceVolume(RepositoryId, i64, Reply<InodeId>),
+    NamespaceCreate(
+        RepositoryId,
+        InodeId,
+        String,
+        NamespaceNodeKind,
+        i64,
+        Reply<DirEntry>,
+    ),
+    NamespaceRename(
+        RepositoryId,
+        InodeId,
+        String,
+        InodeId,
+        String,
+        i64,
+        Reply<()>,
+    ),
+    NamespaceDelete(RepositoryId, InodeId, String, Reply<()>),
+    NamespaceSetFileRoots(
+        RepositoryId,
+        InodeId,
+        u64,
+        Option<[u8; 32]>,
+        Option<[u8; 32]>,
+        i64,
+        Reply<()>,
+    ),
+    NamespaceRecordLegacy(RepositoryId, String, InodeId, Reply<()>),
+    NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -191,6 +223,87 @@ impl DbWriter {
                         }
                         Command::TransitionSpaceLease(value, reply) => {
                             respond(reply, space_lease::transition(&mut connection, value));
+                        }
+                        Command::CreateNamespaceVolume(volume_id, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_volume(&mut connection, volume_id, now_ns),
+                            );
+                        }
+                        Command::NamespaceCreate(volume_id, parent, name, kind, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_node(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    kind,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceRename(
+                            volume_id,
+                            from_parent,
+                            from_name,
+                            to_parent,
+                            to_name,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::rename(
+                                    &mut connection,
+                                    volume_id,
+                                    from_parent,
+                                    &from_name,
+                                    to_parent,
+                                    &to_name,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceDelete(volume_id, parent, name, reply) => {
+                            respond(
+                                reply,
+                                namespace::delete_node(&mut connection, volume_id, parent, &name),
+                            );
+                        }
+                        Command::NamespaceSetFileRoots(
+                            volume_id,
+                            inode,
+                            size,
+                            version_root,
+                            extent_root,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::set_file_roots(
+                                    &mut connection,
+                                    volume_id,
+                                    inode,
+                                    size,
+                                    version_root,
+                                    extent_root,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceRecordLegacy(volume_id, path, inode, reply) => {
+                            respond(
+                                reply,
+                                namespace::record_legacy(&mut connection, volume_id, &path, inode),
+                            );
+                        }
+                        Command::NamespaceSeed(volume_id, nodes, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::seed_volume(&mut connection, volume_id, nodes, now_ns),
+                            );
                         }
                         Command::CreateUpdateJournal(value, reply) => {
                             respond(reply, update::create_journal(&mut connection, value));
@@ -371,6 +484,103 @@ impl DbWriter {
         value: SpaceLeaseTransition,
     ) -> Result<SpaceLeaseState, MirageError> {
         self.request(|reply| Command::TransitionSpaceLease(value, reply))
+    }
+
+    pub fn create_namespace_volume(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<InodeId, MirageError> {
+        self.request(|reply| Command::CreateNamespaceVolume(volume_id, now_ns, reply))
+    }
+
+    pub fn namespace_create(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        kind: NamespaceNodeKind,
+        now_ns: i64,
+    ) -> Result<DirEntry, MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| Command::NamespaceCreate(volume_id, parent, name, kind, now_ns, reply))
+    }
+
+    pub fn namespace_rename(
+        &self,
+        volume_id: RepositoryId,
+        from_parent: InodeId,
+        from_name: &str,
+        to_parent: InodeId,
+        to_name: &str,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        let from_name = from_name.to_owned();
+        let to_name = to_name.to_owned();
+        self.request(|reply| {
+            Command::NamespaceRename(
+                volume_id,
+                from_parent,
+                from_name,
+                to_parent,
+                to_name,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    pub fn namespace_delete(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<(), MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, reply))
+    }
+
+    pub fn namespace_set_file_roots(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        size: u64,
+        version_root: Option<[u8; 32]>,
+        extent_root: Option<[u8; 32]>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::NamespaceSetFileRoots(
+                volume_id,
+                inode,
+                size,
+                version_root,
+                extent_root,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    pub fn namespace_record_legacy(
+        &self,
+        volume_id: RepositoryId,
+        legacy_path: &str,
+        inode: InodeId,
+    ) -> Result<(), MirageError> {
+        let legacy_path = legacy_path.to_owned();
+        self.request(|reply| Command::NamespaceRecordLegacy(volume_id, legacy_path, inode, reply))
+    }
+
+    /// Bulk-seeds a volume's namespace from a verified manifest tree in one
+    /// transaction; idempotent once a volume exists.
+    pub fn namespace_seed(
+        &self,
+        volume_id: RepositoryId,
+        nodes: Vec<NamespaceSeedNode>,
+        now_ns: i64,
+    ) -> Result<usize, MirageError> {
+        self.request(|reply| Command::NamespaceSeed(volume_id, nodes, now_ns, reply))
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {

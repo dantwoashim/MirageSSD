@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use mirage_backend::{
     BackendError, BackendErrorClass, BackendId, BackendRead, DeletionProof, FetchClass,
     ObjectBackend, ObjectKind, ObjectStat, RemoteObjectRef, UploadSource,
@@ -85,12 +86,24 @@ impl ObjectBackend for DriveObjectBackend {
             ));
         }
         let length = source.length.as_u64();
-        let bytes = source.collect_bounded(length).await?;
-        if blake3::hash(&bytes).as_bytes() != expected_hash.as_bytes() {
-            return Err(BackendError::integrity("Drive upload source hash mismatch"));
-        }
+        // Packs are verified as encrypted from their header prefix so the
+        // upload body can stream through instead of collecting in memory.
+        let mut source_stream = source.into_stream();
         if kind == ObjectKind::Pack {
-            require_encrypted_pack(&bytes)?;
+            let mut header = bytes::BytesMut::new();
+            while header.len() < mirage_pack::format::PACK_HEADER_LEN {
+                match futures_util::StreamExt::next(&mut source_stream).await {
+                    Some(Ok(chunk)) => header.extend_from_slice(&chunk),
+                    Some(Err(error)) => return Err(error),
+                    None => break,
+                }
+            }
+            require_encrypted_pack(&header)?;
+            let prefix = header.freeze();
+            let expected = source_stream.remaining() + prefix.len() as u64;
+            let rebuilt =
+                futures_util::stream::once(async move { Ok(prefix) }).chain(source_stream);
+            source_stream = mirage_backend::BackendByteStream::new(rebuilt, expected);
         }
         if let Some(existing) = crate::lookup::find_exact(
             self.transport.as_ref(),
@@ -109,12 +122,15 @@ impl ObjectBackend for DriveObjectBackend {
         properties.insert("mirage_kind".into(), kind.as_str().into());
         properties.insert("mirage_hash".into(), expected_hash.to_string());
         let name = format!("{}-{expected_hash}.bin", kind.as_str());
-        let completed = crate::upload::upload_bytes(
+        let source = UploadSource::new(ByteCount::from_u64(length), source_stream)
+            .map_err(|_| BackendError::integrity("Drive upload source length changed"))?;
+        let completed = crate::upload::upload_stream(
             self.transport.as_ref(),
             &self.token,
             &name,
             &properties,
-            bytes,
+            source,
+            expected_hash,
         )
         .await?;
         if cancel.is_cancelled() {

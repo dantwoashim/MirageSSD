@@ -90,8 +90,8 @@ NTSTATUS FileSystemHost::mount(const std::wstring& path,const std::wstring& inde
     params.Version=sizeof(params);params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
     auto status=FspFileSystemCreate(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME),&params,&interface_table,&fs_);if(!NT_SUCCESS(status))return status;fs_->UserContext=this;status=FspFileSystemSetMountPoint(fs_,const_cast<PWSTR>(path.c_str()));if(!NT_SUCCESS(status)){FspFileSystemDelete(fs_);fs_=nullptr;}return status;
 }
-NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;const auto status=FspFileSystemStartDispatcher(fs_,0);if(!NT_SUCCESS(status))return status;std::cout<<"MIRAGE_READY\n"<<std::flush;WaitForSingleObject(stop_event_,INFINITE);return STATUS_SUCCESS;}
+NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;const auto status=FspFileSystemStartDispatcher(fs_,0);if(!NT_SUCCESS(status))return status;if(engine_)mirage_engine_mark_mounted(engine_);std::cout<<"MIRAGE_READY\n"<<std::flush;WaitForSingleObject(stop_event_,INFINITE);return STATUS_SUCCESS;}
 void FileSystemHost::begin_pending() noexcept{if(pending_count_.fetch_add(1)==0)ResetEvent(pending_zero_);}
 void FileSystemHost::end_pending() noexcept{if(pending_count_.fetch_sub(1)==1)SetEvent(pending_zero_);}
-void FileSystemHost::stop() noexcept{if(fs_){WaitForSingleObject(pending_zero_,INFINITE);FspFileSystemStopDispatcher(fs_);FspFileSystemDelete(fs_);fs_=nullptr;}if(stop_event_)SetEvent(stop_event_);}
+void FileSystemHost::stop() noexcept{if(fs_){WaitForSingleObject(pending_zero_,INFINITE);FspFileSystemStopDispatcher(fs_);FspFileSystemDelete(fs_);fs_=nullptr;}if(engine_)mirage_engine_quiesce(engine_,10000);if(stop_event_)SetEvent(stop_event_);}
 }

@@ -25,11 +25,12 @@ mirage-predictor.workspace = true
 roaring.workspace = true
 mirage-db.workspace = true
 mirage-types.workspace = true
+mirage-crypto.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-mirage-crypto.workspace = true
 mirage-backend-local.workspace = true
 mirage-fault-inject = { path = "../../tools/fault-inject" }
 mirage-manifest = { workspace = true, features = ["test-signing"] }
