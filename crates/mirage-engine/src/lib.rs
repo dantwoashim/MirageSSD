@@ -16,6 +16,7 @@ pub mod handles;
 pub mod journal;
 pub mod mark_set;
 pub mod mount;
+pub mod native_restore;
 pub mod object_plan;
 pub mod observe;
 pub mod outcome;
