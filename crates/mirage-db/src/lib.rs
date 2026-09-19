@@ -5,6 +5,7 @@
 pub mod cache;
 mod error;
 pub mod extent;
+pub mod gc_bounds;
 pub mod generation;
 pub mod integrity;
 pub mod lease;
@@ -36,6 +37,7 @@ pub use cache::{
     ReserveCacheSlotOutcome, load_cache_snapshot,
 };
 pub use extent::{ByteExtent, ExtentKind};
+pub use gc_bounds::{GcBound, GcKind, UnreachableCandidate};
 pub use generation::{ActiveGeneration, VerifiedGeneration};
 pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;

@@ -127,6 +127,9 @@ enum Command {
     LeaseDeclare(crate::workspace_lease::WorkspaceLease, Reply<[u8; 16]>),
     LeaseVerify([u8; 16], u64, u64, Vec<u8>, i64, Reply<()>),
     LeaseRevoke([u8; 16], i64, Reply<()>),
+    GcBoundSet(crate::gc_bounds::GcBound, Reply<()>),
+    GcUnreachableMark(RepositoryId, String, [u8; 32], i64, i64, Reply<()>),
+    GcUnreachableClear(RepositoryId, String, Reply<()>),
     UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
     UploadSessionAdvance(
         [u8; 16],
@@ -515,6 +518,28 @@ impl DbWriter {
                             respond(
                                 reply,
                                 crate::workspace_lease::revoke(&mut connection, &lease_id, now),
+                            );
+                        }
+                        Command::GcBoundSet(bound, reply) => {
+                            respond(reply, crate::gc_bounds::set_bound(&mut connection, &bound));
+                        }
+                        Command::GcUnreachableMark(volume, key, at_commit, after, now, reply) => {
+                            respond(
+                                reply,
+                                crate::gc_bounds::mark_unreachable(
+                                    &mut connection,
+                                    volume,
+                                    &key,
+                                    at_commit,
+                                    after,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::GcUnreachableClear(volume, key, reply) => {
+                            respond(
+                                reply,
+                                crate::gc_bounds::clear_unreachable(&mut connection, volume, &key),
                             );
                         }
                         Command::UploadSessionCreate(session, reply) => {
@@ -1021,6 +1046,42 @@ impl DbWriter {
     /// Revokes a lease; covered pages become eviction candidates.
     pub fn lease_revoke(&self, lease_id: [u8; 16], now_ns: i64) -> Result<(), MirageError> {
         self.request(|reply| Command::LeaseRevoke(lease_id, now_ns, reply))
+    }
+
+    /// Sets the retention bound for a history stream (idempotent upsert).
+    pub fn gc_bound_set(&self, bound: crate::gc_bounds::GcBound) -> Result<(), MirageError> {
+        self.request(|reply| Command::GcBoundSet(bound, reply))
+    }
+
+    /// Marks an object unreachable at a verified commit; removal is gated on
+    /// a later verified commit plus the reclamation window.
+    pub fn gc_unreachable_mark(
+        &self,
+        volume_id: RepositoryId,
+        object_key: &str,
+        at_commit: [u8; 32],
+        reclaim_after_ns: i64,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::GcUnreachableMark(
+                volume_id,
+                object_key.to_string(),
+                at_commit,
+                reclaim_after_ns,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    /// Clears a reclaimed candidate after the remote delete lands.
+    pub fn gc_unreachable_clear(
+        &self,
+        volume_id: RepositoryId,
+        object_key: &str,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::GcUnreachableClear(volume_id, object_key.to_string(), reply))
     }
 
     /// Creates a durable upload session before the first remote call.
