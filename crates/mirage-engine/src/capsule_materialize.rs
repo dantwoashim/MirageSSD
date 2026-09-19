@@ -26,6 +26,46 @@ pub trait CapsulePageStore: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<u64, MirageError>;
     async fn checkpoint(&self, progress: MaterializeProgress) -> Result<(), MirageError>;
+    fn batch_pages(&self) -> usize {
+        1
+    }
+    async fn materialize_pages(
+        &self,
+        pages: &[u32],
+        mandatory: bool,
+        progress: &mut MaterializeProgress,
+        cancel: &CancellationToken,
+    ) -> Result<(), MirageError> {
+        for &page in pages {
+            if cancel.is_cancelled() {
+                return Err(MirageError::cancelled("capsule materialization cancelled"));
+            }
+            let resident = match self.is_verified_resident(page).await {
+                Ok(resident) => resident,
+                Err(error) => {
+                    progress.failed_pages += 1;
+                    return Err(error);
+                }
+            };
+            if resident {
+                progress.already_resident += 1;
+                progress.verified_pages += 1;
+            } else {
+                match self.fetch_verify_commit(page, mandatory, cancel).await {
+                    Ok(bytes) => {
+                        progress.downloaded_pages += 1;
+                        progress.downloaded_bytes = progress.downloaded_bytes.saturating_add(bytes);
+                        progress.verified_pages += 1;
+                    }
+                    Err(error) => {
+                        progress.failed_pages += u64::from(error.code != "MIRAGE_CANCELLED");
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn materialize_capsule(
@@ -44,31 +84,36 @@ pub async fn materialize_capsule(
         ..Default::default()
     };
     let optional = &plan.page_set - &plan.mandatory_set;
+    let mut checkpoint_pages = 0;
+    let mut checkpoint_at = std::time::Instant::now();
     for (mandatory, pages) in [(true, &plan.mandatory_set), (false, &optional)] {
-        for page in pages {
-            if cancel.is_cancelled() {
+        let mut pages = pages.iter();
+        loop {
+            let batch: Vec<_> = pages
+                .by_ref()
+                .take(store.batch_pages().clamp(1, 64))
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            if let Err(error) = store
+                .materialize_pages(&batch, mandatory, &mut progress, cancel)
+                .await
+            {
                 store.checkpoint(progress).await?;
-                return Err(MirageError::cancelled("capsule materialization cancelled"));
+                return Err(error);
             }
-            if store.is_verified_resident(page).await? {
-                progress.already_resident += 1;
-                progress.verified_pages += 1;
-            } else {
-                match store.fetch_verify_commit(page, mandatory, cancel).await {
-                    Ok(bytes) => {
-                        progress.downloaded_pages += 1;
-                        progress.downloaded_bytes = progress.downloaded_bytes.saturating_add(bytes);
-                        progress.verified_pages += 1;
-                    }
-                    Err(error) => {
-                        progress.failed_pages += 1;
-                        store.checkpoint(progress).await?;
-                        return Err(error);
-                    }
-                }
+            if progress.verified_pages - checkpoint_pages >= 32
+                || checkpoint_at.elapsed() >= std::time::Duration::from_millis(500)
+            {
+                store.checkpoint(progress).await?;
+                checkpoint_pages = progress.verified_pages;
+                checkpoint_at = std::time::Instant::now();
             }
-            store.checkpoint(progress).await?;
         }
+    }
+    if checkpoint_pages != progress.verified_pages || progress.total_pages == 0 {
+        store.checkpoint(progress).await?;
     }
     if progress.verified_pages != progress.total_pages {
         return Err(MirageError::integrity_mismatch(

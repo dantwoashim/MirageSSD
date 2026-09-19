@@ -32,6 +32,10 @@ pub struct ReclaimCandidate {
     pub dirty: bool,
     pub pinned: bool,
     pub active_read_leases: u32,
+    /// Published slots of a mounted generation cannot be reused: a separate host
+    /// process may hold its own `ResidentIndex` over the same arena, and
+    /// in-process atomics are not cross-process exclusion.
+    pub mounted_reader_exclusion: bool,
 }
 
 impl ReclaimCandidate {
@@ -42,6 +46,7 @@ impl ReclaimCandidate {
             && !self.dirty
             && !self.pinned
             && self.active_read_leases == 0
+            && !self.mounted_reader_exclusion
     }
 }
 
@@ -67,6 +72,7 @@ pub struct BlockedCapacity {
     pub dirty_bytes: u64,
     pub pinned_bytes: u64,
     pub active_read_bytes: u64,
+    pub mounted_reader_bytes: u64,
 }
 
 /// Deterministic, side-effect-free decision for one requested Space Lease.
@@ -163,6 +169,13 @@ pub fn plan_space_lease(
                 blocked.active_read_bytes,
                 candidate.physical_bytes,
                 "active-read capacity",
+            )?;
+        }
+        if candidate.mounted_reader_exclusion {
+            blocked.mounted_reader_bytes = checked_add(
+                blocked.mounted_reader_bytes,
+                candidate.physical_bytes,
+                "mounted-reader capacity",
             )?;
         }
     }

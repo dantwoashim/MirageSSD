@@ -16,7 +16,9 @@ use mirage_engine::space_lease::{
 use mirage_index::MountIndex;
 use mirage_manifest::{DecodeLimits, decode_manifest_bounded};
 use mirage_pack::{PackReadEncryption, PackReader};
-use mirage_types::{ByteCount, GenerationId, MirageError, PageHash, RepositoryId, SpaceLeaseId};
+use mirage_types::{
+    ByteCount, GenerationId, MirageError, PageHash, RepositoryId, RepositoryState, SpaceLeaseId,
+};
 use serde_json::{Value, json};
 
 use crate::disk_space::{self, VolumeSpace};
@@ -70,6 +72,7 @@ pub(crate) struct RepositoryCapacitySource {
     verified_drive_objects: Mutex<BTreeSet<[u8; 32]>>,
     encryption: Option<PackReadEncryption>,
     reserve_bytes: u64,
+    mounted_reader_exclusion: bool,
 }
 
 impl RepositoryCapacitySource {
@@ -295,6 +298,8 @@ impl RepositoryCapacitySource {
         }
         let (shard, resident, cache_on_target_volume) =
             open_existing_cache(database, &index, &target)?;
+        let mounted_reader_exclusion =
+            database.load_repository_state(repository_id)? != Some(RepositoryState::ReadyUnmounted);
         Ok(Self {
             database: database.clone(),
             repository_id,
@@ -311,6 +316,7 @@ impl RepositoryCapacitySource {
             verified_drive_objects: Mutex::new(BTreeSet::new()),
             encryption,
             reserve_bytes,
+            mounted_reader_exclusion,
         })
     }
 
@@ -364,7 +370,7 @@ impl RepositoryCapacitySource {
                 logical_length,
             } => {
                 let path = self.config.import_root.join(object_id);
-                let mut reader = match &self.encryption {
+                let reader = match &self.encryption {
                     Some(encryption) => {
                         PackReader::open_verified_encrypted(&path, encryption.clone())?
                     }
@@ -421,12 +427,15 @@ impl RepositoryCapacitySource {
             .into_iter()
             .find(|record| record.page_hash == Some(hash))
             .ok_or_else(|| MirageError::cache_full("reclaim candidate is no longer resident"))?;
+        let mounted_reader_exclusion = self.database.load_repository_state(self.repository_id)?
+            != Some(RepositoryState::ReadyUnmounted);
         candidate_for(
             record,
             shard,
             resident,
             &self.proofs,
             self.drive_backend.is_some(),
+            mounted_reader_exclusion,
         )
     }
 }
@@ -467,6 +476,7 @@ impl SpaceLeaseSource for RepositoryCapacitySource {
                             resident,
                             &self.proofs,
                             self.drive_backend.is_some(),
+                            self.mounted_reader_exclusion,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -491,6 +501,7 @@ impl SpaceLeaseSource for RepositoryCapacitySource {
                     dirty: false,
                     pinned: false,
                     active_read_leases: 0,
+                    mounted_reader_exclusion: false,
                 }),
                 ReclaimUnit::CachePage(_) => {}
             }
@@ -734,6 +745,7 @@ fn candidate_for(
     resident: &ResidentIndex,
     proofs: &BTreeMap<PageHash, RemotePageProof>,
     drive_authenticated: bool,
+    mounted_reader_exclusion: bool,
 ) -> Result<ReclaimCandidate, MirageError> {
     let hash = record
         .page_hash
@@ -755,6 +767,7 @@ fn candidate_for(
         dirty,
         pinned: !reasons.is_empty(),
         active_read_leases: resident.active_read_leases(hash)?.unwrap_or(0),
+        mounted_reader_exclusion,
     })
 }
 
@@ -869,7 +882,8 @@ fn plan_json(source: &RepositoryCapacitySource, plan: &SpaceLeasePlan) -> Value 
             "unverified_bytes": plan.blocked.unverified_bytes,
             "dirty_bytes": plan.blocked.dirty_bytes,
             "pinned_bytes": plan.blocked.pinned_bytes,
-            "active_read_bytes": plan.blocked.active_read_bytes
+            "active_read_bytes": plan.blocked.active_read_bytes,
+            "mounted_reader_bytes": plan.blocked.mounted_reader_bytes
         },
         "remote_quota_counted_as_local_capacity": false
     })
@@ -1005,7 +1019,9 @@ mod tests {
     use mirage_crypto::dpapi::ProtectionScope;
     use mirage_crypto::repository_key_store::save_repository_key;
     use mirage_pack::{ImportPlan, PackEncryption, PlannedFile, import_local};
-    use mirage_types::{BackendHealthState, CheckedRange, ContentHash, GenerationId};
+    use mirage_types::{
+        BackendHealthState, CheckedRange, ContentHash, GenerationId, RepositoryEvent,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
@@ -1015,6 +1031,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectBackend for StatOnlyBackend {
+        fn capabilities(&self) -> mirage_backend::BackendCapabilities {
+            mirage_backend::BackendCapabilities::ARCHIVE.read_only()
+        }
+
         async fn read_range(
             &self,
             _object: &RemoteObjectRef,
@@ -1157,6 +1177,148 @@ mod tests {
         assert_eq!(
             release(&database, repository_id, lease_id).unwrap()["state"],
             "released"
+        );
+    }
+
+    #[test]
+    fn mounted_repository_excludes_cache_pages_from_reclaim() {
+        let directory = tempfile::tempdir().expect("directory");
+        let native_root = directory.path().join("game");
+        let assets = native_root.join("assets");
+        let import_root = directory.path().join("import");
+        std::fs::create_dir_all(&assets).expect("assets");
+        std::fs::write(native_root.join("game.exe"), b"launcher").expect("launcher");
+        let bytes = vec![0x42_u8; 1024 * 1024];
+        std::fs::write(assets.join("content.pak"), &bytes).expect("asset");
+        let repository_id = RepositoryId::from_bytes([0x69; 16]);
+        import_local(&ImportPlan {
+            repository_id,
+            generation_id: GenerationId::ZERO,
+            source_root: assets.clone(),
+            files: vec![PlannedFile {
+                relative_path: "content.pak".into(),
+                class: mirage_manifest::FileClass::VirtualContainer,
+            }],
+            page_size: 1024 * 1024,
+            pack_target: 2 * 1024 * 1024,
+            output_staging_directory: import_root.clone(),
+            encryption: None,
+        })
+        .expect("import");
+        let database = Database::open(&directory.path().join("control.db")).expect("database");
+        runtime::register(
+            &database,
+            "S-1-5-21-1001",
+            runtime::RegisterSpec {
+                repository_id,
+                display_name: "mounted exclusion fixture".into(),
+                native_root,
+                mount_subtree: "assets".into(),
+                import_root,
+                launcher_relative: "game.exe".into(),
+                arguments: Vec::new(),
+                version_label: "1".into(),
+                configuration_label: "test".into(),
+                cache_bytes: 2 * 1024 * 1024,
+            },
+        )
+        .expect("register");
+        let active = database
+            .load_active_generation(repository_id)
+            .expect("active query")
+            .expect("active");
+        let index =
+            MountIndex::open(active.mount_index_path.as_ref().expect("index path")).expect("index");
+        let hash = index.page_by_ordinal(0).expect("page").plaintext_hash();
+        let (shard, _resident) = runtime::open_cache(
+            &database,
+            u32::try_from(index.header().page_size).expect("page size"),
+            2 * 1024 * 1024,
+        )
+        .expect("cache");
+        insert_page(&database, shard, hash, &bytes, &()).expect("insert page");
+
+        // While mounted, the resident page is neither selected nor reclaimable.
+        database
+            .set_repository_state(
+                repository_id,
+                RepositoryState::ReadyUnmounted,
+                RepositoryEvent::MountRequested,
+                2,
+            )
+            .expect("mount requested");
+        database
+            .set_repository_state(
+                repository_id,
+                RepositoryState::Mounting,
+                RepositoryEvent::MountSucceeded,
+                3,
+            )
+            .expect("mounted");
+        let source = RepositoryCapacitySource::open(&database, repository_id, None)
+            .expect("capacity source");
+        let snapshot = source.capacity_snapshot().expect("snapshot");
+        let baseline = plan_space_lease(&snapshot, 1).expect("baseline plan");
+        let plan = plan_space_lease(&snapshot, baseline.immediately_available_bytes + 1)
+            .expect("reclaim plan");
+        assert!(plan.selected.is_empty());
+        assert!(plan.blocked.mounted_reader_bytes > 0);
+        assert!(plan.blocked.unique_bytes > 0);
+        assert_eq!(
+            plan_json(&source, &plan)["selected_cache_page_count"],
+            serde_json::json!(0)
+        );
+        assert!(
+            plan_json(&source, &plan)["blocked"]["mounted_reader_bytes"]
+                .as_u64()
+                .expect("mounted_reader_bytes")
+                > 0
+        );
+
+        // Back to unmounted, the same page is selectable again.
+        database
+            .set_repository_state(
+                repository_id,
+                RepositoryState::ReadyMounted,
+                RepositoryEvent::UnmountRequested,
+                4,
+            )
+            .expect("unmounted");
+        drop(source);
+        let source = RepositoryCapacitySource::open(&database, repository_id, None)
+            .expect("capacity source");
+        let snapshot = source.capacity_snapshot().expect("snapshot");
+        let baseline = plan_space_lease(&snapshot, 1).expect("baseline plan");
+        let plan = plan_space_lease(&snapshot, baseline.immediately_available_bytes + 1)
+            .expect("reclaim plan");
+        let candidate = *plan.selected.first().expect("selectable page");
+
+        // A candidate selected while unmounted is rejected at reclaim time once
+        // a mount has started in between.
+        database
+            .set_repository_state(
+                repository_id,
+                RepositoryState::ReadyUnmounted,
+                RepositoryEvent::MountRequested,
+                5,
+            )
+            .expect("mount requested");
+        database
+            .set_repository_state(
+                repository_id,
+                RepositoryState::Mounting,
+                RepositoryEvent::MountSucceeded,
+                6,
+            )
+            .expect("mounted");
+        let error = source
+            .reclaim_verified_clean(candidate)
+            .expect_err("reclaim under a live reader must fail");
+        assert_eq!(error.kind, mirage_types::MirageErrorKind::CacheFull);
+        assert!(
+            error
+                .message
+                .contains("reclaim candidate changed after capacity planning")
         );
     }
 

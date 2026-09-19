@@ -1,11 +1,15 @@
 use crate::PageLocationMap;
 use mirage_backend::ObjectBackend;
-use mirage_cache::{ArenaShard, ReservationLedger, ResidentIndex};
+use mirage_cache::{ArenaShard, ReservationLedger, ReservationSnapshot, ResidentIndex};
 use mirage_db::Database;
 use mirage_pack::PackReadEncryption;
-use mirage_scheduler::FlightMap;
+use mirage_scheduler::{FetchPool, FetchPoolConfig, FlightMap};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Default fetch-pool worker count; the service reports it as the readiness
+/// record's `max_in_flight`.
+pub const DEFAULT_FETCH_WORKERS: usize = 4;
 
 #[derive(Clone)]
 pub struct FetchContext {
@@ -20,6 +24,7 @@ pub struct PageProvider<B: ObjectBackend> {
     pub(crate) index: Arc<ResidentIndex>,
     pub(crate) locations: Arc<PageLocationMap>,
     pub(crate) flights: FlightMap,
+    pub(crate) pool: Arc<FetchPool>,
     pub(crate) budget: ReservationLedger,
     pub(crate) max_window: u64,
     pub(crate) encryption: Option<PackReadEncryption>,
@@ -42,6 +47,12 @@ impl<B: ObjectBackend> PageProvider<B> {
             index,
             locations,
             flights: FlightMap::default(),
+            pool: FetchPool::new(FetchPoolConfig {
+                workers: DEFAULT_FETCH_WORKERS,
+                queue_depth: 256,
+                speculative_queue_depth: 64,
+            })
+            .expect("fixed fetch pool configuration is valid"),
             budget,
             max_window,
             encryption: None,
@@ -52,5 +63,23 @@ impl<B: ObjectBackend> PageProvider<B> {
     pub fn with_encryption(mut self, encryption: PackReadEncryption) -> Self {
         self.encryption = Some(encryption);
         self
+    }
+
+    #[must_use]
+    pub fn with_fetch_pool(mut self, pool: Arc<FetchPool>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// In-flight flights, queued pool jobs, and running pool jobs.
+    #[must_use]
+    pub fn flight_metrics(&self) -> (usize, usize, usize) {
+        (self.flights.len(), self.pool.queued(), self.pool.running())
+    }
+
+    /// Current budget ledger counters: committed, reserved, dirty-reserved, and
+    /// peak envelope bytes.
+    pub fn budget_snapshot(&self) -> Result<ReservationSnapshot, mirage_types::MirageError> {
+        self.budget.snapshot()
     }
 }

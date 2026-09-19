@@ -484,6 +484,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectBackend for ReadOnlyBackend {
+        fn capabilities(&self) -> mirage_backend::BackendCapabilities {
+            mirage_backend::BackendCapabilities::ARCHIVE.read_only()
+        }
+
         async fn read_range(
             &self,
             object: &RemoteObjectRef,

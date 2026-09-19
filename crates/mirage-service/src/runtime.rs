@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mirage_backend::{FetchClass, ObjectBackend, RemoteObjectRef};
@@ -18,8 +18,10 @@ use mirage_db::{
     ReserveCacheSlotOutcome, VerifiedGeneration,
 };
 use mirage_engine::{
-    AdmissionStore, CapsulePageStore, MaterializeProgress, admit_sealed_session,
-    materialize_capsule,
+    AdmissionStore, BackendCapability, CapsulePageStore, CompileInput, EvictionGranularity,
+    FilePlacementClass, HydrationGranularity, MaterializeProgress, OriginEstimate,
+    ReadinessIdentity, ReadinessVerdict, RequiredFile, ScopeSpec, admit_sealed_session,
+    compile_readiness, materialize_capsule,
 };
 use mirage_index::{MountIndex, NodeIndex, compile_to_bytes};
 use mirage_ipc::DriveQuotaSnapshot;
@@ -30,6 +32,7 @@ use mirage_pack::{
     EncryptedFrameAad, PackReadEncryption, PackReader, decode_encrypted_frame,
     encrypted_frame_pack_id,
 };
+use mirage_predictor::binding::{PROFILE_FORMAT_VERSION, ProfileBinding, bind_profile};
 use mirage_predictor::capsule::{
     CapsuleDraft, CapsulePlan, ClusterReason, ProfileKey, ReasonKind, RiskEstimate,
 };
@@ -40,8 +43,9 @@ use mirage_predictor::{
 };
 use mirage_simulator::{BaselineReplay, NetworkModel, ReplayConfig};
 use mirage_types::{
-    ByteCount, CheckedRange, CommitHash, GenerationId, MirageError, RepositoryEvent, RepositoryId,
-    RepositoryState, SessionEvent, SessionId, SessionState, StableFileId,
+    ByteCount, CheckedRange, CommitHash, GenerationId, MirageError, PageHash, PresentationBackend,
+    QualificationVersions, ReadinessConstraint, RepositoryEvent, RepositoryId, RepositoryState,
+    ScopeCompleteness, SessionEvent, SessionId, SessionState, SpatialEnvelope, StableFileId,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -57,6 +61,21 @@ use crate::{
 const RUNTIME_FORMAT_VERSION: u32 = 1;
 const PROFILE_STARTUP_WINDOW_US: u64 = 30_000_000;
 const DEFAULT_DRAIN_MS: u64 = 2_000;
+/// Declared planning assumptions for the origin estimate, shared by the
+/// readiness compiler and the simulator's network model. They are assumptions,
+/// not measurements; origin reachability itself is re-checked at admission.
+const ASSUMED_ORIGIN_TTFB_NS: u64 = 50_000_000;
+const ASSUMED_ORIGIN_GOODPUT_BYTES_PER_SECOND: u64 = 12_500_000;
+/// The only presentation backend admitted today: the measured WinFsp baseline
+/// per ADR 0008. No CFAPI/ProjFS descriptor exists because E1/E2 have not run.
+const WINFSP_CAPABILITY: BackendCapability = BackendCapability {
+    backend: PresentationBackend::WinFspProjection,
+    qualified: true,
+    hydration: HydrationGranularity::Page,
+    eviction: EvictionGranularity::Page,
+    whole_file_pin_only: false,
+    metadata_bytes_per_unit: 64,
+};
 const DRIVE_MANIFEST: &str = "drive-manifest.cbor";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,7 +767,16 @@ pub fn simulate(database: &Database, repository_id: RepositoryId) -> Result<Valu
     let index = MountIndex::open(active.mount_index_path.as_ref().ok_or_else(|| {
         MirageError::integrity_mismatch("active generation has no compiled mount index")
     })?)?;
-    let profiles = load_profiles(database, repository_id)?;
+    let profiles = load_profiles(
+        database,
+        repository_id,
+        &ProfileBinding {
+            repository_id,
+            manifest_hash: active.manifest_hash,
+            format_version: PROFILE_FORMAT_VERSION,
+            label: format!("{}:{}", config.version_label, config.configuration_label),
+        },
+    )?;
     let latest = latest_trace_path(database, repository_id)?;
     let trace = read_trace(&latest, repository_id, active.generation_id)?;
     let normalized = normalize_trace(&index, &trace, None)?;
@@ -765,10 +793,10 @@ pub fn simulate(database: &Database, repository_id: RepositoryId) -> Result<Valu
         page_bytes: page_size,
         pinned_pages: BTreeSet::new(),
         network: NetworkModel {
-            base_latency_ns: 50_000_000,
+            base_latency_ns: ASSUMED_ORIGIN_TTFB_NS,
             jitter_ns: 5_000_000,
             jitter_seed: 0x4d49_5241_4745,
-            bandwidth_bytes_per_second: 12_500_000,
+            bandwidth_bytes_per_second: ASSUMED_ORIGIN_GOODPUT_BYTES_PER_SECOND,
             max_concurrency: 1,
             fail_fetches: BTreeSet::new(),
         },
@@ -823,7 +851,16 @@ pub fn plan(
     let index = MountIndex::open(active.mount_index_path.as_ref().ok_or_else(|| {
         MirageError::integrity_mismatch("active generation has no compiled mount index")
     })?)?;
-    let profiles = load_profiles(database, repository_id)?;
+    let profiles = load_profiles(
+        database,
+        repository_id,
+        &ProfileBinding {
+            repository_id,
+            manifest_hash: active.manifest_hash,
+            format_version: PROFILE_FORMAT_VERSION,
+            label: format!("{}:{}", config.version_label, config.configuration_label),
+        },
+    )?;
     let hard = build_hard_set(
         &profiles,
         &HardSetPolicy {
@@ -890,15 +927,57 @@ pub fn plan(
     }
     let page_size = u32::try_from(index.header().page_size)
         .map_err(|_| MirageError::unsupported_layout("page size exceeds u32"))?;
-    let total_bytes = all
-        .len()
-        .checked_mul(u64::from(page_size))
-        .ok_or_else(|| MirageError::invalid_argument("capsule byte count overflows"))?;
-    if total_bytes > config.cache_bytes {
-        return Err(MirageError::cache_full(format!(
-            "profile union requires {total_bytes} bytes but cache budget is {}",
-            config.cache_bytes
-        )));
+    let resident_slots = database.load_resident_cache_slots()?;
+    let resident_total_bytes = resident_slots
+        .iter()
+        .map(|slot| u64::from(slot.logical_length))
+        .sum::<u64>();
+    let resident_hashes: BTreeSet<PageHash> = resident_slots
+        .iter()
+        .filter_map(|slot| slot.page_hash)
+        .collect();
+    let mut files = Vec::new();
+    for ordinal in 0..index.file_count() {
+        let file = index.file_by_index(
+            u32::try_from(ordinal)
+                .map_err(|_| MirageError::unsupported_layout("file ordinal exceeds u32"))?,
+        )?;
+        let mut required_units = 0_u64;
+        let mut required_bytes = 0_u64;
+        let mut resident_bytes = 0_u64;
+        let mut max_unit_bytes = 0_u64;
+        for relative in 0..file.extent_count() {
+            let extent = file.extent(relative)?;
+            for within in 0..extent.page_count() {
+                let global = extent
+                    .page_start()
+                    .checked_add(within)
+                    .ok_or_else(|| MirageError::invalid_argument("page ordinal overflows"))?;
+                if !all.contains(global) {
+                    continue;
+                }
+                let page = index.page_by_ordinal(global)?;
+                let length = u64::from(page.logical_length());
+                required_units += 1;
+                required_bytes += length;
+                max_unit_bytes = max_unit_bytes.max(length);
+                if resident_hashes.contains(&page.plaintext_hash()) {
+                    resident_bytes += length;
+                }
+            }
+        }
+        if required_units == 0 {
+            continue;
+        }
+        files.push(RequiredFile {
+            file_index: file.ordinal(),
+            logical_size: file.logical_size(),
+            class: FilePlacementClass::Virtual,
+            required_units,
+            required_bytes,
+            resident_bytes,
+            max_unit_bytes,
+        });
     }
     let violation = held_out_violation_millionths(&profiles);
     let dropped: u64 = profiles
@@ -951,11 +1030,93 @@ pub fn plan(
         },
         reasons,
     })?;
+    let scope_resident_bytes = files.iter().map(|file| file.resident_bytes).sum::<u64>();
+    let record = match compile_readiness(&CompileInput {
+        identity: ReadinessIdentity {
+            repository_id,
+            generation: active.generation_id,
+            manifest_hash: active.manifest_hash,
+            configuration_label: format!("{}:{}", config.version_label, config.configuration_label),
+            profile_schema_version: PROFILE_FORMAT_VERSION,
+        },
+        scope: ScopeSpec {
+            scope_id: plan.capsule_id.to_string(),
+            completeness: if full_volume {
+                ScopeCompleteness::Complete
+            } else {
+                ScopeCompleteness::Empirical
+            },
+            files,
+            lead_time_ns: if full_volume {
+                None
+            } else {
+                Some(PROFILE_STARTUP_WINDOW_US * 1000)
+            },
+        },
+        budget_bytes: config.cache_bytes,
+        current: SpatialEnvelope {
+            allocated: resident_total_bytes,
+            reserved_new_allocation: 0,
+            dirty_staging: 0,
+            rollback_retention: 0,
+            journal_and_metadata: 0,
+            filesystem_slack: 0,
+        },
+        candidates: vec![WINFSP_CAPABILITY],
+        origin: OriginEstimate {
+            available: true,
+            queue_delay_ns: 0,
+            source_ttfb_ns: ASSUMED_ORIGIN_TTFB_NS,
+            goodput_bytes_per_second: ASSUMED_ORIGIN_GOODPUT_BYTES_PER_SECOND,
+            decode_ns_per_unit: 0,
+            verify_ns_per_unit: 0,
+            placement_ns_per_unit: 0,
+            safety_margin_ns: 0,
+        },
+        qualification: QualificationVersions {
+            backend: "winfsp".into(),
+            os_build: "unrecorded".into(),
+            driver: "unrecorded".into(),
+            runtime: env!("CARGO_PKG_VERSION").into(),
+        },
+        pin_generation: active.generation_id.as_u64(),
+        ram_credit_bytes: 0,
+        max_in_flight: u32::try_from(mirage_engine::DEFAULT_FETCH_WORKERS).unwrap_or(u32::MAX),
+    })? {
+        ReadinessVerdict::Ready { record, .. } => *record,
+        ReadinessVerdict::Unsupported(unsupported) => {
+            let first = unsupported
+                .rejections
+                .first()
+                .map(|rejection| rejection.detail.as_str())
+                .unwrap_or("no rejection detail");
+            let message = format!(
+                "no qualified readiness plan: {} ({first}); cache budget {} bytes",
+                unsupported.detail, config.cache_bytes
+            );
+            return Err(
+                if unsupported.failed.contains(&ReadinessConstraint::Spatial) {
+                    MirageError::cache_full(message)
+                } else if unsupported
+                    .failed
+                    .contains(&ReadinessConstraint::Compatibility)
+                {
+                    MirageError::unsupported_layout(message)
+                } else {
+                    MirageError::backend_unavailable(message)
+                },
+            );
+        }
+    };
     let capsule_root = repository_state_root(database, repository_id)?.join("capsules");
     std::fs::create_dir_all(&capsule_root).map_err(MirageError::from)?;
     write_json_atomic(
         &capsule_root.join(format!("{}.json", plan.capsule_id)),
         &plan,
+    )?;
+    write_json_atomic(
+        &capsule_root.join(format!("{}.readiness.json", plan.capsule_id)),
+        &record,
     )?;
     Ok(json!({
         "repository_id": repository_id.to_string(),
@@ -967,7 +1128,19 @@ pub fn plan(
         "total_bytes": plan.total_bytes,
         "cache_budget_bytes": config.cache_bytes,
         "held_out_violation_millionths": plan.risk.held_out_violation_millionths,
-        "data_quality_millionths": plan.risk.data_quality_millionths
+        "data_quality_millionths": plan.risk.data_quality_millionths,
+        "readiness": {
+            "mode": record.mode.as_str(),
+            "scope_completeness": record.scope_completeness.as_str(),
+            "presentation": record.presentation.as_str(),
+            "required_bytes": record.required_bytes,
+            "required_units": record.required_units,
+            "resident_bytes": scope_resident_bytes,
+            "spatial_total_bytes": record.spatial.total()?,
+            "budget_bytes": record.budget_bytes,
+            "temporal_lead_ns": record.temporal_lead_ns,
+            "invalidation_conditions": record.invalidation_conditions,
+        }
     }))
 }
 
@@ -1023,7 +1196,18 @@ pub fn materialize(
         "drive_quota_limit_bytes": drive_quota.and_then(|quota| quota.limit_bytes),
         "drive_quota_usage_bytes": drive_quota.map(|quota| quota.usage_bytes),
         "drive_quota_available_bytes": drive_quota.and_then(DriveQuotaSnapshot::available_bytes),
-        "complete": progress.verified_pages == progress.total_pages
+        "complete": progress.verified_pages == progress.total_pages,
+        "timing_ms": store
+            .timing
+            .lock()
+            .map(|timing| json!({
+                "resident_check": timing.resident_check_ms,
+                "fetch_decode": timing.fetch_decode_ms,
+                "hash_verify": timing.hash_verify_ms,
+                "insert": timing.insert_ms,
+                "checkpoint": timing.checkpoint_ms
+            }))
+            .unwrap_or_else(|_| Value::Null)
     }))
 }
 
@@ -1291,6 +1475,18 @@ struct LocalCapsuleStore {
     reservations: Mutex<BTreeMap<mirage_types::PageHash, CacheSlotRecord>>,
     created_session: Mutex<Option<SessionId>>,
     checkpoint_path: PathBuf,
+    timing: Mutex<MaterializeTiming>,
+}
+
+/// Per-phase wall time accumulated during capsule materialization; reported in the
+/// materialize response as `timing_ms`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MaterializeTiming {
+    pub resident_check_ms: f64,
+    pub fetch_decode_ms: f64,
+    pub hash_verify_ms: f64,
+    pub insert_ms: f64,
+    pub checkpoint_ms: f64,
 }
 
 impl LocalCapsuleStore {
@@ -1384,6 +1580,7 @@ impl LocalCapsuleStore {
             pack_readers: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(BTreeMap::new()),
             created_session: Mutex::new(None),
+            timing: Mutex::new(MaterializeTiming::default()),
             checkpoint_path: repository_state_root(database, repository_id)?
                 .join("capsules")
                 .join(format!("{}.progress.json", plan.capsule_id)),
@@ -1404,79 +1601,12 @@ impl LocalCapsuleStore {
         Ok(hashes)
     }
 
-    fn abort_created_session(&self) {
-        let Ok(mut created) = self.created_session.lock() else {
-            return;
-        };
-        let Some(session) = created.take() else {
-            return;
-        };
-        if let Ok(Some(state)) = self.database.load_session_state(session)
-            && matches!(state, SessionState::Verifying | SessionState::SealedReady)
-        {
-            let _ = self.database.transition_session_state(
-                session,
-                state,
-                SessionEvent::AbortRequested,
-                now_ns(),
-            );
-        }
-        let _ = self
-            .resident
-            .pins()
-            .release_session(&self.database, session);
-    }
-}
-
-#[async_trait]
-impl CapsulePageStore for LocalCapsuleStore {
-    fn generation(&self) -> GenerationId {
-        self.generation
-    }
-
-    async fn reserve_all(&self, pages: &RoaringBitmap) -> Result<(), MirageError> {
-        let mut unique = BTreeMap::new();
-        for ordinal in pages {
-            let page = self.page(ordinal)?;
-            if let Some(existing) = unique.insert(page.plaintext_hash(), page.logical_length())
-                && existing != page.logical_length()
-            {
-                return Err(MirageError::integrity_mismatch(
-                    "deduplicated page hash has conflicting lengths",
-                ));
-            }
-        }
-        let requests = unique
-            .iter()
-            .map(|(hash, length)| (*hash, *length))
-            .collect::<Vec<_>>();
-        let outcomes = self.database.reserve_cache_slots_batch(requests)?;
-        let mut reservations = self
-            .reservations
-            .lock()
-            .map_err(|_| MirageError::internal_invariant("capsule reservation lock poisoned"))?;
-        for ((hash, _), outcome) in unique.into_iter().zip(outcomes) {
-            if let ReserveCacheSlotOutcome::Reserved(record) = outcome {
-                reservations.insert(hash, record);
-            }
-        }
-        Ok(())
-    }
-
-    async fn is_verified_resident(&self, page: u32) -> Result<bool, MirageError> {
-        let hash = self.page(page)?.plaintext_hash();
-        Ok(matches!(
-            verify_page(&self.resident, &self.database, hash, IntegrityClass::Clean,)?,
-            VerifyOutcome::Verified
-        ))
-    }
-
-    async fn fetch_verify_commit(
+    async fn fetch_verified_bytes(
         &self,
         page: u32,
         mandatory: bool,
         cancel: &CancellationToken,
-    ) -> Result<u64, MirageError> {
+    ) -> Result<Vec<u8>, MirageError> {
         if cancel.is_cancelled() {
             return Err(MirageError::cancelled("capsule materialization cancelled"));
         }
@@ -1485,6 +1615,7 @@ impl CapsulePageStore for LocalCapsuleStore {
         let location = page_view.remote_location()?;
         let object_id = location.provider_object_id()?;
         validate_single_component(object_id, "pack object ID")?;
+        let fetch_start = Instant::now();
         let bytes = match self.origin {
             RuntimeOrigin::Local => {
                 // Synchronous section only: the std mutex guard must never be held across an
@@ -1502,7 +1633,7 @@ impl CapsulePageStore for LocalCapsuleStore {
                     };
                     readers.insert(object_id.to_owned(), reader);
                 }
-                let reader = readers.get_mut(object_id).ok_or_else(|| {
+                let reader = readers.get(object_id).ok_or_else(|| {
                     MirageError::internal_invariant("pack reader vanished from cache")
                 })?;
                 let bytes = reader.read_page(hash)?.page.bytes.to_vec();
@@ -1561,6 +1692,8 @@ impl CapsulePageStore for LocalCapsuleStore {
                 )?
             }
         };
+        let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
+        let verify_start = Instant::now();
         if bytes.len() != page_view.logical_length() as usize
             || blake3::hash(&bytes).as_bytes() != hash.as_bytes()
         {
@@ -1568,14 +1701,120 @@ impl CapsulePageStore for LocalCapsuleStore {
                 "materialized page differs from mount index",
             ));
         }
-        let record = self
+        if let Ok(mut timing) = self.timing.lock() {
+            timing.fetch_decode_ms += fetch_ms;
+            timing.hash_verify_ms += verify_start.elapsed().as_secs_f64() * 1000.0;
+        }
+        Ok(bytes)
+    }
+
+    fn take_reservation(
+        &self,
+        hash: mirage_types::PageHash,
+        logical_length: u32,
+    ) -> Result<CacheSlotRecord, MirageError> {
+        let reserved = self
             .reservations
             .lock()
             .map_err(|_| MirageError::internal_invariant("capsule reservation lock poisoned"))?
-            .remove(&hash)
-            .ok_or_else(|| {
-                MirageError::repository_conflict("capsule page has no durable cache reservation")
-            })?;
+            .remove(&hash);
+        if let Some(record) = reserved {
+            return Ok(record);
+        }
+        match self.database.reserve_cache_slot(hash, logical_length)? {
+            ReserveCacheSlotOutcome::Reserved(record) => Ok(record),
+            ReserveCacheSlotOutcome::Existing(_) => Err(MirageError::repository_conflict(
+                "cache page became resident during materialization; retry",
+            )),
+        }
+    }
+
+    fn abort_created_session(&self) {
+        let Ok(mut created) = self.created_session.lock() else {
+            return;
+        };
+        let Some(session) = created.take() else {
+            return;
+        };
+        if let Ok(Some(state)) = self.database.load_session_state(session)
+            && matches!(state, SessionState::Verifying | SessionState::SealedReady)
+        {
+            let _ = self.database.transition_session_state(
+                session,
+                state,
+                SessionEvent::AbortRequested,
+                now_ns(),
+            );
+        }
+        let _ = self
+            .resident
+            .pins()
+            .release_session(&self.database, session);
+    }
+}
+
+#[async_trait]
+impl CapsulePageStore for LocalCapsuleStore {
+    fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
+    async fn reserve_all(&self, pages: &RoaringBitmap) -> Result<(), MirageError> {
+        let mut unique = BTreeMap::new();
+        let mut requests = Vec::new();
+        for ordinal in pages {
+            let page = self.page(ordinal)?;
+            let hash = page.plaintext_hash();
+            let length = page.logical_length();
+            match unique.insert(hash, length) {
+                Some(existing) if existing != length => {
+                    return Err(MirageError::integrity_mismatch(
+                        "deduplicated page hash has conflicting lengths",
+                    ));
+                }
+                Some(_) => {}
+                None => requests.push((hash, length)),
+            }
+        }
+        let outcomes = self.database.reserve_cache_slots_batch(requests)?;
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("capsule reservation lock poisoned"))?;
+        for ((hash, _), outcome) in unique.into_iter().zip(outcomes) {
+            if let ReserveCacheSlotOutcome::Reserved(record) = outcome {
+                reservations.insert(hash, record);
+            }
+        }
+        Ok(())
+    }
+
+    async fn is_verified_resident(&self, page: u32) -> Result<bool, MirageError> {
+        let start = Instant::now();
+        let hash = self.page(page)?.plaintext_hash();
+        let verified = matches!(
+            verify_page(&self.resident, &self.database, hash, IntegrityClass::Clean,)?,
+            VerifyOutcome::Verified
+        );
+        if let Ok(mut timing) = self.timing.lock() {
+            timing.resident_check_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+        Ok(verified)
+    }
+
+    async fn fetch_verify_commit(
+        &self,
+        page: u32,
+        mandatory: bool,
+        cancel: &CancellationToken,
+    ) -> Result<u64, MirageError> {
+        if cancel.is_cancelled() {
+            return Err(MirageError::cancelled("capsule materialization cancelled"));
+        }
+        let bytes = self.fetch_verified_bytes(page, mandatory, cancel).await?;
+        let hash = self.page(page)?.plaintext_hash();
+        let record = self.take_reservation(hash, bytes.len() as u32)?;
+        let insert_start = Instant::now();
         let outcome = insert_reserved_page(
             &self.database,
             Arc::clone(&self.shard),
@@ -1588,11 +1827,92 @@ impl CapsulePageStore for LocalCapsuleStore {
             InsertOutcome::Inserted(record) | InsertOutcome::Existing(record) => record,
         };
         self.resident.install(resident, Arc::clone(&self.shard))?;
+        if let Ok(mut timing) = self.timing.lock() {
+            timing.insert_ms += insert_start.elapsed().as_secs_f64() * 1000.0;
+        }
         Ok(bytes.len() as u64)
     }
 
+    fn batch_pages(&self) -> usize {
+        (32 * 1024 * 1024 / self.shard.layout().page_size.as_u64()).clamp(1, 32) as usize
+    }
+
+    async fn materialize_pages(
+        &self,
+        pages: &[u32],
+        mandatory: bool,
+        progress: &mut MaterializeProgress,
+        cancel: &CancellationToken,
+    ) -> Result<(), MirageError> {
+        let result = async {
+            let mut payloads = BTreeMap::new();
+            let mut duplicates = 0;
+            for &ordinal in pages {
+                if cancel.is_cancelled() {
+                    return Err(MirageError::cancelled("capsule materialization cancelled"));
+                }
+                let hash = self.page(ordinal)?.plaintext_hash();
+                match payloads.entry(hash) {
+                    std::collections::btree_map::Entry::Occupied(_) => duplicates += 1,
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        if self.is_verified_resident(ordinal).await? {
+                            progress.already_resident += 1;
+                            progress.verified_pages += 1;
+                        } else {
+                            let bytes = self
+                                .fetch_verified_bytes(ordinal, mandatory, cancel)
+                                .await?;
+                            entry.insert(bytes);
+                        }
+                    }
+                }
+            }
+            if payloads.is_empty() {
+                return Ok(());
+            }
+            if cancel.is_cancelled() {
+                return Err(MirageError::cancelled("capsule materialization cancelled"));
+            }
+            let mut batch: Vec<_> = payloads
+                .iter()
+                .map(|(hash, bytes)| {
+                    let record = self.take_reservation(*hash, bytes.len() as u32)?;
+                    Ok((record, bytes.as_slice()))
+                })
+                .collect::<Result<_, MirageError>>()?;
+            batch.sort_unstable_by_key(|(record, _)| (record.shard_id, record.slot_index));
+            let insert_start = Instant::now();
+            let records = mirage_cache::insert_reserved_pages(
+                &self.database,
+                Arc::clone(&self.shard),
+                &batch,
+                &(),
+            )?;
+            for record in records {
+                self.resident.install(record, Arc::clone(&self.shard))?;
+            }
+            if let Ok(mut timing) = self.timing.lock() {
+                timing.insert_ms += insert_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            progress.downloaded_pages += batch.len() as u64;
+            progress.downloaded_bytes += payloads
+                .values()
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>();
+            progress.already_resident += duplicates;
+            progress.verified_pages += batch.len() as u64 + duplicates;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            progress.failed_pages += u64::from(error.code != "MIRAGE_CANCELLED");
+        }
+        result
+    }
+
     async fn checkpoint(&self, progress: MaterializeProgress) -> Result<(), MirageError> {
-        write_json_atomic(
+        let start = Instant::now();
+        let result = write_json_atomic(
             &self.checkpoint_path,
             &json!({
                 "format_version": 1,
@@ -1605,7 +1925,11 @@ impl CapsulePageStore for LocalCapsuleStore {
                 "failed_pages": progress.failed_pages,
                 "downloaded_bytes": progress.downloaded_bytes
             }),
-        )
+        );
+        if let Ok(mut timing) = self.timing.lock() {
+            timing.checkpoint_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+        result
     }
 }
 
@@ -2589,6 +2913,7 @@ fn local_commit_hash(
 fn load_profiles(
     database: &Database,
     repository_id: RepositoryId,
+    binding: &ProfileBinding,
 ) -> Result<Vec<GameProfile>, MirageError> {
     let root = repository_state_root(database, repository_id)?.join("profiles");
     let mut paths = std::fs::read_dir(&root)
@@ -2616,6 +2941,7 @@ fn load_profiles(
                     .with_source(error)
             })?;
             profile.validate()?;
+            bind_profile(&profile, binding)?;
             Ok(profile)
         })
         .collect()
@@ -3117,6 +3443,155 @@ mod tests {
     use super::*;
     use mirage_backend::{BackendId, ImmutableRevision, ProviderObjectId};
     use mirage_pack::{ImportPlan, PlannedFile, import_local};
+
+    fn plan_fixture(cache_bytes: u64) -> (tempfile::TempDir, Database, RepositoryId) {
+        let directory = tempfile::tempdir().unwrap();
+        let native_root = directory.path().join("game");
+        let source = native_root.join("assets");
+        let import_root = directory.path().join("import");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(native_root.join("game.exe"), b"native launcher").unwrap();
+        let mut bytes = Vec::new();
+        for page in 0..84 {
+            bytes.extend(std::iter::repeat_n((page % 42) as u8, 65536));
+        }
+        bytes.extend([0x79; 137]);
+        std::fs::write(source.join("content.pak"), bytes).unwrap();
+        let repository_id = RepositoryId::from_bytes([0x72; 16]);
+        import_local(&ImportPlan {
+            repository_id,
+            generation_id: GenerationId::ZERO,
+            source_root: source,
+            files: vec![PlannedFile {
+                relative_path: "content.pak".into(),
+                class: mirage_manifest::FileClass::VirtualContainer,
+            }],
+            page_size: 65536,
+            pack_target: 8 * 1024 * 1024,
+            output_staging_directory: import_root.clone(),
+            encryption: None,
+        })
+        .unwrap();
+        let database = Database::open(&directory.path().join("control.db")).unwrap();
+        register(
+            &database,
+            "S-1-5-21-1111111111-2222222222-3333333333-1001",
+            RegisterSpec {
+                repository_id,
+                display_name: "batch materialization".into(),
+                native_root,
+                mount_subtree: "assets".into(),
+                import_root,
+                launcher_relative: "game.exe".into(),
+                arguments: Vec::new(),
+                version_label: "1".into(),
+                configuration_label: "default".into(),
+                cache_bytes,
+            },
+        )
+        .unwrap();
+        let profiles = repository_state_root(&database, repository_id)
+            .unwrap()
+            .join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        write_json_atomic(&profiles.join("synthetic.profile.json"), &json!({
+            "format_version": 1,
+            "repository_id": repository_id.to_string(),
+            "manifest_hash": active_generation(&database, repository_id).unwrap().manifest_hash.to_string(),
+            "label": "1:default",
+            "page_observations": [{"file_index": 0, "page_ordinal": 0, "first_touch_delta_us": 0, "class": "demand"}],
+            "processes": [{"stable_index": 1, "role": "game", "redacted_image_path": "game.exe"}],
+            "dropped_event_count": 0,
+        })).unwrap();
+        (directory, database, repository_id)
+    }
+
+    fn materialization_fixture() -> (
+        tempfile::TempDir,
+        Database,
+        RepositoryId,
+        mirage_types::CapsuleId,
+    ) {
+        let (directory, database, repository_id) = plan_fixture(8 * 1024 * 1024);
+        let planned = plan(&database, repository_id, true).unwrap();
+        let capsule = serde_json::from_value(planned["capsule_id"].clone()).unwrap();
+        (directory, database, repository_id, capsule)
+    }
+
+    #[test]
+    fn plan_reports_verified_scope_for_full_volume_and_profiled_adaptive_for_profiles() {
+        let (_directory, database, repository_id) = plan_fixture(8 * 1024 * 1024);
+        let full = plan(&database, repository_id, true).unwrap();
+        assert_eq!(full["readiness"]["mode"], "verified_scope");
+        assert_eq!(full["readiness"]["scope_completeness"], "complete");
+        assert_eq!(full["readiness"]["presentation"], "win_fsp_projection");
+        let capsule_id = full["capsule_id"].as_str().unwrap();
+        let record_path = repository_state_root(&database, repository_id)
+            .unwrap()
+            .join("capsules")
+            .join(format!("{capsule_id}.readiness.json"));
+        let record: mirage_types::ReadinessRecord =
+            serde_json::from_str(&std::fs::read_to_string(record_path).unwrap()).unwrap();
+        record.validate().unwrap();
+
+        let adaptive = plan(&database, repository_id, false).unwrap();
+        assert_eq!(adaptive["readiness"]["mode"], "profiled_adaptive");
+        assert_eq!(adaptive["readiness"]["scope_completeness"], "empirical");
+        assert!(
+            adaptive["readiness"]["invalidation_conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| condition == "origin_unavailable")
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_scope_that_exceeds_the_budget_as_unsupported() {
+        let (_directory, database, repository_id) = plan_fixture(1024 * 1024);
+        let error = plan(&database, repository_id, true).unwrap_err();
+        assert_eq!(error.kind, mirage_types::MirageErrorKind::CacheFull);
+        assert!(error.message.contains("no qualified readiness plan"));
+    }
+
+    #[test]
+    fn batched_materialization_deduplicates_and_resumes_verified_pages() {
+        let (_directory, database, repository_id, capsule) = materialization_fixture();
+        let first = materialize(&database, repository_id, capsule, None, None).unwrap();
+        assert_eq!(first["complete"], true);
+        assert_eq!(first["failed_pages"], 0);
+        assert_eq!(first["downloaded_pages"], 43);
+        assert_eq!(first["downloaded_bytes"], 42 * 65536 + 137);
+        assert_eq!(database.load_resident_cache_slots().unwrap().len(), 43);
+        let resumed = materialize(&database, repository_id, capsule, None, None).unwrap();
+        assert_eq!(resumed["complete"], true);
+        assert_eq!(resumed["downloaded_pages"], 0);
+        assert_eq!(resumed["already_resident"], resumed["total_pages"]);
+    }
+
+    #[test]
+    fn batched_materialization_repairs_a_corrupt_resident_on_resume() {
+        let (_directory, database, repository_id, capsule) = materialization_fixture();
+        materialize(&database, repository_id, capsule, None, None).unwrap();
+        let record = database.load_resident_cache_slots().unwrap()[0];
+        let (shard, _) = open_cache(&database, 65536, 8 * 1024 * 1024).unwrap();
+        shard.write_slot(record.slot_index, &[0xfe]).unwrap();
+        shard.flush().unwrap();
+        let repaired = materialize(&database, repository_id, capsule, None, None).unwrap();
+        assert_eq!(repaired["complete"], true);
+        assert_eq!(repaired["downloaded_pages"], 1);
+        let (_, resident) = open_cache(&database, 65536, 8 * 1024 * 1024).unwrap();
+        assert_eq!(
+            verify_page(
+                &resident,
+                &database,
+                record.page_hash.unwrap(),
+                IntegrityClass::Clean
+            )
+            .unwrap(),
+            VerifyOutcome::Verified
+        );
+    }
 
     #[test]
     fn subtree_conversion_is_dry_run_first_and_byte_reversible() {

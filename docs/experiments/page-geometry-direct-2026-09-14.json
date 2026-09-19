@@ -1,0 +1,290 @@
+{
+  "caveats": [
+    "Synthetic random fixture on one machine; not a game workload.",
+    "Read latencies include ResidentIndex lookup, lease acquisition, and arena I/O; no WinFsp or kernel path.",
+    "Warm buffered reads measure the OS cache unless --direct is used.",
+    "Changing page size must not reinterpret an existing arena; each geometry used a fresh fixture."
+  ],
+  "debug_build": false,
+  "direct_unbuffered_arena": true,
+  "fixture_bytes": 268435456,
+  "large_reads_per_run": 200,
+  "machine": "ASHIM",
+  "results": [
+    {
+      "aligned_4k_read": {
+        "errors": 0,
+        "mean_ns": 110960,
+        "median_of_per_run_p99_ns": 181700,
+        "per_run_p50_ns": [
+          107700,
+          108100,
+          107000,
+          107800,
+          107600
+        ],
+        "per_run_p99_ns": [
+          211300,
+          181700,
+          168600,
+          203000,
+          169400
+        ],
+        "pooled_p50_ns": 107600,
+        "pooled_p99_ns": 193700,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "errors": 0,
+        "mean_ns": 220354,
+        "median_of_per_run_p99_ns": 338200,
+        "per_run_p50_ns": [
+          215300,
+          215300,
+          215900,
+          216900,
+          215500
+        ],
+        "per_run_p99_ns": [
+          338200,
+          307100,
+          348400,
+          364400,
+          333300
+        ],
+        "pooled_p50_ns": 215700,
+        "pooled_p99_ns": 341900,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 268505088,
+        "arena_metadata_bytes": 266304,
+        "control_db_bytes": 598016,
+        "import_ns": 1829170400,
+        "insert_ns": 16388966900,
+        "mount_index_bytes": 623872,
+        "mount_index_bytes_per_page": 152.3125,
+        "pack_bytes": 286516238,
+        "pack_overhead_bytes": 18080782,
+        "page_count": 4096,
+        "source_bytes": 268435456,
+        "unique_pages": 4096
+      },
+      "materialize_ns": 18218137300,
+      "miss_amplification": {
+        "decoded_amplification": 16.0,
+        "decoded_bytes_per_4k_miss": 65536,
+        "encoded_bytes_per_4k_miss_estimate": 69950.25341796875,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 65536,
+      "sequential_1m_read": {
+        "errors": 0,
+        "mean_ns": 3909169,
+        "median_of_per_run_p99_ns": 4205700,
+        "per_run_p50_ns": [
+          3917200,
+          3880300,
+          3915300,
+          3829600,
+          3933300
+        ],
+        "per_run_p99_ns": [
+          4199300,
+          4191400,
+          4205700,
+          4224000,
+          4454300
+        ],
+        "pooled_p50_ns": 3898200,
+        "pooled_p99_ns": 4236500,
+        "samples": 1000
+      }
+    },
+    {
+      "aligned_4k_read": {
+        "errors": 0,
+        "mean_ns": 110637,
+        "median_of_per_run_p99_ns": 175400,
+        "per_run_p50_ns": [
+          105100,
+          104800,
+          104800,
+          105200,
+          105700
+        ],
+        "per_run_p99_ns": [
+          175400,
+          163300,
+          165700,
+          201100,
+          190500
+        ],
+        "pooled_p50_ns": 105100,
+        "pooled_p99_ns": 177200,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "errors": 0,
+        "mean_ns": 217750,
+        "median_of_per_run_p99_ns": 356100,
+        "per_run_p50_ns": [
+          209600,
+          210200,
+          210400,
+          210900,
+          210500
+        ],
+        "per_run_p99_ns": [
+          314100,
+          326200,
+          356100,
+          360200,
+          363500
+        ],
+        "pooled_p50_ns": 210300,
+        "pooled_p99_ns": 350300,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 268701696,
+        "arena_metadata_bytes": 69696,
+        "control_db_bytes": 253952,
+        "import_ns": 1728148300,
+        "insert_ns": 5488697800,
+        "mount_index_bytes": 156928,
+        "mount_index_bytes_per_page": 153.25,
+        "pack_bytes": 272956430,
+        "pack_overhead_bytes": 4520974,
+        "page_count": 1024,
+        "source_bytes": 268435456,
+        "unique_pages": 1024
+      },
+      "materialize_ns": 7216846100,
+      "miss_amplification": {
+        "decoded_amplification": 64.0,
+        "decoded_bytes_per_4k_miss": 262144,
+        "encoded_bytes_per_4k_miss_estimate": 266559.013671875,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 262144,
+      "sequential_1m_read": {
+        "errors": 0,
+        "mean_ns": 1409926,
+        "median_of_per_run_p99_ns": 1972700,
+        "per_run_p50_ns": [
+          1381100,
+          1381200,
+          1379400,
+          1384200,
+          1387400
+        ],
+        "per_run_p99_ns": [
+          1975000,
+          2160500,
+          1856300,
+          1860900,
+          1972700
+        ],
+        "pooled_p50_ns": 1383000,
+        "pooled_p99_ns": 2092400,
+        "samples": 1000
+      }
+    },
+    {
+      "aligned_4k_read": {
+        "errors": 0,
+        "mean_ns": 108616,
+        "median_of_per_run_p99_ns": 180400,
+        "per_run_p50_ns": [
+          104200,
+          103600,
+          103500,
+          103600,
+          103600
+        ],
+        "per_run_p99_ns": [
+          202100,
+          170300,
+          165900,
+          186800,
+          180400
+        ],
+        "pooled_p50_ns": 103700,
+        "pooled_p99_ns": 181300,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "errors": 0,
+        "mean_ns": 213965,
+        "median_of_per_run_p99_ns": 348000,
+        "per_run_p50_ns": [
+          207000,
+          206700,
+          206200,
+          206400,
+          206600
+        ],
+        "per_run_p99_ns": [
+          368400,
+          348000,
+          304600,
+          338600,
+          356000
+        ],
+        "pooled_p50_ns": 206500,
+        "pooled_p99_ns": 347600,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 269488128,
+        "arena_metadata_bytes": 20544,
+        "control_db_bytes": 4096,
+        "import_ns": 1819714000,
+        "insert_ns": 2357653700,
+        "mount_index_bytes": 40192,
+        "mount_index_bytes_per_page": 157.0,
+        "pack_bytes": 269566477,
+        "pack_overhead_bytes": 1131021,
+        "page_count": 256,
+        "source_bytes": 268435456,
+        "unique_pages": 256
+      },
+      "materialize_ns": 4177367700,
+      "miss_amplification": {
+        "decoded_amplification": 256.0,
+        "decoded_bytes_per_4k_miss": 1048576,
+        "encoded_bytes_per_4k_miss_estimate": 1052994.05078125,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 1048576,
+      "sequential_1m_read": {
+        "errors": 0,
+        "mean_ns": 800611,
+        "median_of_per_run_p99_ns": 889700,
+        "per_run_p50_ns": [
+          796300,
+          792700,
+          787500,
+          787100,
+          790300
+        ],
+        "per_run_p99_ns": [
+          891600,
+          939400,
+          862000,
+          864900,
+          889700
+        ],
+        "pooled_p50_ns": 790800,
+        "pooled_p99_ns": 889700,
+        "samples": 1000
+      }
+    }
+  ],
+  "runs": 5,
+  "schema_version": 1,
+  "small_reads_per_run": 20000,
+  "tool": "page_geometry",
+  "warm_buffered": false
+}

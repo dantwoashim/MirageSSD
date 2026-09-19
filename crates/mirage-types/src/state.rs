@@ -24,6 +24,8 @@ macro_rules! state_enum {
     };
 }
 
+pub(crate) use state_enum;
+
 state_enum! {
     /// Repository lifecycle from first import through mount, play, update, and recovery.
     RepositoryState {

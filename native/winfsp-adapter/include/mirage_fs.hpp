@@ -7,9 +7,6 @@
 namespace mirage {
 struct FileContext {
     std::atomic_uint32_t references{1};
-    std::atomic_uint64_t last_end{};
-    std::atomic_uint32_t sequential_reads{};
-    std::atomic_bool prefetching{};
     std::uint32_t opener_pid{};
     MirageFileHandle* rust_handle{};
     MirageFileInfo info{};

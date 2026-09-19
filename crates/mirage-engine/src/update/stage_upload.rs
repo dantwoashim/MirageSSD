@@ -31,6 +31,7 @@ pub async fn upload_staged_pack(
     if cancel.is_cancelled() {
         return Err(MirageError::cancelled("staging upload cancelled"));
     }
+    crate::repository_writer::require_publish_capability(backend)?;
     let bytes = std::fs::read(&staged.pack.path).map_err(MirageError::from)?;
     if bytes.len() as u64 != staged.pack.byte_length
         || blake3::hash(&bytes).as_bytes() != staged.pack.content_hash.as_bytes()

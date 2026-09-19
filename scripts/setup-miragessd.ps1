@@ -180,7 +180,9 @@ try {
   $result = & $installer @parameters
   if ($LASTEXITCODE -ne 0) { throw 'MirageSSD installation failed.' }
 
-  $mount = $DriveLetter.TrimEnd(':').ToUpperInvariant() + ':\'
+  $installedResult = ($result -join "`n") | ConvertFrom-Json
+  $mount = [string]$installedResult.MountPoint
+  if ($mount -notmatch '^[D-Z]:\\$' -or -not $installedResult.Installed) { throw 'The installer returned an invalid mount point.' }
   Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList $mount
   Show-Result "MirageSSD is ready at $mount`n`nIt will reconnect automatically whenever you sign in to Windows."
   $result

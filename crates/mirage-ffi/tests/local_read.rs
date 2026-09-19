@@ -99,6 +99,230 @@ fn run_local_read(encrypted: bool) {
 }
 
 #[test]
+fn concurrent_origin_misses_decode_once() {
+    let source = tempfile::tempdir().expect("source");
+    std::fs::create_dir(source.path().join("assets")).expect("directory");
+    let mut expected = vec![0x37; 64 * 1024];
+    expected.extend((0..41_000).map(|value| (value % 241) as u8));
+    std::fs::write(source.path().join("assets/data.pak"), &expected).expect("source file");
+    let objects = tempfile::tempdir().expect("objects");
+    let imported = import_local(&ImportPlan {
+        repository_id: RepositoryId::from_bytes([0x51; 16]),
+        generation_id: GenerationId::ZERO,
+        source_root: source.path().to_path_buf(),
+        files: vec![PlannedFile {
+            relative_path: "assets/data.pak".into(),
+            class: FileClass::VirtualContainer,
+        }],
+        page_size: 64 * 1024,
+        pack_target: 256 * 1024,
+        output_staging_directory: objects.path().to_path_buf(),
+        encryption: None,
+    })
+    .expect("import");
+    let index_path = objects.path().join("mount.idx");
+    mirage_index::compile_to_path(&imported.manifest, &index_path).expect("index");
+    let index = utf16(&index_path);
+    let root = utf16(objects.path());
+    let mut engine: *mut MirageEngineHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_engine_create_local(
+                index.as_ptr(),
+                index.len(),
+                root.as_ptr(),
+                root.len(),
+                &mut engine,
+            )
+        },
+        MirageStatus::Ok
+    );
+    let path: Vec<u16> = "\\assets\\data.pak".encode_utf16().collect();
+    let mut file: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_lookup(engine, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    // Sixteen threads miss the same first page through one shared flight: the
+    // owner decodes once and every subscriber reads the published page.
+    const READERS: usize = 16;
+    let file_addr = file as usize;
+    let barrier = Arc::new(std::sync::Barrier::new(READERS));
+    let workers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let file = file_addr as *const MirageFileHandle;
+                let mut actual = vec![0_u8; 4096];
+                let mut transferred = 0_usize;
+                let status = unsafe {
+                    mirage_ffi::mirage_read(
+                        file,
+                        0,
+                        actual.as_mut_ptr(),
+                        actual.len(),
+                        &mut transferred,
+                    )
+                };
+                (status, transferred, actual)
+            })
+        })
+        .collect();
+    for worker in workers {
+        let (status, transferred, actual) = worker.join().expect("reader");
+        assert_eq!(status, MirageStatus::Ok);
+        assert_eq!(transferred, 4096);
+        assert_eq!(actual, expected[..4096]);
+    }
+    let engine_ref = unsafe { &*engine };
+    assert_eq!(engine_ref.origin_decode_count(), 1);
+    assert!(engine_ref.origin_flights.is_empty());
+    unsafe {
+        mirage_ffi::mirage_file_close(file);
+        mirage_ffi::mirage_engine_destroy(engine);
+    }
+}
+
+/// Cache-mode engine with a reachable local origin; only `resident_pages` of
+/// the three-page fixture are inserted into the arena.
+fn cache_origin_fixture(
+    resident_pages: &[usize],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    *mut MirageEngineHandle,
+    *mut MirageFileHandle,
+    Vec<u8>,
+) {
+    let source = tempfile::tempdir().expect("source");
+    std::fs::create_dir(source.path().join("assets")).expect("directory");
+    let mut expected = Vec::new();
+    for page in 0..3_u8 {
+        expected.extend(std::iter::repeat_n(page + 0x41, 64 * 1024));
+    }
+    std::fs::write(source.path().join("assets/data.pak"), &expected).expect("source file");
+    let objects = tempfile::tempdir().expect("objects");
+    let imported = import_local(&ImportPlan {
+        repository_id: RepositoryId::from_bytes([0x63; 16]),
+        generation_id: GenerationId::ZERO,
+        source_root: source.path().to_path_buf(),
+        files: vec![PlannedFile {
+            relative_path: "assets/data.pak".into(),
+            class: FileClass::VirtualContainer,
+        }],
+        page_size: 64 * 1024,
+        pack_target: 256 * 1024,
+        output_staging_directory: objects.path().to_path_buf(),
+        encryption: None,
+    })
+    .expect("import");
+    let index_path = objects.path().join("cache.idx");
+    mirage_index::compile_to_path(&imported.manifest, &index_path).expect("index");
+
+    let state = tempfile::tempdir().expect("state");
+    std::fs::create_dir(state.path().join("cache")).expect("cache directory");
+    let database = Database::open(&state.path().join("control.db")).expect("database");
+    let layout = CacheLayout {
+        page_size: ByteCount::from_u64(64 * 1024),
+        slot_count: imported.manifest.pages.len() as u32 + 1,
+        db_journal_allowance: ByteCount::ZERO,
+        filesystem_reserve: ByteCount::ZERO,
+    };
+    let shard = Arc::new(
+        ArenaShard::create(&state.path().join("cache/shard-0.bin"), layout).expect("shard"),
+    );
+    database
+        .register_cache_shard(CacheShardSpec {
+            shard_id: 0,
+            relative_path: "shard-0.bin".into(),
+            page_size: layout.page_size,
+            slot_count: layout.slot_count,
+        })
+        .expect("register shard");
+    for &page in resident_pages {
+        let chunk = &expected[page * 64 * 1024..(page + 1) * 64 * 1024];
+        insert_page(
+            &database,
+            Arc::clone(&shard),
+            imported.manifest.pages[page].plaintext_hash,
+            chunk,
+            &(),
+        )
+        .expect("insert cache page");
+    }
+    drop(shard);
+    drop(database);
+
+    let index = utf16(&index_path);
+    let root = utf16(state.path());
+    let origin = utf16(objects.path());
+    let mut engine: *mut MirageEngineHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_engine_create_cache_with_origin(
+                index.as_ptr(),
+                index.len(),
+                root.as_ptr(),
+                root.len(),
+                origin.as_ptr(),
+                origin.len(),
+                &mut engine,
+            )
+        },
+        MirageStatus::Ok
+    );
+    let path: Vec<u16> = "\\assets\\data.pak".encode_utf16().collect();
+    let mut file: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_lookup(engine, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    (source, objects, state, engine, file, expected)
+}
+
+#[test]
+fn adjacent_resident_slots_are_served_by_one_coalesced_read() {
+    let (_source, _objects, _state, engine, file, expected) = cache_origin_fixture(&[0, 1, 2]);
+    let mut actual = vec![0_u8; expected.len()];
+    let mut transferred = 0;
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_read(file, 0, actual.as_mut_ptr(), actual.len(), &mut transferred)
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(transferred, expected.len());
+    assert_eq!(actual, expected);
+    assert_eq!(unsafe { &*engine }.coalesced_reads(), (1, 3));
+    unsafe {
+        mirage_ffi::mirage_file_close(file);
+        mirage_ffi::mirage_engine_destroy(engine);
+    }
+}
+
+#[test]
+fn a_non_resident_middle_page_breaks_the_run_without_losing_bytes() {
+    let (_source, _objects, _state, engine, file, expected) = cache_origin_fixture(&[0, 2]);
+    let mut actual = vec![0_u8; expected.len()];
+    let mut transferred = 0;
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_read(file, 0, actual.as_mut_ptr(), actual.len(), &mut transferred)
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(transferred, expected.len());
+    assert_eq!(actual, expected);
+    assert_eq!(unsafe { &*engine }.coalesced_reads(), (0, 0));
+    unsafe {
+        mirage_ffi::mirage_file_close(file);
+        mirage_ffi::mirage_engine_destroy(engine);
+    }
+}
+
+#[test]
 fn verified_sparse_cache_reads_are_exact_without_pack_access() {
     let source = tempfile::tempdir().expect("source");
     std::fs::create_dir(source.path().join("assets")).expect("directory");

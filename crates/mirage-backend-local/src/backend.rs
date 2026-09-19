@@ -81,6 +81,10 @@ impl LocalObjectBackend {
 
 #[async_trait]
 impl ObjectBackend for LocalObjectBackend {
+    fn capabilities(&self) -> mirage_backend::BackendCapabilities {
+        mirage_backend::BackendCapabilities::ARCHIVE
+    }
+
     async fn read_range(
         &self,
         object: &RemoteObjectRef,

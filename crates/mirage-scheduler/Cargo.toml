@@ -18,10 +18,13 @@ mirage-pack.workspace = true
 mirage-manifest.workspace = true
 bytes.workspace = true
 futures-executor.workspace = true
+futures-util.workspace = true
 tokio-util.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 mirage-backend-local.workspace = true
+mirage-crypto.workspace = true
 tempfile.workspace = true
 proptest.workspace = true

@@ -57,6 +57,10 @@ impl std::fmt::Debug for DriveObjectBackend {
 
 #[async_trait]
 impl ObjectBackend for DriveObjectBackend {
+    fn capabilities(&self) -> mirage_backend::BackendCapabilities {
+        mirage_backend::BackendCapabilities::ARCHIVE
+    }
+
     async fn read_range(
         &self,
         object: &RemoteObjectRef,

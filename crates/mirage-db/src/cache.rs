@@ -83,6 +83,12 @@ impl Database {
     ) -> Result<CommitCacheSlotOutcome, MirageError> {
         self.writer.commit_cache_slot(record)
     }
+    pub fn commit_cache_slots_batch(
+        &self,
+        records: Vec<CacheSlotRecord>,
+    ) -> Result<Vec<CacheSlotRecord>, MirageError> {
+        self.writer.commit_cache_slots_batch(records)
+    }
     pub fn release_cache_reservation(&self, record: CacheSlotRecord) -> Result<(), MirageError> {
         self.writer.release_cache_reservation(record)
     }
@@ -114,17 +120,17 @@ impl Database {
 
 pub(crate) fn reserve_batch(
     connection: &mut Connection,
-    mut requests: Vec<(PageHash, u32)>,
+    requests: Vec<(PageHash, u32)>,
 ) -> Result<Vec<ReserveCacheSlotOutcome>, MirageError> {
     if requests.is_empty() {
         return Err(MirageError::invalid_argument(
             "cache reservation batch is empty",
         ));
     }
-    requests.sort_by_key(|request| request.0);
-    for pair in requests.windows(2) {
-        if pair[0].0 == pair[1].0 {
-            if pair[0].1 != pair[1].1 {
+    let mut lengths = std::collections::BTreeMap::new();
+    for &(hash, length) in &requests {
+        if let Some(existing) = lengths.insert(hash, length) {
+            if existing != length {
                 return Err(MirageError::invalid_argument(
                     "duplicate cache reservation has conflicting lengths",
                 ));
@@ -339,6 +345,54 @@ pub(crate) fn commit_slot(
         state: CacheSlotState::Resident,
         ..record
     }))
+}
+
+pub(crate) fn commit_batch(
+    connection: &mut Connection,
+    records: Vec<CacheSlotRecord>,
+) -> Result<Vec<CacheSlotRecord>, MirageError> {
+    if records.is_empty() || records.len() > 64 {
+        return Err(MirageError::invalid_argument(
+            "cache commit batch must contain 1 to 64 slots",
+        ));
+    }
+    let mut slots = std::collections::BTreeSet::new();
+    let mut hashes = std::collections::BTreeSet::new();
+    for record in &records {
+        require(*record, CacheSlotState::Reserved)?;
+        if !slots.insert((record.shard_id, record.slot_index))
+            || !hashes.insert(record.page_hash.expect("validated"))
+        {
+            return Err(MirageError::invalid_argument(
+                "cache commit batch contains duplicate slots or hashes",
+            ));
+        }
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| sqlite(error, "failed to begin cache batch commit"))?;
+    let mut committed = Vec::with_capacity(records.len());
+    for record in records {
+        let hash = record.page_hash.expect("validated");
+        if query_hash(&transaction, hash, CacheSlotState::Resident)?.is_some() {
+            return Err(conflict("cache batch page became resident before commit"));
+        }
+        let changed = transaction.execute(
+            "UPDATE cache_slots SET state=2 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=1 AND page_hash=?4 AND logical_length=?5",
+            params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(record.logical_length)],
+        ).map_err(|error| sqlite(error, "failed to publish cache batch slot"))?;
+        if changed != 1 {
+            return Err(conflict("cache batch reservation changed before commit"));
+        }
+        committed.push(CacheSlotRecord {
+            state: CacheSlotState::Resident,
+            ..record
+        });
+    }
+    transaction
+        .commit()
+        .map_err(|error| sqlite(error, "failed to commit resident cache batch"))?;
+    Ok(committed)
 }
 
 pub(crate) fn release(

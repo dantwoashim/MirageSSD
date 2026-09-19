@@ -19,6 +19,7 @@ pub mod page_location;
 pub mod page_provider;
 pub mod read;
 pub mod read_request;
+pub mod readiness;
 pub mod repair;
 pub mod repository_extract;
 pub mod repository_reader;
@@ -36,9 +37,14 @@ pub use generation::MountGeneration;
 pub use observe::{ObservationEvent, SessionObserver, TelemetryMetrics};
 pub use outcome::{CacheTier, ReadOutcome, SealViolation};
 pub use page_location::{PageLocation, PageLocationMap};
-pub use page_provider::{FetchContext, PageProvider};
+pub use page_provider::{DEFAULT_FETCH_WORKERS, FetchContext, PageProvider};
 pub use read_request::{
     AccessPattern, BufferCacheMode, BufferingHint, ProcessRole, ReadContext, ReadPriority,
+};
+pub use readiness::{
+    BackendCapability, CandidateRejection, CompileInput, EvictionGranularity, FilePlacementClass,
+    HydrationGranularity, OriginEstimate, ReadinessIdentity, ReadinessVerdict, RequiredFile,
+    ScopeSpec, UnsupportedPlan, compile_readiness,
 };
 pub use repository_extract::{
     ExtractReport, extract_virtual_files, extract_virtual_files_with_encryption,

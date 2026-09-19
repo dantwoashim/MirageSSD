@@ -160,6 +160,31 @@ impl BudgetReservation {
     pub fn release(mut self) {
         self.release_inner();
     }
+    /// Moves this reservation's bytes from `reserved` to `committed` after
+    /// placement; the envelope does not grow, so `peak` is unchanged. The
+    /// reservation is consumed and Drop becomes a no-op. On overflow the
+    /// reservation releases instead of committing.
+    pub fn commit(mut self) -> Result<(), MirageError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("reservation ledger lock poisoned"))?;
+        let committed = state
+            .committed
+            .checked_add(self.bytes)
+            .ok_or_else(|| MirageError::invalid_argument("committed cache bytes overflow"))?;
+        state.reserved -= self.bytes;
+        if matches!(
+            self.class,
+            ReservationClass::DirtyUpdate | ReservationClass::Staging
+        ) {
+            state.dirty_reserved -= self.bytes;
+        }
+        state.committed = committed;
+        self.active = false;
+        Ok(())
+    }
     fn release_inner(&mut self) {
         if !self.active {
             return;

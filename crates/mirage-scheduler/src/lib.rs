@@ -4,6 +4,7 @@ pub mod backoff;
 pub mod coalesce;
 pub mod controller;
 pub mod decode;
+pub mod fetch_pool;
 pub mod flight;
 pub mod flight_map;
 pub mod metrics;
@@ -17,7 +18,8 @@ pub mod worker;
 
 pub use coalesce::coalesce;
 pub use controller::{ConcurrencyController, ControllerInput, ControllerRecommendation};
-pub use flight::{FlightFailure, FlightHandle, PageFlight};
+pub use fetch_pool::{FetchPool, FetchPoolConfig};
+pub use flight::{FlightCompletion, FlightFailure, FlightHandle, FlightResult, PageFlight};
 pub use flight_map::{FlightAcquire, FlightMap};
 pub use priority::PriorityQueue;
 pub use queue::{QueueMetrics, SchedulerQueue};

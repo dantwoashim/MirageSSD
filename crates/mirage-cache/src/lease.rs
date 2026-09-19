@@ -13,6 +13,12 @@ impl ResidentPageGuard {
     pub fn logical_length(&self) -> u32 {
         self.page.record.logical_length
     }
+    /// Arena slot this guard pins; adjacent slots hold physically contiguous
+    /// pages, which is what a coalesced read relies on.
+    #[must_use]
+    pub fn slot_index(&self) -> u32 {
+        self.page.record.slot_index
+    }
     pub fn read_exact(&self, offset: u32, output: &mut [u8]) -> Result<(), MirageError> {
         self.page.shard.read_slot(
             self.page.record.slot_index,

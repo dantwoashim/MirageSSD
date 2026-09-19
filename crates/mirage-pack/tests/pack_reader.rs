@@ -40,16 +40,34 @@ fn build_pack() -> (
 #[test]
 fn random_physical_order_is_hash_lookupable_and_exact() {
     let (_directory, complete, pages) = build_pack();
-    let mut reader = PackReader::open_verified(&complete.path).expect("reader");
+    let reader = PackReader::open_verified(&complete.path).expect("reader");
     for page in pages {
         assert_eq!(reader.read_page(page.hash).expect("read").page, page);
     }
 }
 
 #[test]
+fn concurrent_positional_reads_never_share_a_file_cursor() {
+    let (_directory, complete, pages) = build_pack();
+    let reader = PackReader::open_indexed(&complete.path).unwrap();
+    std::thread::scope(|scope| {
+        for worker in 0..8 {
+            let reader = &reader;
+            let pages = &pages;
+            scope.spawn(move || {
+                for read in 0..64 {
+                    let page = &pages[(worker + read) % pages.len()];
+                    assert_eq!(reader.read_page(page.hash).unwrap().page, *page);
+                }
+            });
+        }
+    });
+}
+
+#[test]
 fn indexed_open_serves_pages_but_per_page_verification_still_rejects_corruption() {
     let (_directory, complete, pages) = build_pack();
-    let mut reader = PackReader::open_indexed(&complete.path).expect("indexed reader");
+    let reader = PackReader::open_indexed(&complete.path).expect("indexed reader");
     for page in &pages {
         assert_eq!(reader.read_page(page.hash).expect("read").page, *page);
     }
@@ -62,7 +80,7 @@ fn indexed_open_serves_pages_but_per_page_verification_still_rejects_corruption(
     let corrupt = complete.path.with_file_name("indexed-corrupt.bin");
     std::fs::write(&corrupt, &bytes).expect("corrupt pack");
     assert!(PackReader::open_verified(&corrupt).is_err());
-    let mut reader = PackReader::open_indexed(&corrupt).expect("indexed open must succeed");
+    let reader = PackReader::open_indexed(&corrupt).expect("indexed open must succeed");
     let error = reader
         .read_page(entry.page_hash)
         .expect_err("corrupt frame");
@@ -156,11 +174,11 @@ fn encrypted_pack_round_trips_and_rejects_missing_or_wrong_context() {
     writer.append_page(&page).expect("append");
     let complete = writer.finish().expect("finish");
 
-    let mut structural = PackReader::open_verified(&complete.path).expect("structural reader");
+    let structural = PackReader::open_verified(&complete.path).expect("structural reader");
     assert!(structural.is_encrypted());
     assert!(structural.read_page(page.hash).is_err());
 
-    let mut reader = PackReader::open_verified_encrypted(
+    let reader = PackReader::open_verified_encrypted(
         &complete.path,
         PackReadEncryption {
             repository_id,
@@ -170,7 +188,7 @@ fn encrypted_pack_round_trips_and_rejects_missing_or_wrong_context() {
     .expect("reader");
     assert_eq!(reader.read_page(page.hash).expect("decrypt").page, page);
 
-    let mut wrong_repository = PackReader::open_verified_encrypted(
+    let wrong_repository = PackReader::open_verified_encrypted(
         &complete.path,
         PackReadEncryption {
             repository_id: RepositoryId::from_bytes([4; 16]),
@@ -180,7 +198,7 @@ fn encrypted_pack_round_trips_and_rejects_missing_or_wrong_context() {
     .expect("structural open");
     assert!(wrong_repository.read_page(page.hash).is_err());
 
-    let mut wrong_key = PackReader::open_verified_encrypted(
+    let wrong_key = PackReader::open_verified_encrypted(
         &complete.path,
         PackReadEncryption {
             repository_id,

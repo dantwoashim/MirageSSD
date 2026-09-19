@@ -66,6 +66,7 @@ fn candidate(value: u8, bytes: u64, age: u64) -> ReclaimCandidate {
         dirty: false,
         pinned: false,
         active_read_leases: 0,
+        mounted_reader_exclusion: false,
     }
 }
 

@@ -20,12 +20,25 @@ pub struct PublishedGeneration {
     pub commit_body: RepositoryCommit,
 }
 
+/// Refuses to start a publishing transaction against an origin that does not
+/// advertise archive mutation, before any object is uploaded.
+pub fn require_publish_capability(backend: &dyn ObjectBackend) -> Result<(), MirageError> {
+    if backend.capabilities().can_publish() {
+        Ok(())
+    } else {
+        Err(MirageError::provider_unavailable(
+            "origin is read-only and cannot publish a generation",
+        ))
+    }
+}
+
 pub async fn publish_base_generation(
     backend: &dyn ObjectBackend,
     packs: &[CompletedPack],
     manifest: &RepositoryManifest,
     signer: &dyn CommitSigner,
 ) -> Result<PublishedGeneration, MirageError> {
+    require_publish_capability(backend)?;
     let cancel = CancellationToken::new();
     let mut remote_packs = Vec::with_capacity(packs.len());
     for pack in packs {
@@ -128,6 +141,7 @@ pub async fn publish_successor_generation(
     signer: &dyn CommitSigner,
     update_id: UpdateId,
 ) -> Result<PublishedGeneration, MirageError> {
+    require_publish_capability(backend)?;
     if parent.body.repository_id != manifest.repository_id
         || manifest.generation_id.as_u64() <= parent.body.sequence
     {

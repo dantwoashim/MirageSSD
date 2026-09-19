@@ -187,3 +187,94 @@ pub(crate) fn deallocate(file: &File, offset: u64, length: u64) -> Result<(), Mi
     }
     Ok(())
 }
+
+/// Number of allocated physical extents backing `file`, as reported by NTFS.
+/// Sparse holes (LCN of -1) are not counted. This is a measurement of the
+/// volume's current layout, not a property of the arena format.
+pub(crate) fn physical_extent_count(file: &File) -> Result<u64, MirageError> {
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_GET_RETRIEVAL_POINTERS, RETRIEVAL_POINTERS_BUFFER, STARTING_VCN_INPUT_BUFFER,
+    };
+
+    const EXTENTS_PER_CALL: usize = 1024;
+    #[repr(C)]
+    struct Extent {
+        next_vcn: i64,
+        lcn: i64,
+    }
+    let header = std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>();
+    let record = std::mem::size_of::<Extent>();
+    let mut output = vec![0_u8; header + EXTENTS_PER_CALL * record];
+    let mut starting_vcn = 0_i64;
+    let mut extents = 0_u64;
+    loop {
+        let input = STARTING_VCN_INPUT_BUFFER {
+            StartingVcn: starting_vcn,
+        };
+        let mut returned = 0_u32;
+        // SAFETY: the input struct and output buffer are live and correctly sized for the
+        // synchronous call; the handle is valid and the byte count is uniquely borrowed.
+        let success = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_GET_RETRIEVAL_POINTERS,
+                (&raw const input).cast(),
+                std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                output.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let more_data = if success == 0 {
+            // SAFETY: GetLastError takes no pointers and observes this thread's last error.
+            let error = unsafe { GetLastError() };
+            if error == windows_sys::Win32::Foundation::ERROR_HANDLE_EOF {
+                return Ok(extents);
+            }
+            if error != ERROR_MORE_DATA {
+                return Err(MirageError::from(std::io::Error::from_raw_os_error(
+                    error as i32,
+                )));
+            }
+            true
+        } else {
+            false
+        };
+        if (returned as usize) < header {
+            return Err(MirageError::integrity_mismatch(
+                "retrieval-pointer query returned a partial header",
+            ));
+        }
+        // SAFETY: the buffer holds at least a full header; ExtentCount is at offset 0.
+        let count = unsafe { output.as_ptr().cast::<u32>().read_unaligned() } as usize;
+        let available = (returned as usize - header) / record;
+        let count = count.min(available).min(EXTENTS_PER_CALL);
+        if count == 0 {
+            return Err(MirageError::provider_unavailable(
+                "retrieval-pointer query could not make progress",
+            ));
+        }
+        // The extent array begins after the 16-byte header (ExtentCount + padding + StartingVcn).
+        let array_offset = std::mem::offset_of!(RETRIEVAL_POINTERS_BUFFER, Extents);
+        let mut last_next_vcn = starting_vcn;
+        for index in 0..count {
+            let base = array_offset + index * record;
+            // SAFETY: `base + record <= returned` by the count clamp above.
+            let extent = unsafe { output.as_ptr().add(base).cast::<Extent>().read_unaligned() };
+            if extent.lcn != -1 {
+                extents += 1;
+            }
+            last_next_vcn = extent.next_vcn;
+        }
+        if !more_data {
+            return Ok(extents);
+        }
+        if last_next_vcn <= starting_vcn {
+            return Err(MirageError::provider_unavailable(
+                "retrieval-pointer query could not make progress",
+            ));
+        }
+        starting_vcn = last_next_vcn;
+    }
+}

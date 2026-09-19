@@ -94,6 +94,8 @@ This produces an ad-hoc-signed `MirageSSD.app` as a ZIP and DMG with checksums. 
 
 Setup chooses a cache budget from available local space. That budget is a cleanup target, not unlimited staging capacity: open files and pending uploads cannot safely be evicted. Downloads can fill the local disk if upload cannot keep up.
 
+**Optional preparation:** [Prepare selected files](docs/prefetch.md) through the existing mounted drive before opening them. ZIP metadata and bounded prefix/whole-file modes are opt-in; no automatic scanning, cache pinning, or unmeasured speedup is promised.
+
 ## Data safety and current limits
 
 - Keep originals until the remote copy and a restore have been verified. Do not use this preview as the only copy of irreplaceable data.

@@ -452,7 +452,7 @@ fn load_or_create_pack(
         ));
     }
     if let Some(path) = existing.pop() {
-        let mut reader = PackReader::open_verified_encrypted(
+        let reader = PackReader::open_verified_encrypted(
             &path,
             PackReadEncryption {
                 repository_id: repository,

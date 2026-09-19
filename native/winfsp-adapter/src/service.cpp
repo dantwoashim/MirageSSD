@@ -58,13 +58,6 @@ NTSTATUS read_dir(FSP_FILE_SYSTEM*, PVOID context, PWSTR, PWSTR marker, PVOID bu
     for (const auto& child : children) { const auto name_bytes = child.name.size()*sizeof(wchar_t); std::vector<unsigned char> storage(sizeof(FSP_FSCTL_DIR_INFO)+name_bytes); auto* entry = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(storage.data()); std::memset(entry,0,storage.size()); entry->Size=static_cast<UINT16>(sizeof(FSP_FSCTL_DIR_INFO)+name_bytes); fill_info(child.info,&entry->FileInfo); std::memcpy(entry->FileNameBuf,child.name.data(),name_bytes); if (!FspFileSystemAddDirInfo(entry,buffer,length,transferred)) break; }
     FspFileSystemAddDirInfo(nullptr,buffer,length,transferred); return STATUS_SUCCESS;
 }
-void record_read(FileSystemHost* owner,FileContext* opened,UINT64 offset,size_t read){
-    const auto end=offset+read;const auto previous=opened->last_end.exchange(end);const auto sequence=previous==offset?opened->sequential_reads.fetch_add(1)+1:0;if(previous!=offset)opened->sequential_reads.store(0);
-    if(sequence<2||end>=opened->info.size||opened->prefetching.exchange(true))return;
-    opened->references.fetch_add(1);owner->begin_pending();
-    try{std::thread([owner,opened,end]{const auto remaining=opened->info.size-end;const auto length=static_cast<size_t>(std::min<UINT64>(remaining,64*1024));std::vector<uint8_t> bytes(length);size_t transferred{};mirage_read_speculative(opened->rust_handle,end,bytes.data(),bytes.size(),&transferred);opened->prefetching.store(false);mirage::release_file_context(opened);owner->end_pending();}).detach();}
-    catch(...){opened->prefetching.store(false);mirage::release_file_context(opened);owner->end_pending();}
-}
 NTSTATUS read_file(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer, UINT64 offset, ULONG length, PULONG transferred) {
     auto* opened=static_cast<FileContext*>(context); if(!opened||opened->info.directory)return STATUS_FILE_IS_A_DIRECTORY;
     // FspFileSystemOperationProcessId() is only valid during Create/Open/Rename; Read always sees 0.
@@ -72,9 +65,9 @@ NTSTATUS read_file(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer, UINT64 offs
     const UINT32 pid=opened->opener_pid;
     auto* owner=host(fs);if(owner->async_delay_ms()!=0){
         const auto hint=FspFileSystemGetOperationContext()->Request->Hint;opened->references.fetch_add(1);owner->begin_pending();
-        try{std::thread([fs,owner,opened,buffer,offset,length,hint,pid]{Sleep(owner->async_delay_ms());size_t read{};const auto result=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);if(result==MIRAGE_OK)record_read(owner,opened,offset,read);FSP_FSCTL_TRANSACT_RSP response;std::memset(&response,0,sizeof(response));response.Size=sizeof(response);response.Kind=FspFsctlTransactReadKind;response.Hint=hint;response.IoStatus.Status=mirage_status_to_ntstatus(result);response.IoStatus.Information=static_cast<UINT32>(read);FspFileSystemSendResponse(fs,&response);mirage::release_file_context(opened);owner->end_pending();}).detach();return STATUS_PENDING;}catch(...){mirage::release_file_context(opened);owner->end_pending();}
+        try{std::thread([fs,owner,opened,buffer,offset,length,hint,pid]{Sleep(owner->async_delay_ms());size_t read{};const auto result=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);FSP_FSCTL_TRANSACT_RSP response;std::memset(&response,0,sizeof(response));response.Size=sizeof(response);response.Kind=FspFsctlTransactReadKind;response.Hint=hint;response.IoStatus.Status=mirage_status_to_ntstatus(result);response.IoStatus.Information=static_cast<UINT32>(read);FspFileSystemSendResponse(fs,&response);mirage::release_file_context(opened);owner->end_pending();}).detach();return STATUS_PENDING;}catch(...){mirage::release_file_context(opened);owner->end_pending();}
     }
-    size_t read{};const auto status=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);if(status==MIRAGE_OK)record_read(owner,opened,offset,read);*transferred=static_cast<ULONG>(read);return mirage_status_to_ntstatus(status);
+    size_t read{};const auto status=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);*transferred=static_cast<ULONG>(read);return mirage_status_to_ntstatus(status);
 }
 NTSTATUS overwrite(FSP_FILE_SYSTEM*,PVOID,UINT32,BOOLEAN,UINT64,FSP_FSCTL_FILE_INFO*){return STATUS_MEDIA_WRITE_PROTECTED;}
 FSP_FILE_SYSTEM_INTERFACE interface_table={.GetVolumeInfo=get_volume,.GetSecurityByName=security_by_name,.Create=create,.Open=open_file,.Overwrite=overwrite,.Close=close_file,.Read=read_file,.GetFileInfo=get_info,.ReadDirectory=read_dir};
@@ -94,7 +87,7 @@ NTSTATUS FileSystemHost::mount(const std::wstring& path,const std::wstring& inde
     params.UmFileContextIsUserContext2=1;
     // INFINITE FileInfoTimeout is what enables kernel data caching and read-ahead in WinFsp;
     // safe here because a mounted generation is immutable. Volume/dir info stay finite.
-    params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeout=1000;params.DirInfoTimeout=1000;
+    params.Version=sizeof(params);params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
     auto status=FspFileSystemCreate(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME),&params,&interface_table,&fs_);if(!NT_SUCCESS(status))return status;fs_->UserContext=this;status=FspFileSystemSetMountPoint(fs_,const_cast<PWSTR>(path.c_str()));if(!NT_SUCCESS(status)){FspFileSystemDelete(fs_);fs_=nullptr;}return status;
 }
 NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;const auto status=FspFileSystemStartDispatcher(fs_,0);if(!NT_SUCCESS(status))return status;std::cout<<"MIRAGE_READY\n"<<std::flush;WaitForSingleObject(stop_event_,INFINITE);return STATUS_SUCCESS;}

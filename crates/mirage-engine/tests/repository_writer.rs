@@ -141,6 +141,10 @@ impl FailPutBackend {
 
 #[async_trait::async_trait]
 impl ObjectBackend for FailPutBackend {
+    fn capabilities(&self) -> mirage_backend::BackendCapabilities {
+        mirage_backend::BackendCapabilities::ARCHIVE
+    }
+
     async fn read_range(
         &self,
         object: &mirage_backend::RemoteObjectRef,
@@ -189,4 +193,38 @@ impl ObjectBackend for FailPutBackend {
     async fn health(&self) -> mirage_types::BackendHealthState {
         self.inner.health().await
     }
+}
+
+#[test]
+fn read_only_origin_is_refused_before_any_upload() {
+    let repository = RepositoryId::from_bytes([0x33; 16]);
+    let source = tempfile::tempdir().expect("source");
+    let import_parent = tempfile::tempdir().expect("import parent");
+    let imported = imported(
+        source.path(),
+        &import_parent.path().join("import"),
+        repository,
+    );
+    let backend_root = tempfile::tempdir().expect("backend root");
+    let archive =
+        Arc::new(LocalObjectBackend::open(backend_root.path(), repository).expect("backend"));
+    let origin = mirage_backend::ReadOnlyOrigin::new(Arc::clone(&archive));
+    let signer = InMemoryTestSigner::new([7; 16], [9; 32]);
+    let error = futures_executor::block_on(publish_base_generation(
+        &origin,
+        &imported.packs,
+        &imported.manifest,
+        &signer,
+    ))
+    .expect_err("read-only origin cannot publish");
+    assert_eq!(
+        error.kind,
+        mirage_types::MirageErrorKind::ProviderUnavailable
+    );
+    let commits = futures_executor::block_on(archive.enumerate_commits(repository))
+        .expect("enumerate the untouched archive");
+    assert!(
+        commits.is_empty(),
+        "nothing was uploaded through the read-only boundary"
+    );
 }

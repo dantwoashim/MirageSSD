@@ -1,5 +1,7 @@
 # ADR 0001: Hybrid Native NTFS and WinFsp Virtualization Boundary
 
+Status: rationale superseded by ADR 0008; prohibitions remain in force.
+
 ## Context
 
 PC games consist of heterogeneous files with vastly different access patterns, update frequencies, and security constraints:

@@ -6,6 +6,7 @@ pub mod adapt;
 pub mod admission;
 pub mod arena;
 pub mod budget;
+pub mod coalesced_read;
 pub mod doorkeeper;
 pub mod evict;
 pub mod format;
@@ -37,11 +38,14 @@ mod windows_sparse;
 pub use accounting::CacheUsage;
 pub use admission::{AdmissionContext, AdmissionDecision, AdmissionWeights};
 pub use budget::{BudgetConfig, ReservationClass};
+pub use coalesced_read::{read_contiguous, slots_are_contiguous};
 pub use format::{ArenaHeader, CacheLayout, SlotMetadata, SlotState};
 pub use frequency::FrequencySketch;
 pub use ghost::{GhostHistory, GhostKind, GhostMetrics};
 pub use index::ResidentIndex;
-pub use insert::{InsertHook, InsertOutcome, InsertStep, insert_page, insert_reserved_page};
+pub use insert::{
+    InsertHook, InsertOutcome, InsertStep, insert_page, insert_reserved_page, insert_reserved_pages,
+};
 pub use lease::ResidentPageGuard;
 pub use pin::{PinReason, PinRegistry};
 pub use policy_core::{PolicyCore, PolicyEvent, PolicyKind, PolicyOutcome};

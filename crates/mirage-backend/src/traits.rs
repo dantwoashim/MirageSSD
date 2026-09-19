@@ -3,13 +3,17 @@ use mirage_types::{BackendHealthState, CheckedRange, ContentHash, RepositoryId};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BackendError, BackendRead, DeletionProof, FetchClass, ObjectKind, ObjectStat, RemoteObjectRef,
-    UploadSource,
+    BackendCapabilities, BackendError, BackendRead, DeletionProof, FetchClass, ObjectKind,
+    ObjectStat, RemoteObjectRef, UploadSource,
 };
 
 /// Immutable-object origin/archive interface. Implementations are normally repository-scoped.
 #[async_trait]
 pub trait ObjectBackend: Send + Sync {
+    /// What this backend advertises it can do. Callers that publish or delete
+    /// check `capabilities().can_publish()` before starting a transaction.
+    fn capabilities(&self) -> BackendCapabilities;
+
     async fn read_range(
         &self,
         object: &RemoteObjectRef,

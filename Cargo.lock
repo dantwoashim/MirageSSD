@@ -1054,6 +1054,18 @@ dependencies = [
 [[package]]
 name = "mirage-bench-runner"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "mirage-cache",
+ "mirage-db",
+ "mirage-index",
+ "mirage-manifest",
+ "mirage-pack",
+ "mirage-simulator",
+ "mirage-types",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "mirage-cache"
@@ -1173,6 +1185,7 @@ dependencies = [
  "mirage-scheduler",
  "mirage-types",
  "roaring",
+ "serde",
  "tempfile",
  "tokio-util",
 ]
@@ -1210,6 +1223,7 @@ dependencies = [
  "mirage-index",
  "mirage-manifest",
  "mirage-pack",
+ "mirage-scheduler",
  "mirage-types",
  "tempfile",
  "windows-sys 0.61.2",
@@ -1329,12 +1343,15 @@ dependencies = [
 name = "mirage-scheduler"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "futures-executor",
+ "futures-util",
  "mirage-backend",
  "mirage-backend-local",
  "mirage-cache",
+ "mirage-crypto",
  "mirage-db",
  "mirage-manifest",
  "mirage-pack",

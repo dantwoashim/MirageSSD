@@ -61,6 +61,9 @@ Copy-Item -LiteralPath $rclone -Destination (Join-Path $payload 'rclone.exe')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-miragessd.ps1') -Destination $bundle
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install-device-drive.ps1') -Destination $bundle
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uninstall-device-drive.ps1') -Destination $bundle
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'prefetch-device.ps1') -Destination $bundle
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'account-device.ps1') -Destination $bundle
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'device-lifecycle.ps1') -Destination $bundle
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'run-powershell-hidden.vbs') -Destination $bundle
 [IO.File]::WriteAllText((Join-Path $bundle 'client-id.txt'), $ClientId, [Text.UTF8Encoding]::new($false))
 # Installed desktop apps are public OAuth clients. Package only their application

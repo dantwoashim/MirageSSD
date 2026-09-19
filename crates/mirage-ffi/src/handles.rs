@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mirage_cache::ResidentIndex;
+use mirage_cache::{ArenaShard, ResidentIndex};
 use mirage_index::{MountIndex, NodeIndex};
-use mirage_pack::{PackReadEncryption, PackReader};
+use mirage_pack::{PackReadEncryption, PackReader, PlainPage};
 use mirage_types::PageHash;
 pub struct DecodedPageCache {
-    entries: BTreeMap<PageHash, Arc<[u8]>>,
+    entries: BTreeMap<PageHash, Arc<PlainPage>>,
     order: VecDeque<PageHash>,
     capacity: usize,
+    size_bytes: usize,
 }
 impl DecodedPageCache {
     pub fn bounded(capacity: usize) -> Self {
@@ -20,23 +21,29 @@ impl DecodedPageCache {
             entries: BTreeMap::new(),
             order: VecDeque::new(),
             capacity,
+            size_bytes: 0,
         }
     }
-    pub fn get(&self, hash: PageHash) -> Option<Arc<[u8]>> {
+    pub fn get(&self, hash: PageHash) -> Option<Arc<PlainPage>> {
         self.entries.get(&hash).cloned()
     }
-    pub fn insert(&mut self, hash: PageHash, bytes: Arc<[u8]>) {
-        if self.entries.contains_key(&hash) {
+    pub fn insert(&mut self, hash: PageHash, bytes: Arc<PlainPage>) {
+        let length = bytes.bytes.len();
+        let byte_limit = self.capacity.saturating_mul(1024 * 1024);
+        if self.capacity == 0 || length > byte_limit || self.entries.contains_key(&hash) {
             return;
         }
-        while self.entries.len() >= self.capacity {
+        while self.entries.len() >= self.capacity || self.size_bytes > byte_limit - length {
             if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+                if let Some(page) = self.entries.remove(&oldest) {
+                    self.size_bytes -= page.bytes.len();
+                }
             } else {
                 break;
             }
         }
         self.order.push_back(hash);
+        self.size_bytes += length;
         self.entries.insert(hash, bytes);
     }
 }
@@ -55,6 +62,7 @@ pub struct ViolationLog {
     path: PathBuf,
     count: AtomicU64,
     origin_served: AtomicU64,
+    file: Mutex<Option<std::fs::File>>,
 }
 impl ViolationLog {
     pub fn new(path: PathBuf) -> Self {
@@ -62,6 +70,7 @@ impl ViolationLog {
             path,
             count: AtomicU64::new(0),
             origin_served: AtomicU64::new(0),
+            file: Mutex::new(None),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -72,6 +81,7 @@ impl ViolationLog {
         offset: u64,
         length: usize,
         caller_pid: u32,
+        caller_image: &str,
         path: &str,
         outcome: &str,
     ) {
@@ -82,7 +92,7 @@ impl ViolationLog {
         self.append(&format!(
             "{}\tfile={file_index}\tpage={page_ordinal}\toffset={offset}\tlen={length}\tpid={caller_pid}\timage={}\tpath={path}\toutcome={outcome}\n",
             unix_ns(),
-            caller_image_name(caller_pid)
+            caller_image
         ));
     }
     /// Informational line recorded on every successful file lookup in the cache-only
@@ -109,11 +119,20 @@ impl ViolationLog {
         ));
     }
     fn append(&self, line: &str) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        let Ok(mut guard) = self.file.lock() else {
+            return;
+        };
+        if guard.is_none() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                Ok(file) => *guard = Some(file),
+                Err(_) => return,
+            }
+        }
+        if let Some(file) = guard.as_mut() {
             let _ = file.write_all(line.as_bytes());
         }
     }
@@ -161,14 +180,32 @@ fn unix_ns() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
+/// Counters for coalesced adjacent-slot reads served by this engine.
+#[derive(Default)]
+pub struct CoalescedReads {
+    /// Runs of two or more adjacent resident spans served with one arena read.
+    pub runs: AtomicU64,
+    /// Pages covered by those runs.
+    pub pages: AtomicU64,
+}
 pub struct MirageEngineHandle {
     pub entries: BTreeMap<Vec<u16>, Entry>,
     pub index: Option<Arc<MountIndex>>,
     pub object_root: Option<Arc<PathBuf>>,
     pub encryption: Option<PackReadEncryption>,
-    pub readers: Arc<Mutex<BTreeMap<String, PackReader>>>,
+    pub readers: Arc<Mutex<BTreeMap<String, Arc<PackReader>>>>,
     pub pages: Arc<Mutex<DecodedPageCache>>,
+    /// In-flight origin decodes shared by every handle of this engine, so
+    /// concurrent misses on one page decode once.
+    pub origin_flights: mirage_scheduler::FlightMap,
+    /// Owner-side origin decodes performed; duplicate misses share the flight
+    /// and never increment this.
+    pub origin_decodes: Arc<AtomicU64>,
     pub resident: Option<Arc<ResidentIndex>>,
+    /// Arena behind `resident`; kept so coalesced reads can serve
+    /// adjacent-slot runs with one I/O.
+    pub shard: Option<Arc<ArenaShard>>,
+    pub coalesced: Arc<CoalescedReads>,
     pub violations: Option<Arc<ViolationLog>>,
     pub trace_lookups: bool,
 }
@@ -178,10 +215,31 @@ pub struct MirageFileHandle {
     pub node: Option<NodeIndex>,
     pub object_root: Option<Arc<PathBuf>>,
     pub encryption: Option<PackReadEncryption>,
-    pub readers: Arc<Mutex<BTreeMap<String, PackReader>>>,
+    pub readers: Arc<Mutex<BTreeMap<String, Arc<PackReader>>>>,
     pub pages: Arc<Mutex<DecodedPageCache>>,
+    pub origin_flights: mirage_scheduler::FlightMap,
+    pub origin_decodes: Arc<AtomicU64>,
     pub resident: Option<Arc<ResidentIndex>>,
+    pub shard: Option<Arc<ArenaShard>>,
+    pub coalesced: Arc<CoalescedReads>,
     pub violations: Option<Arc<ViolationLog>>,
+    pub logical_path: std::sync::OnceLock<String>,
+    pub caller_image: Mutex<Option<(u32, Arc<str>)>>,
+}
+impl MirageFileHandle {
+    pub fn caller_image(&self, pid: u32) -> Arc<str> {
+        let Ok(mut cached) = self.caller_image.lock() else {
+            return Arc::from("?");
+        };
+        if let Some((cached_pid, image)) = cached.as_ref()
+            && *cached_pid == pid
+        {
+            return Arc::clone(image);
+        }
+        let image: Arc<str> = Arc::from(caller_image_name(pid));
+        *cached = Some((pid, Arc::clone(&image)));
+        image
+    }
 }
 impl MirageEngineHandle {
     pub fn empty() -> Self {
@@ -192,24 +250,70 @@ impl MirageEngineHandle {
             encryption: None,
             readers: Arc::new(Mutex::new(BTreeMap::new())),
             pages: Arc::new(Mutex::new(DecodedPageCache::bounded(128))),
+            origin_flights: mirage_scheduler::FlightMap::default(),
+            origin_decodes: Arc::new(AtomicU64::new(0)),
             resident: None,
+            shard: None,
+            coalesced: Arc::new(CoalescedReads::default()),
             violations: None,
             trace_lookups: false,
         }
+    }
+    /// Owner-side origin decodes performed by this engine.
+    #[must_use]
+    pub fn origin_decode_count(&self) -> u64 {
+        self.origin_decodes.load(Ordering::Relaxed)
+    }
+    /// Coalesced adjacent-slot read runs and the pages they covered.
+    #[must_use]
+    pub fn coalesced_reads(&self) -> (u64, u64) {
+        (
+            self.coalesced.runs.load(Ordering::Relaxed),
+            self.coalesced.pages.load(Ordering::Relaxed),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ViolationLog;
+    use super::{DecodedPageCache, ViolationLog};
+
+    #[test]
+    fn decoded_cache_reuses_payloads_and_bounds_large_pages_by_bytes() {
+        use mirage_pack::PlainPage;
+        use std::sync::Arc;
+        let first = Arc::new(PlainPage::from_bytes(vec![1; 3 * 1024 * 1024].into()));
+        let second = Arc::new(PlainPage::from_bytes(vec![2; 3 * 1024 * 1024].into()));
+        let mut cache = DecodedPageCache::bounded(4);
+        cache.insert(first.hash, Arc::clone(&first));
+        assert!(Arc::ptr_eq(&cache.get(first.hash).unwrap(), &first));
+        cache.insert(second.hash, Arc::clone(&second));
+        assert!(cache.get(first.hash).is_none());
+        assert!(cache.get(second.hash).is_some());
+        assert_eq!(cache.size_bytes, 3 * 1024 * 1024);
+        cache.insert(second.hash, Arc::clone(&second));
+        assert_eq!(cache.size_bytes, 3 * 1024 * 1024);
+        let mut disabled = DecodedPageCache::bounded(0);
+        disabled.insert(first.hash, first);
+        assert_eq!(disabled.size_bytes, 0);
+    }
 
     #[test]
     fn violation_log_counts_and_appends_lines() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("seal-violations.log");
         let log = ViolationLog::new(path.clone());
-        log.record(7, 42, 44_040_192, 65_536, 0, "assets/pak0.pak", "origin");
-        log.record(0, 1, 0, 4096, 0, "assets/pak0.pak", "failed");
+        log.record(
+            7,
+            42,
+            44_040_192,
+            65_536,
+            0,
+            "?",
+            "assets/pak0.pak",
+            "origin",
+        );
+        log.record(0, 1, 0, 4096, 0, "?", "assets/pak0.pak", "failed");
         log.lookup(7, "assets/pak0.pak");
         log.summary();
         assert_eq!(log.count(), 2);

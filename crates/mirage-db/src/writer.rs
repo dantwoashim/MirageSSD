@@ -36,6 +36,7 @@ enum Command {
         Reply<Vec<ReserveCacheSlotOutcome>>,
     ),
     CommitCacheSlot(CacheSlotRecord, Reply<CommitCacheSlotOutcome>),
+    CommitCacheSlotsBatch(Vec<CacheSlotRecord>, Reply<Vec<CacheSlotRecord>>),
     ReleaseCacheReservation(CacheSlotRecord, Reply<()>),
     BeginCacheEviction(CacheSlotRecord, Reply<CacheSlotRecord>),
     FinishCacheDeallocation(CacheSlotRecord, Reply<()>),
@@ -121,6 +122,9 @@ impl DbWriter {
                         }
                         Command::CommitCacheSlot(value, reply) => {
                             respond(reply, cache::commit_slot(&mut connection, value));
+                        }
+                        Command::CommitCacheSlotsBatch(records, reply) => {
+                            respond(reply, cache::commit_batch(&mut connection, records));
                         }
                         Command::ReleaseCacheReservation(value, reply) => {
                             respond(reply, cache::release(&mut connection, value));
@@ -255,6 +259,13 @@ impl DbWriter {
         value: CacheSlotRecord,
     ) -> Result<CommitCacheSlotOutcome, MirageError> {
         self.request(|reply| Command::CommitCacheSlot(value, reply))
+    }
+
+    pub fn commit_cache_slots_batch(
+        &self,
+        records: Vec<CacheSlotRecord>,
+    ) -> Result<Vec<CacheSlotRecord>, MirageError> {
+        self.request(|reply| Command::CommitCacheSlotsBatch(records, reply))
     }
 
     pub fn release_cache_reservation(&self, value: CacheSlotRecord) -> Result<(), MirageError> {

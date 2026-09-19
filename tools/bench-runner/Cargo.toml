@@ -7,3 +7,14 @@ rust-version.workspace=true
 publish=false
 [lints]
 workspace=true
+[dependencies]
+mirage-types.workspace=true
+mirage-cache.workspace=true
+mirage-db.workspace=true
+mirage-index.workspace=true
+mirage-manifest.workspace=true
+mirage-pack.workspace=true
+mirage-simulator.workspace=true
+bytes.workspace=true
+serde_json.workspace=true
+tempfile.workspace=true

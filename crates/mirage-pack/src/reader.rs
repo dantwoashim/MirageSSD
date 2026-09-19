@@ -168,19 +168,35 @@ impl PackReader {
             .map(|index| self.entries[index])
     }
 
-    pub fn read_page(&mut self, hash: PageHash) -> Result<DecodedFrame, MirageError> {
+    pub fn read_page(&self, hash: PageHash) -> Result<DecodedFrame, MirageError> {
         let entry = self.lookup(hash).ok_or_else(|| {
             MirageError::remote_object_missing("page is absent from immutable pack")
         })?;
         let length = usize::try_from(entry.frame_length)
             .map_err(|_| MirageError::manifest_invalid("frame length cannot fit memory"))?;
         let mut bytes = vec![0_u8; length];
-        self.file
-            .seek(SeekFrom::Start(entry.frame_offset))
-            .map_err(MirageError::from)?;
-        self.file
-            .read_exact(&mut bytes)
-            .map_err(MirageError::from)?;
+        let mut remaining = bytes.as_mut_slice();
+        let mut offset = entry.frame_offset;
+        while !remaining.is_empty() {
+            #[cfg(windows)]
+            let read = {
+                use std::os::windows::fs::FileExt;
+                self.file.seek_read(remaining, offset)
+            };
+            #[cfg(not(windows))]
+            let read = {
+                use std::os::unix::fs::FileExt;
+                self.file.read_at(remaining, offset)
+            };
+            let read = read.map_err(MirageError::from)?;
+            if read == 0 {
+                return Err(MirageError::from(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            remaining = &mut remaining[read..];
+            offset += read as u64;
+        }
         let decoded = decode_entry_frame(&bytes, entry, self.encryption.as_ref(), self.pack_id)?;
         if decoded.page.hash != hash {
             return Err(MirageError::integrity_mismatch(

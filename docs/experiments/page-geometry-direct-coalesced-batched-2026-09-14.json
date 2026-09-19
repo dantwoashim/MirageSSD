@@ -1,0 +1,331 @@
+{
+  "batched_materializer": true,
+  "caveats": [
+    "Synthetic random fixture on one machine; not a game workload.",
+    "Read latencies include ResidentIndex lookup, lease acquisition, and arena I/O; no WinFsp or kernel path.",
+    "Warm buffered reads measure the OS cache unless --direct is used.",
+    "Changing page size must not reinterpret an existing arena; each geometry used a fresh fixture."
+  ],
+  "coalesced": true,
+  "debug_build": false,
+  "direct_unbuffered_arena": true,
+  "fixture_bytes": 268435456,
+  "large_reads_per_run": 200,
+  "machine": "ASHIM",
+  "results": [
+    {
+      "aligned_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 12568955500,
+        "lease_ns_total": 117281200,
+        "mean_ns": 128086,
+        "median_of_per_run_p99_ns": 268600,
+        "per_run_p50_ns": [
+          112900,
+          111800,
+          112400,
+          111900,
+          112500
+        ],
+        "per_run_p99_ns": [
+          276500,
+          262000,
+          253300,
+          268900,
+          268600
+        ],
+        "pooled_p50_ns": 112300,
+        "pooled_p99_ns": 267300,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 13369622000,
+        "lease_ns_total": 170218400,
+        "mean_ns": 136767,
+        "median_of_per_run_p99_ns": 262600,
+        "per_run_p50_ns": [
+          120500,
+          120400,
+          124100,
+          123500,
+          122100
+        ],
+        "per_run_p99_ns": [
+          251100,
+          262600,
+          271600,
+          271600,
+          261300
+        ],
+        "pooled_p50_ns": 122100,
+        "pooled_p99_ns": 264900,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 268505088,
+        "arena_metadata_bytes": 266304,
+        "arena_physical_extents": 265,
+        "control_db_bytes": 487424,
+        "import_ns": 3507661800,
+        "insert_ns": 4085422200,
+        "mount_index_bytes": 623872,
+        "mount_index_bytes_per_page": 152.3125,
+        "pack_bytes": 286516238,
+        "pack_overhead_bytes": 18080782,
+        "page_count": 4096,
+        "source_bytes": 268435456,
+        "unique_pages": 4096
+      },
+      "materialize_ns": 7593084000,
+      "miss_amplification": {
+        "decoded_amplification": 16.0,
+        "decoded_bytes_per_4k_miss": 65536,
+        "encoded_bytes_per_4k_miss_estimate": 69950.25341796875,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 65536,
+      "sequential_1m_read": {
+        "coalesced_requests": 1000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 830693600,
+        "lease_ns_total": 10724700,
+        "mean_ns": 845576,
+        "median_of_per_run_p99_ns": 994500,
+        "per_run_p50_ns": [
+          841000,
+          830500,
+          825700,
+          831000,
+          834100
+        ],
+        "per_run_p99_ns": [
+          1002600,
+          968900,
+          992300,
+          1073700,
+          994500
+        ],
+        "pooled_p50_ns": 833000,
+        "pooled_p99_ns": 1002600,
+        "samples": 1000
+      }
+    },
+    {
+      "aligned_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 12504618100,
+        "lease_ns_total": 91264600,
+        "mean_ns": 127173,
+        "median_of_per_run_p99_ns": 253000,
+        "per_run_p50_ns": [
+          115900,
+          113800,
+          112000,
+          113600,
+          114200
+        ],
+        "per_run_p99_ns": [
+          258600,
+          253000,
+          252200,
+          248900,
+          253700
+        ],
+        "pooled_p50_ns": 113800,
+        "pooled_p99_ns": 253600,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 13232101500,
+        "lease_ns_total": 134775700,
+        "mean_ns": 135018,
+        "median_of_per_run_p99_ns": 269800,
+        "per_run_p50_ns": [
+          117200,
+          123000,
+          120600,
+          119600,
+          115700
+        ],
+        "per_run_p99_ns": [
+          271200,
+          270000,
+          261400,
+          269800,
+          267900
+        ],
+        "pooled_p50_ns": 119400,
+        "pooled_p99_ns": 268600,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 268701696,
+        "arena_metadata_bytes": 69696,
+        "arena_physical_extents": 265,
+        "control_db_bytes": 4096,
+        "import_ns": 2519778900,
+        "insert_ns": 1834502000,
+        "mount_index_bytes": 156928,
+        "mount_index_bytes_per_page": 153.25,
+        "pack_bytes": 272956430,
+        "pack_overhead_bytes": 4520974,
+        "page_count": 1024,
+        "source_bytes": 268435456,
+        "unique_pages": 1024
+      },
+      "materialize_ns": 4354280900,
+      "miss_amplification": {
+        "decoded_amplification": 64.0,
+        "decoded_bytes_per_4k_miss": 262144,
+        "encoded_bytes_per_4k_miss_estimate": 266559.013671875,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 262144,
+      "sequential_1m_read": {
+        "coalesced_requests": 1000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 815973000,
+        "lease_ns_total": 2975900,
+        "mean_ns": 821502,
+        "median_of_per_run_p99_ns": 954200,
+        "per_run_p50_ns": [
+          812800,
+          810200,
+          808300,
+          808900,
+          802200
+        ],
+        "per_run_p99_ns": [
+          1125300,
+          937100,
+          954200,
+          989700,
+          935100
+        ],
+        "pooled_p50_ns": 809300,
+        "pooled_p99_ns": 1001500,
+        "samples": 1000
+      }
+    },
+    {
+      "aligned_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 13174197100,
+        "lease_ns_total": 81776900,
+        "mean_ns": 133776,
+        "median_of_per_run_p99_ns": 255700,
+        "per_run_p50_ns": [
+          123900,
+          123700,
+          123500,
+          123000,
+          124400
+        ],
+        "per_run_p99_ns": [
+          266000,
+          260700,
+          251800,
+          253000,
+          255700
+        ],
+        "pooled_p50_ns": 123700,
+        "pooled_p99_ns": 257400,
+        "samples": 100000
+      },
+      "boundary_4k_read": {
+        "coalesced_requests": 100000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 13725076200,
+        "lease_ns_total": 106384600,
+        "mean_ns": 139649,
+        "median_of_per_run_p99_ns": 264100,
+        "per_run_p50_ns": [
+          129400,
+          128800,
+          129700,
+          129300,
+          130500
+        ],
+        "per_run_p99_ns": [
+          265800,
+          264100,
+          266400,
+          255400,
+          262500
+        ],
+        "pooled_p50_ns": 129500,
+        "pooled_p99_ns": 263400,
+        "samples": 100000
+      },
+      "footprint": {
+        "arena_logical_bytes": 269488128,
+        "arena_metadata_bytes": 20544,
+        "arena_physical_extents": 635,
+        "control_db_bytes": 4096,
+        "import_ns": 2133691300,
+        "insert_ns": 3461743400,
+        "mount_index_bytes": 40192,
+        "mount_index_bytes_per_page": 157.0,
+        "pack_bytes": 269566477,
+        "pack_overhead_bytes": 1131021,
+        "page_count": 256,
+        "source_bytes": 268435456,
+        "unique_pages": 256
+      },
+      "materialize_ns": 5595434700,
+      "miss_amplification": {
+        "decoded_amplification": 256.0,
+        "decoded_bytes_per_4k_miss": 1048576,
+        "encoded_bytes_per_4k_miss_estimate": 1052994.05078125,
+        "note": "computed from geometry, not a measured origin transfer"
+      },
+      "page_size": 1048576,
+      "sequential_1m_read": {
+        "coalesced_requests": 1000,
+        "errors": 0,
+        "fallback_requests": 0,
+        "io_ns_total": 866290500,
+        "lease_ns_total": 1326600,
+        "mean_ns": 870348,
+        "median_of_per_run_p99_ns": 1066300,
+        "per_run_p50_ns": [
+          889000,
+          853900,
+          859700,
+          866100,
+          868700
+        ],
+        "per_run_p99_ns": [
+          1075900,
+          1016700,
+          1023800,
+          1080600,
+          1066300
+        ],
+        "pooled_p50_ns": 867800,
+        "pooled_p99_ns": 1066300,
+        "samples": 1000
+      }
+    }
+  ],
+  "runs": 5,
+  "schema_version": 1,
+  "small_reads_per_run": 20000,
+  "tool": "page_geometry",
+  "warm_buffered": false
+}

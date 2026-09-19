@@ -20,6 +20,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'device-lifecycle.ps1')
 
 function Resolve-RequiredFile([string]$Value, [string]$Label) {
   $resolved = Resolve-Path -LiteralPath $Value -ErrorAction Stop
@@ -51,21 +52,6 @@ if ($ClientId) {
 }
 $cachePath = [System.IO.Path]::GetFullPath($CacheDirectory)
 $mount = $DriveLetter.TrimEnd(':').ToUpperInvariant() + ':\'
-if (Test-Path -LiteralPath $mount) {
-  $volume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($mount.TrimEnd('\'))'" -ErrorAction SilentlyContinue
-  if ($volume.VolumeName -eq 'MirageSSD') {
-    [pscustomobject]@{
-      Installed = $true
-      AlreadyRunning = $true
-      PersistentAtLogon = $true
-      MountPoint = $mount
-      VolumeName = 'MirageSSD'
-    } | ConvertTo-Json -Compress
-    return
-  }
-  throw "$mount is already in use by another volume."
-}
-
 $installRoot = Join-Path $env:LOCALAPPDATA 'MirageSSD\device'
 $logRoot = Join-Path $env:LOCALAPPDATA 'MirageSSD\logs'
 $installedMirage = Join-Path $installRoot 'mirage.exe'
@@ -74,13 +60,31 @@ $launcherFile = Join-Path $installRoot 'mount-device.vbs'
 $logFile = Join-Path $logRoot 'device-drive.log'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User.Value
-$previousTask = Get-ScheduledTask -TaskName "MirageSSD Drive $sid" -ErrorAction SilentlyContinue
-if ($previousTask -and $previousTask.State -eq 'Running') {
-  # The mounted-volume guard above already returned for a running drive.
-  # Stop only this user's failed startup before replacing its payload.
-  Stop-ScheduledTask -TaskName $previousTask.TaskName
-  Start-Sleep -Seconds 1
+$operation = [Threading.Mutex]::new($false, ('Local\MirageSSD-Device-' + $sid))
+$operationHeld = $false
+try {
+try { $operationHeld = $operation.WaitOne(0) } catch [Threading.AbandonedMutexException] { $operationHeld = $true }
+if (-not $operationHeld) { throw 'Another MirageSSD setup or account operation is running.' }
+$previous = $null
+$configurationPath = Join-Path $installRoot 'device-install.json'
+if (Test-Path -LiteralPath $configurationPath -PathType Leaf) {
+  $previous = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+  if ($previous.format -ne 'miragessd-device-install-v1' -or $previous.owner_sid -ne $sid -or $previous.task_name -ne "MirageSSD Drive $sid") { throw 'Invalid existing installation owner.' }
+  $cachePath = [IO.Path]::GetFullPath([string]$previous.cache_directory)
+  $mount = [string]$previous.drive_letter
+  if ($mount -notmatch '^[D-Z]:\\$') { throw 'Invalid recorded drive letter.' }
+  $DriveLetter = $mount.Substring(0, 1)
 }
+if (Test-Path -LiteralPath $mount) {
+  $volume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($mount.TrimEnd('\'))'" -ErrorAction Stop
+  if (-not $previous -or $volume.VolumeName -ne 'MirageSSD') { throw 'The drive letter is occupied by another volume.' }
+}
+Test-PendingUploads $cachePath
+Stop-DeviceDrive "MirageSSD Drive $sid" $installRoot
+Test-PendingUploads $cachePath
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while ((Test-Path -LiteralPath $mount) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
+if (Test-Path -LiteralPath $mount) { throw 'The previous drive has not disconnected. Close open files and retry.' }
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
@@ -97,9 +101,9 @@ foreach ($path in @($installRoot, $logRoot, $cachePath)) {
 $tokenStore = Join-Path $env:LOCALAPPDATA 'MirageSSD\credentials\drive-token.json'
 if (-not (Test-Path -LiteralPath $tokenStore -PathType Leaf)) {
   if ($credentialSource) {
-    & $installedMirage backend login --client-credentials $credentialSource --timeout-seconds 600
+    & $installedMirage backend login --client-credentials $credentialSource --timeout-seconds 600 | Out-Null
   } elseif ($ClientId) {
-    & $installedMirage backend login --client-id $ClientId --timeout-seconds 600
+    & $installedMirage backend login --client-id $ClientId --timeout-seconds 600 | Out-Null
   } else {
     throw 'First-time setup requires a Google OAuth desktop client ID.'
   }
@@ -107,6 +111,15 @@ if (-not (Test-Path -LiteralPath $tokenStore -PathType Leaf)) {
     throw 'Google Drive sign-in did not complete.'
   }
 }
+
+$currentAccount = Get-SignedInAccount $installedMirage
+$stateFile = Join-Path $installRoot 'account-state.json'
+$recordedAccount = Read-AccountState
+if (-not $currentAccount) { throw 'The signed-in Google account could not be identified.' }
+if (-not $recordedAccount -or $recordedAccount.account_id -ne $currentAccount) {
+  Clear-VfsCache $cachePath
+}
+Write-AccountState $true $currentAccount
 
 if ($credentialSource) {
   & $installedMirage --json backend authorize-device --drive-client-credentials $credentialSource | Out-Null
@@ -203,7 +216,38 @@ $uninstallScript = Join-Path $installRoot 'uninstall-device-drive.ps1'
 $hiddenRunner = Join-Path $installRoot 'run-powershell-hidden.vbs'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uninstall-device-drive.ps1') -Destination $uninstallScript -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'run-powershell-hidden.vbs') -Destination $hiddenRunner -Force
-$configuration = @{format='miragessd-device-install-v1';task_name=$taskName;cache_directory=$cachePath;drive_letter=$mount;owner_sid=$sid}
+$prefetchScript = Join-Path $installRoot 'prefetch-device.ps1'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'prefetch-device.ps1') -Destination $prefetchScript -Force
+$accountScript = Join-Path $installRoot 'account-device.ps1'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'device-lifecycle.ps1') -Destination $installRoot -Force
+$accountScriptSource = Join-Path $PSScriptRoot 'account-device.ps1'
+if (Test-Path -LiteralPath $accountScriptSource -PathType Leaf) {
+  Copy-Item -LiteralPath $accountScriptSource -Destination $accountScript -Force
+}
+$installedClientConfiguration = Join-Path $installRoot 'oauth-desktop.json'
+if ($credentialSource) {
+  Copy-Item -LiteralPath $credentialSource -Destination $installedClientConfiguration -Force
+}
+$accountStateFile = Join-Path $installRoot 'account-state.json'
+$statusOutput = @(& $installedMirage --json backend status)
+$statusAccount = $null
+try {
+  $statusEnvelope = ($statusOutput -join "`n") | ConvertFrom-Json
+  if ($statusEnvelope.ok -and $statusEnvelope.data.authenticated) { $statusAccount = [string]$statusEnvelope.data.account_id }
+} catch { }
+$accountState = @{format='miragessd-account-state-v1';signed_in=$true;account_id=$statusAccount}
+[IO.File]::WriteAllText($accountStateFile, ($accountState | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+$accountFiles = @($accountScript, $accountStateFile)
+if (Test-Path -LiteralPath $installedClientConfiguration -PathType Leaf) { $accountFiles += $installedClientConfiguration }
+foreach ($path in $accountFiles) {
+  if (Test-Path -LiteralPath $path -PathType Leaf) {
+    & icacls.exe $path /inheritance:r /grant:r "*$($sid):F" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw 'Failed to secure the account-management files.'
+    }
+  }
+}
+$configuration = @{format='miragessd-device-install-v1';task_name=$taskName;cache_directory=$cachePath;cache_min_free_space=$CacheMinFreeSpace;drive_letter=$mount;owner_sid=$sid}
 [IO.File]::WriteAllText((Join-Path $installRoot 'device-install.json'), ($configuration | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MirageSSDWritableDevice'
 New-Item -Path $uninstallKey -Force | Out-Null
@@ -222,6 +266,24 @@ if ($desktop) {
   $shortcut.Save()
 }
 
+$programs = [Environment]::GetFolderPath('Programs')
+if ($programs) {
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $shell.CreateShortcut((Join-Path $programs 'MirageSSD Prepare Files.lnk'))
+  $shortcut.TargetPath = $wscript
+  $shortcut.Arguments = '//B //NoLogo ' + (Quote-TaskArgument $hiddenRunner) + ' ' + (Quote-TaskArgument $prefetchScript)
+  $shortcut.Description = 'Opt-in ZIP metadata preparation through the mounted MirageSSD drive'
+  $shortcut.Save()
+}
+if ($programs -and (Test-Path -LiteralPath $accountScript -PathType Leaf)) {
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $shell.CreateShortcut((Join-Path $programs 'MirageSSD Account.lnk'))
+  $shortcut.TargetPath = $wscript
+  $shortcut.Arguments = '//B //NoLogo ' + (Quote-TaskArgument $hiddenRunner) + ' ' + (Quote-TaskArgument $accountScript)
+  $shortcut.Description = 'Sign out of MirageSSD or switch to a different Google account'
+  $shortcut.Save()
+}
+
 [pscustomobject]@{
   Installed = $true
   PersistentAtLogon = $true
@@ -233,3 +295,7 @@ if ($desktop) {
   WriteBackDelay = '5s'
   ColdReadStreams = $ReadChunkStreams
 } | ConvertTo-Json -Compress
+} finally {
+  if ($operationHeld) { $operation.ReleaseMutex() }
+  $operation.Dispose()
+}

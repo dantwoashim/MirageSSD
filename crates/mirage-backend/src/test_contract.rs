@@ -100,6 +100,63 @@ pub async fn assert_object_backend_contract(
     assert_eq!(missing.class, BackendErrorClass::Missing);
 }
 
+/// Asserts that a read-only origin serves `object` exactly while refusing every
+/// mutation before contacting the provider.
+pub async fn assert_read_only_origin_contract(
+    origin: Arc<dyn ObjectBackend>,
+    object: &crate::RemoteObjectRef,
+    expected_bytes: &[u8],
+) {
+    assert_eq!(
+        origin.capabilities().mutation,
+        crate::MutationCapability::ReadOnly
+    );
+    assert!(!origin.capabilities().can_publish());
+    let range = CheckedRange::new(0, expected_bytes.len() as u64).expect("object range");
+    let read = origin
+        .read_range(
+            object,
+            range,
+            FetchClass::BlockingRead,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("read-only origin serves reads");
+    let received = read
+        .collect_bounded(CONTRACT_MAX_BYTES)
+        .await
+        .expect("collect bounded range");
+    assert_eq!(&received[..], expected_bytes);
+    let stat = origin.stat(object).await.expect("read-only origin stats");
+    assert_eq!(stat.content_hash, object.content_hash);
+
+    let put = origin
+        .put_immutable(
+            ObjectKind::Pack,
+            UploadSource::from_bytes(Bytes::from_static(b"never stored")),
+            content_hash(b"never stored"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("read-only origin refuses put");
+    assert_eq!(put.class, BackendErrorClass::Unsupported);
+    let proof = DeletionProof {
+        repository_id: RepositoryId::from_bytes([0x11; 16]),
+        object_hash: object.content_hash,
+        retained_root_set_hash: ContentHash::from_bytes([0; 32]),
+        validated_at_sequence: 0,
+    };
+    let delete = origin
+        .delete_immutable(object, &proof, CancellationToken::new())
+        .await
+        .expect_err("read-only origin refuses delete");
+    assert_eq!(delete.class, BackendErrorClass::Unsupported);
+    origin
+        .stat(object)
+        .await
+        .expect("object survives the refused delete");
+}
+
 #[must_use]
 pub fn content_hash(bytes: &[u8]) -> ContentHash {
     ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
@@ -156,6 +213,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectBackend for MemoryBackend {
+        fn capabilities(&self) -> crate::BackendCapabilities {
+            crate::BackendCapabilities::ARCHIVE
+        }
+
         async fn read_range(
             &self,
             object: &RemoteObjectRef,
@@ -297,6 +358,21 @@ mod tests {
     }
 
     crate::object_backend_contract_tests!(memory_backend);
+
+    #[test]
+    fn read_only_origin_serves_reads_and_refuses_mutation() {
+        let archive = Arc::new(MemoryBackend::default());
+        let bytes = Bytes::from_static(b"publisher content");
+        let object = futures_executor::block_on(archive.put_immutable(
+            ObjectKind::Pack,
+            UploadSource::from_bytes(bytes.clone()),
+            content_hash(&bytes),
+            CancellationToken::new(),
+        ))
+        .expect("seed the archive");
+        let origin: Arc<dyn ObjectBackend> = Arc::new(crate::ReadOnlyOrigin::new(archive));
+        futures_executor::block_on(assert_read_only_origin_contract(origin, &object, &bytes));
+    }
 
     #[test]
     fn bounded_stream_rejects_truncation_and_overrun() {

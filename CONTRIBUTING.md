@@ -15,6 +15,12 @@ For UI changes, run `npm ci`, `npm test`, and `npm run build` in `apps/mirage-ui
 
 Hardware, mounted-volume, endurance, and authenticated checks need their stated prerequisites. Unit-test success is not proof that those scenarios passed.
 
+The Windows mounted-volume test invokes the **debug** adapter. Rebuild `windows-msvc-debug` after changing the adapter or FFI; rebuilding only the release binary does not update that test's executable.
+
+For filesystem performance measurements, use release binaries and identical request sizes, offsets, concurrency, and verification settings on native and mounted paths. Alternate their run order, separate cached from unbuffered I/O, and keep builds/tests out of the measurement interval. Report application read failures separately from filesystem cache misses: Windows Cache Manager can issue read-ahead beyond the application's requested ranges.
+
+When editor buffers and on-disk files disagree after an external formatter, confirm changes with `git diff` and filesystem searches before building. Windows canonical `\\?\` paths can be used with file tools to inspect and update the actual files. Verify that targeted test filters run the intended tests rather than accepting a zero-test result.
+
 ## Pull requests
 
 Target `main`. Explain the behavior changed, verification performed, and any migration or recovery implications. Do not combine a functional fix with unrelated cleanup.

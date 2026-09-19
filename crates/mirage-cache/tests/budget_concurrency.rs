@@ -75,3 +75,68 @@ fn priority_reserves_soft_watermarks_and_overflow_are_enforced() {
         .is_err()
     );
 }
+
+#[test]
+fn commit_moves_reserved_bytes_into_committed_and_release_after_commit_is_inert() {
+    let ledger = ReservationLedger::new(
+        BudgetConfig {
+            hard_bytes: 10_000,
+            prefetch_soft_bytes: 10_000,
+            update_safety_reserve: 1_000,
+            dirty_update_bytes: 1_000,
+        },
+        400,
+    )
+    .expect("ledger");
+    let reservation = ledger
+        .reserve(300, ReservationClass::Blocking)
+        .expect("reserve");
+    assert_eq!(ledger.snapshot().expect("reserved").reserved_bytes, 300);
+    reservation.commit().expect("commit");
+    let snapshot = ledger.snapshot().expect("snapshot");
+    assert_eq!(snapshot.committed_bytes, 700);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    // The envelope never grew, so the peak is the committed total.
+    assert_eq!(snapshot.peak_envelope_bytes, 700);
+    // Committed bytes now count against the blocking class budget.
+    assert!(ledger.reserve(8_301, ReservationClass::Blocking).is_err());
+    ledger
+        .reserve(8_300, ReservationClass::Blocking)
+        .expect("fits exactly")
+        .commit()
+        .expect("commit to the blocking limit");
+    assert_eq!(ledger.snapshot().expect("full").committed_bytes, 9_000);
+    assert!(ledger.reserve(1, ReservationClass::Blocking).is_err());
+    // The update safety reserve still admits a staging reservation.
+    ledger
+        .reserve(1_000, ReservationClass::Staging)
+        .expect("staging to the hard envelope")
+        .commit()
+        .expect("commit");
+    assert_eq!(ledger.snapshot().expect("envelope").committed_bytes, 10_000);
+    assert!(ledger.reserve(1, ReservationClass::Staging).is_err());
+}
+
+#[test]
+fn dirty_commit_clears_the_dirty_reservation_and_failed_reserve_releases() {
+    let ledger = ReservationLedger::new(
+        BudgetConfig {
+            hard_bytes: 10_000,
+            prefetch_soft_bytes: 10_000,
+            update_safety_reserve: 1_000,
+            dirty_update_bytes: 1_000,
+        },
+        0,
+    )
+    .expect("ledger");
+    let reservation = ledger
+        .reserve(500, ReservationClass::DirtyUpdate)
+        .expect("dirty reserve");
+    assert_eq!(ledger.snapshot().expect("held").dirty_reserved_bytes, 500);
+    reservation.commit().expect("commit");
+    let snapshot = ledger.snapshot().expect("committed");
+    assert_eq!(snapshot.committed_bytes, 500);
+    assert_eq!(snapshot.dirty_reserved_bytes, 0);
+    // A failed commit is unreachable here: the envelope already bounds
+    // committed + reserved, so committed growth cannot overflow u64.
+}

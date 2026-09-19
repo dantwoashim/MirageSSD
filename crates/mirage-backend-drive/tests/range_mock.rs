@@ -103,3 +103,43 @@ fn whole_short_malformed_and_cancelled_responses_are_rejected() {
     .unwrap_err();
     assert_eq!(error.class, BackendErrorClass::TransientTransport);
 }
+
+#[test]
+fn malformed_and_missing_content_range_are_rejected() {
+    for response in [
+        response(206, Some("items 10-13/1024"), b"abcd"),
+        response(206, Some("bytes 10-XX/1024"), b"abcd"),
+        response(206, Some("bytes 10-13"), b"abcd"),
+        response(206, Some("bytes 10-13/abc"), b"abcd"),
+        response(206, None, b"abcd"),
+    ] {
+        let mock = Arc::new(Mock::default());
+        mock.responses.lock().unwrap().push_back(response);
+        let client = DriveClient::new(mock, Zeroizing::new("token".into()));
+        let error = futures_executor::block_on(client.read_range(
+            &object(),
+            CheckedRange::new(10, 4).unwrap(),
+            &CancellationToken::new(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.class, BackendErrorClass::Integrity);
+    }
+
+    // A wildcard total is legal; only the span must match the request.
+    let mock = Arc::new(Mock::default());
+    mock.responses
+        .lock()
+        .unwrap()
+        .push_back(response(206, Some("bytes 10-13/*"), b"abcd"));
+    let client = DriveClient::new(mock, Zeroizing::new("token".into()));
+    let read = futures_executor::block_on(client.read_range(
+        &object(),
+        CheckedRange::new(10, 4).unwrap(),
+        &CancellationToken::new(),
+    ))
+    .unwrap();
+    assert_eq!(
+        futures_executor::block_on(read.collect_bounded(4)).unwrap(),
+        b"abcd"[..]
+    );
+}

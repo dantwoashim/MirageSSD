@@ -7,6 +7,7 @@ pub mod error;
 pub mod hash;
 pub mod id;
 pub mod range;
+pub mod readiness;
 pub mod retry;
 pub mod state;
 pub mod transition;
@@ -19,6 +20,11 @@ pub use id::{
     UpdateId,
 };
 pub use range::{CheckedRange, PageSlice};
+pub use readiness::{
+    FetchFailureCause, PresentationBackend, QualificationVersions, READINESS_SCHEMA_VERSION,
+    ReadinessConstraint, ReadinessMode, ReadinessRecord, ScopeCompleteness, SpatialEnvelope,
+    TemporalEstimate,
+};
 pub use retry::RetryDisposition;
 pub use state::{BackendHealthState, PageState, RepositoryState, SessionState, UpdateState};
 pub use transition::{

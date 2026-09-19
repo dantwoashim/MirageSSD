@@ -14,6 +14,7 @@ fn candidate(value: u8, physical_bytes: u64, last_access_sequence: u64) -> Recla
         dirty: false,
         pinned: false,
         active_read_leases: 0,
+        mounted_reader_exclusion: false,
     }
 }
 
@@ -69,6 +70,39 @@ fn only_verified_clean_unpinned_idle_bytes_are_selected() {
     assert_eq!(plan.blocked.unverified_bytes, 30);
     assert_eq!(plan.blocked.pinned_bytes, 40);
     assert_eq!(plan.blocked.active_read_bytes, 50);
+}
+
+#[test]
+fn mounted_reader_exclusion_blocks_otherwise_clean_candidates() {
+    let mut mounted = candidate(7, 60, 1);
+    mounted.mounted_reader_exclusion = true;
+    let plan = plan_space_lease(
+        &CapacitySnapshot {
+            physical_free_bytes: 10,
+            filesystem_reserve_bytes: 0,
+            outstanding_space_lease_bytes: 0,
+            candidates: vec![mounted],
+        },
+        50,
+    )
+    .expect("plan");
+    assert!(plan.selected.is_empty());
+    assert_eq!(plan.blocked.mounted_reader_bytes, 60);
+    assert_eq!(plan.blocked.unique_bytes, 60);
+
+    mounted.mounted_reader_exclusion = false;
+    let plan = plan_space_lease(
+        &CapacitySnapshot {
+            physical_free_bytes: 10,
+            filesystem_reserve_bytes: 0,
+            outstanding_space_lease_bytes: 0,
+            candidates: vec![mounted],
+        },
+        50,
+    )
+    .expect("plan");
+    assert_eq!(plan.selected.len(), 1);
+    assert_eq!(plan.blocked.mounted_reader_bytes, 0);
 }
 
 #[test]

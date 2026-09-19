@@ -103,13 +103,16 @@ pub(crate) struct AlignedBuf {
 #[allow(unsafe_code)]
 impl AlignedBuf {
     pub fn new(size: usize) -> io::Result<Self> {
-        let layout = std::alloc::Layout::from_size_align(size, 4096)
+        let layout = std::alloc::Layout::from_size_align(size.max(1), 4096)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: layout was just constructed as valid; a null allocation is
         // checked immediately below.
-        let ptr = unsafe { std::alloc::alloc(layout) };
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = std::ptr::NonNull::new(ptr).ok_or(io::ErrorKind::OutOfMemory)?;
         Ok(Self { ptr, layout })
+    }
+    pub fn len(&self) -> usize {
+        self.layout.size()
     }
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: `ptr` owns `layout.size()` bytes for the lifetime of self.

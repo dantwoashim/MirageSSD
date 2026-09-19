@@ -13,6 +13,7 @@ workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+futures-executor.workspace = true
 futures-util.workspace = true
 mirage-backend.workspace = true
 mirage-manifest.workspace = true
@@ -24,10 +25,10 @@ mirage-predictor.workspace = true
 roaring.workspace = true
 mirage-db.workspace = true
 mirage-types.workspace = true
+serde.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-futures-executor.workspace = true
 mirage-crypto.workspace = true
 mirage-backend-local.workspace = true
 mirage-fault-inject = { path = "../../tools/fault-inject" }

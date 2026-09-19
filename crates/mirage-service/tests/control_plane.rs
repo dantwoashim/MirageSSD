@@ -339,6 +339,109 @@ fn normal_users_only_see_and_target_their_owned_repositories() {
     ));
 }
 
+#[test]
+fn plan_rejects_a_stale_profile_bound_to_another_manifest() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x51; 16]);
+    let generation = GenerationId::from_u64(3);
+    let commit = CommitHash::from_bytes([7; 32]);
+    let manifest = directory.path().join("objects/active.manifest");
+    let index = directory.path().join("objects/active.midx");
+    std::fs::create_dir_all(manifest.parent().expect("parent")).expect("objects");
+    std::fs::write(&manifest, b"manifest fixture").expect("manifest");
+    let fixture = decode_manifest_bounded(
+        include_bytes!("../../mirage-manifest/tests/fixtures/manifest-v2-complex.cbor"),
+        DecodeLimits::default(),
+    )
+    .expect("manifest fixture");
+    std::fs::write(&index, compile_to_bytes(&fixture).expect("compile index")).expect("index");
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "plan fixture".into(),
+            local_root: directory.path().join("repository"),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    database
+        .insert_verified_generation(VerifiedGeneration {
+            repository_id,
+            generation_id: generation,
+            commit_hash: commit,
+            manifest_hash: ManifestHash::from_bytes([8; 32]),
+            manifest_local_path: manifest.clone(),
+            mount_index_path: Some(index.clone()),
+            created_at_ns: 2,
+        })
+        .expect("generation");
+    database
+        .activate_generation(repository_id, generation, commit, None, 3)
+        .expect("activate");
+    let runtime_root = directory
+        .path()
+        .join("repositories")
+        .join(repository_id.to_string());
+    let profile_root = runtime_root.join("profiles");
+    std::fs::create_dir_all(&profile_root).expect("profile root");
+    std::fs::write(
+        runtime_root.join("runtime.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": 1,
+            "native_root": directory.path().canonicalize().unwrap(),
+            "mount_subtree": "mount",
+            "import_root": manifest.parent().unwrap(),
+            "launcher_relative": "game.exe",
+            "arguments": [],
+            "version_label": "1",
+            "configuration_label": "test",
+            "cache_bytes": 1048576,
+            "drain_ms": 0
+        }))
+        .unwrap(),
+    )
+    .expect("runtime config");
+    let stale = mirage_predictor::GameProfile {
+        format_version: 1,
+        repository_id,
+        manifest_hash: ManifestHash::from_bytes([9; 32]),
+        label: "1:test".into(),
+        page_observations: vec![mirage_predictor::PageObservation {
+            file_index: 0,
+            page_ordinal: 0,
+            first_touch_delta_us: 0,
+            class: mirage_predictor::ObservationClass::Demand,
+        }],
+        processes: vec![],
+        dropped_event_count: 0,
+    };
+    std::fs::write(
+        profile_root.join("stale.profile.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .expect("stale profile");
+    let handler = ControlPlaneHandler::new(database);
+
+    let planned = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::Plan {
+                repository_id,
+                full_volume: false,
+            },
+        ),
+    );
+    assert!(
+        matches!(planned, ResponseBody::Error { ref code, ref message }
+            if code == "MIRAGE_REPOSITORY_CONFLICT" && message.contains("wrong_manifest")),
+        "stale profile must fail closed: {planned:?}"
+    );
+}
+
 struct FakeMountControl {
     calls: Arc<Mutex<Vec<&'static str>>>,
 }

@@ -1,8 +1,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use mirage_scheduler::{FetchPriority, FlightFailure, FlightMap};
-use mirage_types::PageHash;
+use mirage_scheduler::{FetchPool, FetchPoolConfig, FetchPriority, FlightFailure, FlightMap};
+use mirage_types::{FetchFailureCause, MirageErrorKind, PageHash};
+use tokio_util::sync::CancellationToken;
+
+fn failure() -> FlightFailure {
+    FlightFailure {
+        cause: FetchFailureCause::Internal,
+        code: "MIRAGE_REMOTE_UNAVAILABLE".into(),
+    }
+}
 
 #[test]
 fn thousand_waiters_share_one_owner_and_observe_completion() {
@@ -51,9 +60,7 @@ fn errors_fan_out_and_retry_gets_new_owner() {
         FetchPriority::P0Blocking as u8
     );
     assert_eq!(first.handle.flight().earliest_deadline_ns(), 10);
-    let failure = FlightFailure {
-        code: "MIRAGE_REMOTE_UNAVAILABLE".into(),
-    };
+    let failure = failure();
     assert!(map.complete(hash, Err(failure.clone())).expect("complete"));
     assert_eq!(second.handle.flight().wait(), Err(failure));
     assert!(
@@ -61,4 +68,135 @@ fn errors_fan_out_and_retry_gets_new_owner() {
             .expect("retry")
             .owner
     );
+}
+
+#[test]
+fn wait_or_cancel_returns_none_when_cancelled_first() {
+    let map = FlightMap::default();
+    let hash = PageHash::from_bytes([10; 32]);
+    let acquired = map
+        .acquire(hash, FetchPriority::P0Blocking, 10, true)
+        .expect("acquire");
+    let token = CancellationToken::new();
+    token.cancel();
+    assert_eq!(
+        futures_executor::block_on(acquired.handle.flight().wait_or_cancel(&token)),
+        None
+    );
+}
+
+#[test]
+fn acquire_after_cancelled_flight_creates_new_owner() {
+    let map = FlightMap::default();
+    let hash = PageHash::from_bytes([11; 32]);
+    {
+        let acquired = map
+            .acquire(hash, FetchPriority::P0Blocking, 10, true)
+            .expect("acquire");
+        assert!(acquired.owner);
+        let flight = Arc::clone(acquired.handle.flight());
+        drop(acquired);
+        assert!(flight.cancellation().is_cancelled());
+    }
+    let next = map
+        .acquire(hash, FetchPriority::P0Blocking, 10, true)
+        .expect("re-acquire");
+    assert!(next.owner);
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn subscriber_limit_is_enforced() {
+    let map = FlightMap::with_limits(2);
+    let hash = PageHash::from_bytes([12; 32]);
+    let _first = map
+        .acquire(hash, FetchPriority::P0Blocking, 10, true)
+        .expect("first");
+    let _second = map
+        .acquire(hash, FetchPriority::P0Blocking, 10, true)
+        .expect("second");
+    let error = match map.acquire(hash, FetchPriority::P0Blocking, 10, true) {
+        Ok(_) => panic!("third subscriber must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, MirageErrorKind::CacheFull);
+}
+
+#[test]
+fn complete_owned_ignores_a_replaced_flight() {
+    let map = FlightMap::default();
+    let hash = PageHash::from_bytes([13; 32]);
+    let stale = {
+        let acquired = map
+            .acquire(hash, FetchPriority::P0Blocking, 10, true)
+            .expect("stale owner");
+        let flight = Arc::clone(acquired.handle.flight());
+        // Dropping the only waiter cancels the flight; the next acquire
+        // replaces the map entry with a fresh owner flight.
+        drop(acquired);
+        flight
+    };
+    assert!(stale.cancellation().is_cancelled());
+    let current = map
+        .acquire(hash, FetchPriority::P0Blocking, 10, true)
+        .expect("current owner");
+    let current_flight = Arc::clone(current.handle.flight());
+    assert!(current.owner);
+    assert!(!Arc::ptr_eq(&stale, &current_flight));
+
+    // Completing a flight the map no longer references still resolves the
+    // flight but leaves the current entry alone.
+    assert!(
+        !map.complete_owned(hash, &stale, Ok(()))
+            .expect("complete stale")
+    );
+    assert!(stale.try_result().is_some());
+    assert_eq!(map.len(), 1);
+    assert!(current_flight.try_result().is_none());
+    assert!(
+        map.complete_owned(hash, &current_flight, Ok(()))
+            .expect("complete current")
+    );
+    assert!(map.is_empty());
+}
+
+#[test]
+fn fetch_pool_reports_saturation() {
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 1,
+        speculative_queue_depth: 0,
+    })
+    .expect("pool");
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    pool.spawn(
+        FetchPriority::P0Blocking,
+        u64::MAX,
+        Box::new(move || {
+            let _ = release_rx.recv();
+        }),
+    )
+    .expect("blocking job");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.running() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pool.running(), 1);
+    let mut accepted = 1_usize;
+    loop {
+        match pool.spawn(FetchPriority::P0Blocking, u64::MAX, Box::new(|| {})) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                assert_eq!(error.kind, MirageErrorKind::CacheFull);
+                break;
+            }
+        }
+        assert!(accepted <= 16, "pool never saturated");
+    }
+    release_tx.send(()).expect("release worker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.completed() < accepted as u64 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pool.completed(), accepted as u64);
 }

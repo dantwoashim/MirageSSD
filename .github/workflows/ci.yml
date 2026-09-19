@@ -73,6 +73,14 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked -- --nocapture
 
+      - name: Check Windows installer and account lifecycle
+        shell: powershell
+        run: |
+          ./scripts/test-device-lifecycle.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-device-prefetch.ps1
+          ./scripts/test-capability-inventory.ps1
+
       - name: Test and build management UI
         working-directory: apps/mirage-ui
         run: |
