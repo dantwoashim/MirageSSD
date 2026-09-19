@@ -115,6 +115,18 @@ enum Command {
         i64,
         Reply<()>,
     ),
+    UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
+    UploadSessionAdvance(
+        [u8; 16],
+        crate::upload_session::SessionPhase,
+        Option<String>,
+        Option<String>,
+        u64,
+        u64,
+        Option<String>,
+        i64,
+        Reply<()>,
+    ),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -432,6 +444,38 @@ impl DbWriter {
                                     inode,
                                     version,
                                     &extents,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::UploadSessionCreate(session, reply) => {
+                            respond(
+                                reply,
+                                crate::upload_session::create_session(&mut connection, &session),
+                            );
+                        }
+                        Command::UploadSessionAdvance(
+                            session_id,
+                            phase,
+                            upload_id,
+                            uri,
+                            chunk_offset,
+                            committed,
+                            error_class,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                crate::upload_session::advance_phase(
+                                    &mut connection,
+                                    &session_id,
+                                    phase,
+                                    upload_id.as_deref(),
+                                    uri.as_deref(),
+                                    chunk_offset,
+                                    committed,
+                                    error_class.as_deref(),
                                     now,
                                 ),
                             );
@@ -840,6 +884,42 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<u64, MirageError> {
         self.request(|reply| Command::OperationReclaimPending(volume_id, now_ns, reply))
+    }
+
+    /// Creates a durable upload session before the first remote call.
+    pub fn upload_session_create(
+        &self,
+        session: crate::upload_session::UploadSession,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::UploadSessionCreate(session, reply))
+    }
+
+    /// Advances a session's phase, upload cursor, and error class.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_session_advance(
+        &self,
+        session_id: [u8; 16],
+        phase: crate::upload_session::SessionPhase,
+        remote_upload_id: Option<String>,
+        session_uri: Option<String>,
+        chunk_offset: u64,
+        committed_bytes: u64,
+        error_class: Option<String>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::UploadSessionAdvance(
+                session_id,
+                phase,
+                remote_upload_id,
+                session_uri,
+                chunk_offset,
+                committed_bytes,
+                error_class,
+                now_ns,
+                reply,
+            )
+        })
     }
 
     /// Atomically replaces an inode's extent set at `version`.

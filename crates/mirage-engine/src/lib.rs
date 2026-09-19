@@ -21,6 +21,7 @@ pub mod observe;
 pub mod outcome;
 pub mod page_location;
 pub mod page_provider;
+pub mod publication_session;
 pub mod read;
 pub mod read_request;
 pub mod readiness;

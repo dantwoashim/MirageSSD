@@ -21,6 +21,7 @@ pub mod space_lease;
 mod state_codec;
 pub mod uninstall;
 pub mod update;
+pub mod upload_session;
 mod value;
 mod writer;
 
@@ -51,6 +52,7 @@ pub use session::{NewSealedSession, SessionProcess};
 pub use space_lease::{NewSpaceLease, SpaceLeaseEvent, SpaceLeaseRecord, SpaceLeaseState};
 pub use uninstall::{UninstallSafetyReport, check_uninstall_safety};
 pub use update::{ActiveUpdate, NativeSnapshot, NewUpdateJournal, OverlayPage};
+pub use upload_session::{SessionKind, SessionPhase, UploadSession as PublicationSession};
 pub use writer::DbWriter;
 
 #[derive(Debug, Clone)]
