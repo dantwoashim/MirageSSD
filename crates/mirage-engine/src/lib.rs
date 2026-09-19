@@ -11,6 +11,7 @@ pub mod file_handle;
 pub mod gc;
 pub mod generation;
 pub mod get_or_fetch;
+pub mod handles;
 pub mod journal;
 pub mod mark_set;
 pub mod mount;

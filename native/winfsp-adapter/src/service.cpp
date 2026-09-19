@@ -40,7 +40,35 @@ NTSTATUS security_by_name(FSP_FILE_SYSTEM* fs, PWSTR name, PUINT32 attributes, P
     if (size) { const auto required = static_cast<SIZE_T>(host(fs)->security_size()); if (required > *size) { *size = required; return STATUS_BUFFER_OVERFLOW; } *size = required; if (output) std::memcpy(output, host(fs)->security(), required); }
     return STATUS_SUCCESS;
 }
-NTSTATUS create(FSP_FILE_SYSTEM*, PWSTR, UINT32, UINT32, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID*, FSP_FSCTL_FILE_INFO*) { return STATUS_MEDIA_WRITE_PROTECTED; }
+// WinFsp encodes the create disposition in the upper byte of CreateOptions.
+NTSTATUS create(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
+    const uint8_t directory=(create_options&FILE_DIRECTORY_FILE)!=0?1:0;
+    const UINT32 disposition=create_options>>24;
+    if(disposition==FILE_CREATE||disposition==FILE_OVERWRITE_IF||disposition==FILE_OPEN_IF||disposition==FILE_SUPERSEDE){
+        const auto status=mirage_namespace_create(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name),directory);
+        // OPEN_IF/SUPERSEDE may still resolve an existing entry.
+        if(status!=MIRAGE_OK&&!(disposition!=FILE_CREATE&&status==MIRAGE_CONFLICT))return mirage_status_to_ntstatus(status);
+    }
+    MirageFileHandle* file{}; MirageFileInfo stat{}; const auto status=lookup(fs,name,&file,&stat); if(!NT_SUCCESS(status)) return status;
+    auto* opened=new (std::nothrow) FileContext{}; if(!opened){mirage_file_close(file);return STATUS_INSUFFICIENT_RESOURCES;} opened->rust_handle=file; opened->info=stat; opened->opener_pid=FspFileSystemOperationProcessId();
+    *context=opened; fill_info(stat,info); return STATUS_SUCCESS;
+}
+NTSTATUS rename_file(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, PWSTR new_name, BOOLEAN) {
+    auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
+    return mirage_status_to_ntstatus(mirage_namespace_rename(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name),reinterpret_cast<const uint16_t*>(new_name),std::wcslen(new_name)));
+}
+NTSTATUS set_delete(FSP_FILE_SYSTEM*, PVOID context, PWSTR, BOOLEAN delete_file) {
+    auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
+    opened->delete_pending=delete_file!=FALSE;
+    return STATUS_SUCCESS;
+}
+void cleanup(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, ULONG flags) {
+    auto* opened=static_cast<FileContext*>(context); if(!opened) return;
+    // Delete-pending: the durable delete is issued when the last handle's
+    // cleanup runs, so open readers keep identity until then.
+    if((flags&FspCleanupDelete)&&opened->delete_pending)
+        mirage_namespace_delete(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name));
+}
 NTSTATUS open_file(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32, UINT32, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
     MirageFileHandle* file{}; MirageFileInfo stat{}; const auto status = lookup(fs, name, &file, &stat); if (!NT_SUCCESS(status)) return status;
     auto* opened = new (std::nothrow) FileContext{}; if (!opened) { mirage_file_close(file); return STATUS_INSUFFICIENT_RESOURCES; } opened->rust_handle=file; opened->info=stat; opened->opener_pid=FspFileSystemOperationProcessId();
@@ -70,7 +98,7 @@ NTSTATUS read_file(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer, UINT64 offs
     size_t read{};const auto status=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);*transferred=static_cast<ULONG>(read);return mirage_status_to_ntstatus(status);
 }
 NTSTATUS overwrite(FSP_FILE_SYSTEM*,PVOID,UINT32,BOOLEAN,UINT64,FSP_FSCTL_FILE_INFO*){return STATUS_MEDIA_WRITE_PROTECTED;}
-FSP_FILE_SYSTEM_INTERFACE interface_table={.GetVolumeInfo=get_volume,.GetSecurityByName=security_by_name,.Create=create,.Open=open_file,.Overwrite=overwrite,.Close=close_file,.Read=read_file,.GetFileInfo=get_info,.ReadDirectory=read_dir};
+FSP_FILE_SYSTEM_INTERFACE interface_table={.GetVolumeInfo=get_volume,.GetSecurityByName=security_by_name,.Create=create,.Open=open_file,.Overwrite=overwrite,.Cleanup=cleanup,.Close=close_file,.Read=read_file,.GetFileInfo=get_info,.ReadDirectory=read_dir,.Rename=rename_file,.SetDelete=set_delete};
 }
 namespace mirage {
 void release_file_context(FileContext* context) noexcept{if(context&&context->references.fetch_sub(1)==1){mirage_file_close(context->rust_handle);delete context;}}

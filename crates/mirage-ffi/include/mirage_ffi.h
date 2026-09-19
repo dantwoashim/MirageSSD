@@ -30,6 +30,10 @@ MirageStatus mirage_read(const MirageFileHandle *handle,uint64_t offset,uint8_t 
 MirageStatus mirage_read_ex(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred,uint32_t caller_pid);
 /* Host read-ahead: same as mirage_read but a non-resident page is not recorded as a seal violation. */
 MirageStatus mirage_read_speculative(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred);
+/* Durable namespace mutations; each applies offline and journals the operation for later publication. */
+MirageStatus mirage_namespace_create(MirageEngineHandle *engine,const uint16_t *path,size_t path_len,uint8_t directory);
+MirageStatus mirage_namespace_rename(MirageEngineHandle *engine,const uint16_t *from_path,size_t from_len,const uint16_t *to_path,size_t to_len);
+MirageStatus mirage_namespace_delete(MirageEngineHandle *engine,const uint16_t *path,size_t path_len);
 typedef uint8_t (*MirageEnumerateCallback)(void *context,const uint16_t *name,size_t name_len,MirageFileInfo info);
 MirageStatus mirage_enumerate(const MirageFileHandle *handle,const uint16_t *marker,size_t marker_len,size_t limit,void *context,MirageEnumerateCallback callback);
 #ifdef __cplusplus

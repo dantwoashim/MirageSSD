@@ -743,6 +743,21 @@ impl crate::Database {
         })
     }
 
+    /// The volume's root inode when the namespace volume exists.
+    pub fn namespace_root(&self, volume_id: RepositoryId) -> Result<Option<InodeId>, MirageError> {
+        self.reads().with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM namespace_volumes WHERE volume_id = ?1",
+                    [volume_id.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|present| present.map(|_| root_inode(volume_id)))
+                .map_err(|e| sqlite(e, "namespace root lookup failed"))
+        })
+    }
+
     pub fn namespace_resolve_path(
         &self,
         volume_id: RepositoryId,

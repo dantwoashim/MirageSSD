@@ -220,6 +220,11 @@ pub struct MirageEngineHandle {
     /// Cloud-backed page provider for non-resident pages when no local
     /// origin pack directory exists.
     pub provider: Option<Arc<PageProviderHook>>,
+    /// Control-plane database for namespace mutations and the local
+    /// operation journal; `None` for engines that never mutate.
+    pub db: Option<mirage_db::Database>,
+    /// Open-handle table for share modes and delete-pending semantics.
+    pub handles: Arc<mirage_engine::handles::HandleTable>,
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -276,6 +281,8 @@ impl MirageEngineHandle {
             trace_lookups: false,
             coordinator: None,
             provider: None,
+            db: None,
+            handles: Arc::new(mirage_engine::handles::HandleTable::default()),
         }
     }
     /// Owner-side origin decodes performed by this engine.

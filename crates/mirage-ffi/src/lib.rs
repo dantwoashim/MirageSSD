@@ -15,7 +15,9 @@ use mirage_cache::{ArenaShard, CacheLayout, ResidentIndex};
 use mirage_index::{FileView, MountIndex, NodeIndex, PageView, ResolvedSpan};
 use mirage_pack::{PackReadEncryption, PackReader, PlainPage};
 use mirage_scheduler::{FetchPriority, FlightFailure, FlightMap, PageFlight};
-use mirage_types::{ByteCount, FetchFailureCause, MirageError, MirageErrorKind, PageHash};
+use mirage_types::{
+    ByteCount, FetchFailureCause, InodeId, MirageError, MirageErrorKind, PageHash, RepositoryId,
+};
 
 fn contained(operation: impl FnOnce() -> MirageStatus) -> MirageStatus {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(MirageStatus::Internal)
@@ -120,6 +122,8 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             trace_lookups: false,
             coordinator: None,
             provider: None,
+            db: None,
+            handles: Arc::new(mirage_engine::handles::HandleTable::default()),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -194,6 +198,8 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             trace_lookups: false,
             coordinator: None,
             provider: None,
+            db: None,
+            handles: Arc::new(mirage_engine::handles::HandleTable::default()),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -382,6 +388,8 @@ unsafe fn create_cache_impl(
                 Some(Arc::new(move |hash| coordinator.provide_page(hash))
                     as Arc<handles::PageProviderHook>)
             },
+            db: mirage_db::Database::open(&state_root.join("control.db")).ok(),
+            handles: Arc::new(mirage_engine::handles::HandleTable::default()),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -1277,4 +1285,287 @@ pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> Mir
         }
         MirageStatus::Ok
     })
+}
+
+/// Splits a UTF-16 mount-relative path into its parent path (as a namespace
+/// `/`-joined string) and final component name.
+fn split_utf16_path(path: *const u16, path_len: usize) -> Result<(String, String), MirageStatus> {
+    if path.is_null() || path_len == 0 {
+        return Err(MirageStatus::InvalidArgument);
+    }
+    let units = unsafe { std::slice::from_raw_parts(path, path_len) };
+    let full = String::from_utf16(units).map_err(|_| MirageStatus::InvalidArgument)?;
+    let normalized = full.replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    let (parent, name) = trimmed
+        .rsplit_once('/')
+        .map(|(parent, name)| (parent.to_string(), name.to_string()))
+        .unwrap_or_else(|| (String::new(), trimmed.to_string()));
+    if name.is_empty() {
+        return Err(MirageStatus::InvalidArgument);
+    }
+    Ok((parent, name))
+}
+
+/// Mutation preconditions: a mounted coordinator plus the control database.
+fn mutation_context(
+    engine: &MirageEngineHandle,
+) -> Result<(&mirage_db::Database, RepositoryId), MirageStatus> {
+    match &engine.coordinator {
+        Some(coordinator) if coordinator.state() == mirage_engine::volume::VolumeState::Mounted => {
+        }
+        _ => return Err(MirageStatus::Conflict),
+    }
+    let Some(db) = &engine.db else {
+        return Err(MirageStatus::BackendUnavailable);
+    };
+    let Some(index) = &engine.index else {
+        return Err(MirageStatus::IntegrityFailure);
+    };
+    Ok((db, index.header().repository_id))
+}
+
+fn journal_namespace_operation(
+    db: &mirage_db::Database,
+    volume: RepositoryId,
+    kind: mirage_db::OperationKind,
+    payload: Vec<u8>,
+    now_ns: i64,
+) -> Result<(), MirageStatus> {
+    let mut operation_id = [0u8; 16];
+    if getrandom::fill(&mut operation_id).is_err() {
+        return Err(MirageStatus::Internal);
+    }
+    let device_seq = db
+        .next_operation_seq(volume)
+        .map_err(|_| MirageStatus::IoError)?;
+    db.writer()
+        .operation_begin(
+            mirage_db::OperationRecord {
+                operation_id,
+                device_seq,
+                volume_id: volume,
+                base_commit: None,
+                kind,
+                payload,
+                status: mirage_db::OperationStatus::Pending,
+                flush_group: None,
+                depends_on: None,
+                created_ns: now_ns,
+            },
+            Vec::new(),
+        )
+        .map_err(|_| MirageStatus::IoError)?;
+    db.writer()
+        .operation_commit(operation_id)
+        .map_err(|_| MirageStatus::IoError)
+}
+
+fn now_ns_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn resolve_parent(
+    db: &mirage_db::Database,
+    volume: RepositoryId,
+    parent_path: &str,
+) -> Result<InodeId, MirageStatus> {
+    if parent_path.is_empty() {
+        db.namespace_root(volume)
+            .map_err(|_| MirageStatus::IoError)?
+            .ok_or(MirageStatus::NotFound)
+    } else {
+        db.namespace_resolve_path(volume, parent_path)
+            .map_err(|_| MirageStatus::IoError)?
+            .ok_or(MirageStatus::NotFound)
+    }
+}
+
+/// Creates a file or directory in the durable namespace; works fully offline
+/// and journals the mutation for later remote publication.
+///
+/// # Safety
+/// `engine` must be live; `path` must point to `path_len` UTF-16 units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_namespace_create(
+    engine: *mut MirageEngineHandle,
+    path: *const u16,
+    path_len: usize,
+    directory: u8,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let engine = unsafe { &*engine };
+        let (parent_path, name) = match split_utf16_path(path, path_len) {
+            Ok(parts) => parts,
+            Err(status) => return status,
+        };
+        let (db, volume) = match mutation_context(engine) {
+            Ok(context) => context,
+            Err(status) => return status,
+        };
+        let now = now_ns_i64();
+        let parent = match resolve_parent(db, volume, &parent_path) {
+            Ok(inode) => inode,
+            Err(status) => return status,
+        };
+        let kind = if directory != 0 {
+            mirage_db::NamespaceNodeKind::Directory
+        } else {
+            mirage_db::NamespaceNodeKind::File
+        };
+        match db.namespace_create(volume, parent, &name, kind, now) {
+            Ok(_) => {}
+            Err(error) => return mutation_status(&error),
+        }
+        match journal_namespace_operation(
+            db,
+            volume,
+            if directory != 0 {
+                mirage_db::OperationKind::Mkdir
+            } else {
+                mirage_db::OperationKind::Create
+            },
+            format!("{parent_path}/{name}").into_bytes(),
+            now,
+        ) {
+            Ok(()) => MirageStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+/// Renames or moves a namespace entry; inode identity survives the move and
+/// the mutation works without touching cloud content.
+///
+/// # Safety
+/// `engine` must be live; both paths must be valid UTF-16 slices.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_namespace_rename(
+    engine: *mut MirageEngineHandle,
+    from_path: *const u16,
+    from_len: usize,
+    to_path: *const u16,
+    to_len: usize,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let engine = unsafe { &*engine };
+        let (from_parent_path, from_name) = match split_utf16_path(from_path, from_len) {
+            Ok(parts) => parts,
+            Err(status) => return status,
+        };
+        let (to_parent_path, to_name) = match split_utf16_path(to_path, to_len) {
+            Ok(parts) => parts,
+            Err(status) => return status,
+        };
+        let (db, volume) = match mutation_context(engine) {
+            Ok(context) => context,
+            Err(status) => return status,
+        };
+        let from_parent = match resolve_parent(db, volume, &from_parent_path) {
+            Ok(inode) => inode,
+            Err(status) => return status,
+        };
+        let to_parent = match resolve_parent(db, volume, &to_parent_path) {
+            Ok(inode) => inode,
+            Err(status) => return status,
+        };
+        let now = now_ns_i64();
+        match db.namespace_rename(volume, from_parent, &from_name, to_parent, &to_name, now) {
+            Ok(()) => {}
+            Err(error) => return mutation_status(&error),
+        }
+        match journal_namespace_operation(
+            db,
+            volume,
+            mirage_db::OperationKind::Rename,
+            format!("{from_parent_path}/{from_name}\n{to_parent_path}/{to_name}").into_bytes(),
+            now,
+        ) {
+            Ok(()) => MirageStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+/// Deletes a namespace entry; open handles hold the inode as a
+/// delete-pending tombstone until the last close.
+///
+/// # Safety
+/// `engine` must be live; `path` must point to `path_len` UTF-16 units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_namespace_delete(
+    engine: *mut MirageEngineHandle,
+    path: *const u16,
+    path_len: usize,
+) -> MirageStatus {
+    contained(|| {
+        if engine.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let engine = unsafe { &*engine };
+        let (parent_path, name) = match split_utf16_path(path, path_len) {
+            Ok(parts) => parts,
+            Err(status) => return status,
+        };
+        let (db, volume) = match mutation_context(engine) {
+            Ok(context) => context,
+            Err(status) => return status,
+        };
+        let full = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        let inode = match db.namespace_resolve_path(volume, &full) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => return MirageStatus::NotFound,
+            Err(_) => return MirageStatus::IoError,
+        };
+        // Open handles hold the entry as a delete-pending tombstone; the row
+        // survives until the last close re-issues the delete.
+        match engine.handles.request_delete(inode) {
+            Ok(mirage_engine::handles::DeleteDisposition::Pending) => {
+                return MirageStatus::Ok;
+            }
+            Ok(mirage_engine::handles::DeleteDisposition::Removed) => {}
+            Err(_) => return MirageStatus::AccessDenied,
+        }
+        let parent = match resolve_parent(db, volume, &parent_path) {
+            Ok(inode) => inode,
+            Err(status) => return status,
+        };
+        let now = now_ns_i64();
+        match db.namespace_delete(volume, parent, &name, now) {
+            Ok(()) => {}
+            Err(error) => return mutation_status(&error),
+        }
+        match journal_namespace_operation(
+            db,
+            volume,
+            mirage_db::OperationKind::Delete,
+            full.into_bytes(),
+            now,
+        ) {
+            Ok(()) => MirageStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+fn mutation_status(error: &MirageError) -> MirageStatus {
+    match error.kind {
+        MirageErrorKind::RepositoryConflict => MirageStatus::Conflict,
+        MirageErrorKind::InvalidArgument => MirageStatus::InvalidArgument,
+        MirageErrorKind::IntegrityMismatch => MirageStatus::IntegrityFailure,
+        _ => MirageStatus::IoError,
+    }
 }
