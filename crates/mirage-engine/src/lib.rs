@@ -25,6 +25,7 @@ pub mod publication_session;
 pub mod read;
 pub mod read_request;
 pub mod readiness;
+pub mod reconcile;
 pub mod repair;
 pub mod repository_extract;
 pub mod repository_reader;

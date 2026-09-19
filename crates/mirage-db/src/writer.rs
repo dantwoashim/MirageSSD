@@ -115,6 +115,15 @@ enum Command {
         i64,
         Reply<()>,
     ),
+    RemoteHeadObserve(crate::remote_observation::RemoteHead, Reply<()>),
+    RemoteChangeRecord(crate::remote_observation::RemoteChange, Reply<()>),
+    DivergenceRecord(crate::remote_observation::Divergence, Reply<()>),
+    DivergenceResolve(
+        RepositoryId,
+        crate::remote_observation::DivergenceStatus,
+        i64,
+        Reply<()>,
+    ),
     UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
     UploadSessionAdvance(
         [u8; 16],
@@ -444,6 +453,38 @@ impl DbWriter {
                                     inode,
                                     version,
                                     &extents,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::RemoteHeadObserve(head, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::observe_head(&mut connection, &head),
+                            );
+                        }
+                        Command::RemoteChangeRecord(change, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::record_change(&mut connection, &change),
+                            );
+                        }
+                        Command::DivergenceRecord(divergence, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::record_divergence(
+                                    &mut connection,
+                                    &divergence,
+                                ),
+                            );
+                        }
+                        Command::DivergenceResolve(volume_id, status, now, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::resolve_divergence(
+                                    &mut connection,
+                                    volume_id,
+                                    status,
                                     now,
                                 ),
                             );
@@ -884,6 +925,40 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<u64, MirageError> {
         self.request(|reply| Command::OperationReclaimPending(volume_id, now_ns, reply))
+    }
+
+    /// Records an observed remote head; a backwards cursor is rejected.
+    pub fn remote_head_observe(
+        &self,
+        head: crate::remote_observation::RemoteHead,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::RemoteHeadObserve(head, reply))
+    }
+
+    /// Records one remote change under its cursor (idempotent on cursor).
+    pub fn remote_change_record(
+        &self,
+        change: crate::remote_observation::RemoteChange,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::RemoteChangeRecord(change, reply))
+    }
+
+    /// Records a divergence; both histories stay visible.
+    pub fn divergence_record(
+        &self,
+        divergence: crate::remote_observation::Divergence,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::DivergenceRecord(divergence, reply))
+    }
+
+    /// Marks a live divergence resolved; the record is kept for audit.
+    pub fn divergence_resolve(
+        &self,
+        volume_id: RepositoryId,
+        status: crate::remote_observation::DivergenceStatus,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::DivergenceResolve(volume_id, status, now_ns, reply))
     }
 
     /// Creates a durable upload session before the first remote call.

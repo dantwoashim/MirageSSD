@@ -93,6 +93,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0016_remote_publication.sql",
         sql: include_str!("../../../migrations/0016_remote_publication.sql"),
     },
+    Migration {
+        version: 17,
+        name: "0017_remote_observation.sql",
+        sql: include_str!("../../../migrations/0017_remote_observation.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

@@ -15,6 +15,7 @@ pub mod operation;
 pub mod physical;
 pub mod pin;
 pub mod remote_object;
+pub mod remote_observation;
 pub mod repository;
 pub mod session;
 pub mod space_lease;
@@ -47,6 +48,7 @@ pub use pin::{CachePinRecord, PersistentPinReason};
 pub use remote_object::{
     BackendAccount, RemoteObjectRecord, UploadSession, UpsertRemoteObjectOutcome,
 };
+pub use remote_observation::{Divergence, DivergenceStatus, RemoteChange, RemoteHead};
 pub use repository::{NewRepository, RepositorySummary};
 pub use session::{NewSealedSession, SessionProcess};
 pub use space_lease::{NewSpaceLease, SpaceLeaseEvent, SpaceLeaseRecord, SpaceLeaseState};
