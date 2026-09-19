@@ -10,7 +10,7 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 
 ## Download
 
-**Windows:** [MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.3-preview/MirageSSD-Setup-v0.1.3-preview.exe) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.3-preview)
+**Windows:** [MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.4-preview/MirageSSD-Setup-v0.1.4-preview.exe) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.4-preview)
 
 **macOS (Apple Silicon):** [MirageSSD 0.1.2 preview (.dmg)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.2-preview/MirageSSD-0.1.2-preview-macos-arm64.dmg) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.2-preview) · [Install guide](docs/macos.md). Requires [macFUSE](https://macfuse.github.io/). Intel Macs: [build from source](docs/macos.md#build-the-app-yourself).
 
@@ -44,7 +44,7 @@ For large folders, the repository also includes packed archive and backup helper
 
 ### Use an installer
 
-Download the [Windows preview installer](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.3-preview/MirageSSD-Setup-v0.1.3-preview.exe), then:
+Download the [Windows preview installer](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.4-preview/MirageSSD-Setup-v0.1.4-preview.exe), then:
 
 1. Open `MirageSSD-Setup-*.exe` as your normal Windows user.
 2. Choose **Install and connect Google Drive**.
