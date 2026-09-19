@@ -1,22 +1,18 @@
 # MirageSSD
 
-**Your Google Drive, mounted in Windows Explorer—with a local write-back cache.**
+**Cloud capacity. Local caching. Your files, right in Explorer.**
 
 MirageSSD exposes an application-owned folder in Google Drive as a writable Windows drive. Open files, save downloads, and copy folders through ordinary filesystem paths. Recently used data stays on the local disk; uploads run in the background.
 
-**Status: Windows 11 x64 engineering preview, with a macOS 12+ preview app.** This is not yet a production backup system or a replacement for a physical SSD.
+**Engineering preview · Windows 11 x64 · macOS 12+**
+
+[Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Get started](#get-started) · [Performance](#performance) · [Project map](#repository-map)
 
 ## Download
 
 **Windows:** [MirageSSD Setup (.exe)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.3-preview/MirageSSD-Setup-v0.1.3-preview.exe) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.3-preview)
 
 **macOS (Apple Silicon):** [MirageSSD 0.1.2 preview (.dmg)](https://github.com/dantwoashim/MirageSSD/releases/download/v0.1.2-preview/MirageSSD-0.1.2-preview-macos-arm64.dmg) · [Release notes and checksum](https://github.com/dantwoashim/MirageSSD/releases/tag/v0.1.2-preview) · [Install guide](docs/macos.md). Requires [macFUSE](https://macfuse.github.io/). Intel Macs: [build from source](docs/macos.md#build-the-app-yourself).
-
-Download an installer above, not GitHub's **Code → Download ZIP** (which contains source code). On Windows, run it as your normal user, choose **Install and connect Google Drive**, and sign in with your own Google account. Administrator approval is needed if WinFsp must be installed.
-
-Both previews are **unsigned** (the macOS app is ad-hoc signed, not notarized). Do not disable Windows security or Gatekeeper to run them; on macOS, right-click the app → **Open** once. Google OAuth is in production, so manual tester-email registration is no longer required; organization account policies may still restrict access. A fresh non-tester account and clean-PC installation have not yet been verified end to end.
-
-[Build and install](docs/building.md) · [macOS preview](docs/macos.md) · [Architecture](docs/architecture.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -27,7 +23,22 @@ Both previews are **unsigned** (the macOS app is ad-hoc signed, not notarized). 
 - **Windows file attributes.** A pinned rclone patch preserves hidden, read-only, system, and archive flags in a local metadata journal.
 - **A single-file installer.** The builder packages the application, patched provider, checksum-verified WinFsp prerequisite, and upstream notices.
 
-Files transfer to the Google account you connect. MirageSSD does not supply cloud storage. It uses Google's `drive.file` scope: the volume is **not a full mirror of every existing file in My Drive**.
+The drive uses storage in your own Google account. Google's `drive.file` access gives MirageSSD a dedicated application-managed folder.
+
+## How it works
+
+```text
+Applications and Explorer
+          |
+          v
+MirageSSD drive <--> Local disk cache <--> Google Drive
+```
+
+When you open a file, MirageSSD serves cached bytes locally and fetches missing content from Drive. When you save a file, it stages the write on your disk and uploads it in the background. A completed local copy means the data has reached the cache; upload completion means it has reached Google Drive.
+
+The Windows mount combines a pinned rclone provider with WinFsp. The macOS app uses the same provider with macFUSE and exposes the folder in Finder. Startup supervision restores the mount when you sign in.
+
+For large folders, the repository also includes packed archive and backup helpers. The separate Rust asset engine explores preparing a game's working set in advance, with page-level caching and session admission. Read the [architecture guide](docs/architecture.md) for the component boundaries.
 
 ## Get started
 
@@ -40,13 +51,13 @@ Download the [Windows preview installer](https://github.com/dantwoashim/MirageSS
 3. Approve the administrator prompt if WinFsp needs installation.
 4. Sign in with your own Google account.
 
-The drive opens in Explorer when setup finishes. Start with disposable files, wait for their upload, and confirm they remain readable after signing out of Windows and back in.
+The drive opens in Explorer when setup finishes. Copy a small folder to it, let the upload finish, and open the files from the mounted drive.
 
-Requirements: **Windows 11 x64**, an **NTFS volume with at least 12 GiB free**, internet, and permission to install WinFsp. The preview installer is unsigned; do not disable Windows security to run it.
+Requirements: **Windows 11 x64**, an **NTFS volume with at least 12 GiB free**, internet, and permission to install WinFsp. Installer details and troubleshooting are in the [build guide](docs/building.md) and [troubleshooting guide](docs/troubleshooting.md).
 
 ### Build your own installer
 
-This repository contains source, not preconfigured account credentials or committed executables. Install Rust 1.94.0, the MSVC C++ build tools, Git, Go 1.25 or newer, and WinFsp 2.1.25156.
+Install Rust 1.94.0, the MSVC C++ build tools, Git, Go 1.25 or newer, and WinFsp 2.1.25156.
 
 From PowerShell:
 
@@ -80,7 +91,7 @@ The macOS preview mounts the same Drive folder at `~/MirageSSD` in Finder throug
 
 This produces an ad-hoc-signed `MirageSSD.app` as a ZIP and DMG with checksums. Install, sign-in, uninstall, and troubleshooting steps are in the [macOS guide](docs/macos.md). Preview builds are not notarized: right-click → **Open** on first launch instead of lowering Gatekeeper.
 
-## Performance: what to expect
+## Performance
 
 | Operation | What determines its speed |
 | --- | --- |
@@ -90,20 +101,11 @@ This produces an ad-hoc-signed `MirageSSD.app` as a ZIP and DMG with checksums. 
 | Finish uploading a large copy | Upstream bandwidth and provider limits |
 | Copy thousands of small files | Metadata operations and per-file overhead |
 
-**A completed copy into the drive is not proof of a completed cloud upload.** Write-back caching improves responsiveness; it does not make a slow connection faster.
+Setup sizes the cache from available local space. Recently used files stay close to applications, while open files and pending uploads retain their staging space until they can be released. Leave room for your largest writes and let uploads finish before reclaiming local storage.
 
-Setup chooses a cache budget from available local space. That budget is a cleanup target, not unlimited staging capacity: open files and pending uploads cannot safely be evicted. Downloads can fill the local disk if upload cannot keep up.
+You can [prepare selected files](docs/prefetch.md) before opening them. The preparation tool supports ZIP metadata, file prefixes, and whole files within a chosen byte budget.
 
-**Optional preparation:** [Prepare selected files](docs/prefetch.md) through the existing mounted drive before opening them. ZIP metadata and bounded prefix/whole-file modes are opt-in; no automatic scanning, cache pinning, or unmeasured speedup is promised.
-
-## Data safety and current limits
-
-- Keep originals until the remote copy and a restore have been verified. Do not use this preview as the only copy of irreplaceable data.
-- Do not delete the cache while uploads are pending.
-- Ordinary files on the writable drive are **not client-side encrypted by MirageSSD**. Encrypted repositories and backups are separate paths.
-- Offline reads require cached content. Windows attributes are stored locally and do not automatically follow files to another PC.
-- Games, launchers, databases, virtual machines, and anti-cheat components belong on native storage. Use the mount for archiving, not as a zero-lag execution guarantee.
-- Linux desktop mounting, signed or notarized installers, and clean-machine certification are not delivered by this preview. The macOS app is ad-hoc signed and requires macFUSE; Windows attribute metadata does not apply on macOS.
+For games and large applications, use cloud storage for archives and restore the files to native storage for execution. Keep originals through upload and a verified restore. See [troubleshooting](docs/troubleshooting.md) for upload, cache, and recovery guidance.
 
 Uninstall through **Settings → Apps → Installed apps → MirageSSD**. Removal checks for known pending writes and retains cached data, credentials, attribute metadata, cloud files, and shared WinFsp.
 
@@ -121,7 +123,16 @@ Uninstall through **Settings → Apps → Installed apps → MirageSSD**. Remova
 | `tests/`, `fuzz/`, `tools/` | Fixtures, integration checks, fuzz targets, and test tools |
 | `docs/` | Build instructions, architecture, specifications, and design decisions |
 
-The writable drive uses **rclone + WinFsp**. The immutable pack engine and management UI are separate development components, not prerequisites for the one-click writable-drive installer.
+The one-click Windows installer runs the **rclone + WinFsp** writable drive. The immutable pack engine and management UI have their own development workflow.
+
+## Further reading
+
+- [Build and install](docs/building.md) — dependencies, authentication, and packaging.
+- [macOS guide](docs/macos.md) — installation, Finder mounting, and app builds.
+- [Architecture](docs/architecture.md) — storage paths and component responsibilities.
+- [File preparation](docs/prefetch.md) — warm selected content before use.
+- [Troubleshooting](docs/troubleshooting.md) — diagnose mount and transfer issues.
+- [Contributing](CONTRIBUTING.md) — development workflow and verification.
 
 ## License
 
