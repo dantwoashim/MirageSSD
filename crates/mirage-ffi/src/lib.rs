@@ -5,6 +5,7 @@ pub mod status;
 use handles::{DecodedPageCache, Entry, ViolationLog};
 pub use handles::{MirageEngineHandle, MirageFileHandle};
 pub use status::MirageStatus;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr;
@@ -124,6 +125,8 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             provider: None,
             db: None,
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
+            extents: Arc::new(std::sync::Mutex::new(Default::default())),
+            state_root: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -200,6 +203,8 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             provider: None,
             db: None,
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
+            extents: Arc::new(std::sync::Mutex::new(Default::default())),
+            state_root: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -390,6 +395,8 @@ unsafe fn create_cache_impl(
             },
             db: mirage_db::Database::open(&state_root.join("control.db")).ok(),
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
+            extents: Arc::new(std::sync::Mutex::new(Default::default())),
+            state_root: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -526,6 +533,11 @@ pub unsafe extern "C" fn mirage_lookup(
             {
                 log.lookup(u64::from(ordinal), &path);
             }
+            let namespace_inode = engine.db.as_ref().and_then(|db| {
+                db.namespace_resolve_path(index.header().repository_id, &path)
+                    .ok()
+                    .flatten()
+            });
             let entry = match node {
                 NodeIndex::Directory(ordinal) => Entry {
                     index: u64::from(ordinal),
@@ -562,6 +574,17 @@ pub unsafe extern "C" fn mirage_lookup(
                         provider: engine.provider.clone(),
                         logical_path: Default::default(),
                         caller_image: Default::default(),
+                        inode: namespace_inode,
+                        db: engine.db.clone(),
+                        handles: Arc::clone(&engine.handles),
+                        extents: Arc::clone(&engine.extents),
+                        state_root: engine.state_root.clone(),
+                        desired_access: mirage_engine::handles::DesiredAccess {
+                            read: true,
+                            write: false,
+                            delete: false,
+                        },
+                        share_access: mirage_engine::handles::ShareAccess::ALL,
                     })),
                 )
             };
@@ -591,6 +614,17 @@ pub unsafe extern "C" fn mirage_lookup(
                     provider: engine.provider.clone(),
                     logical_path: Default::default(),
                     caller_image: Default::default(),
+                    inode: None,
+                    db: engine.db.clone(),
+                    handles: Arc::clone(&engine.handles),
+                    extents: Arc::clone(&engine.extents),
+                    state_root: engine.state_root.clone(),
+                    desired_access: mirage_engine::handles::DesiredAccess {
+                        read: true,
+                        write: false,
+                        delete: false,
+                    },
+                    share_access: mirage_engine::handles::ShareAccess::ALL,
                 })),
             )
         };
@@ -610,7 +644,18 @@ pub unsafe extern "C" fn mirage_read(
     output_len: usize,
     transferred: *mut usize,
 ) -> MirageStatus {
-    unsafe { read_impl(handle, offset, output, output_len, transferred, true, 0) }
+    unsafe {
+        read_impl(
+            handle,
+            offset,
+            output,
+            output_len,
+            transferred,
+            true,
+            0,
+            false,
+        )
+    }
 }
 
 /// Same as [`mirage_read`] but records the calling process id in seal-violation
@@ -636,6 +681,7 @@ pub unsafe extern "C" fn mirage_read_ex(
             transferred,
             true,
             caller_pid,
+            false,
         )
     }
 }
@@ -655,7 +701,18 @@ pub unsafe extern "C" fn mirage_read_speculative(
     output_len: usize,
     transferred: *mut usize,
 ) -> MirageStatus {
-    unsafe { read_impl(handle, offset, output, output_len, transferred, false, 0) }
+    unsafe {
+        read_impl(
+            handle,
+            offset,
+            output,
+            output_len,
+            transferred,
+            false,
+            0,
+            false,
+        )
+    }
 }
 
 /// Best-effort `a/b/file` path for a mount-index file, resolved only on the
@@ -683,6 +740,7 @@ fn file_path(index: &MountIndex, file: FileView<'_>) -> String {
     parts.join("/")
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn read_impl(
     handle: *const MirageFileHandle,
     offset: u64,
@@ -691,6 +749,7 @@ unsafe fn read_impl(
     transferred: *mut usize,
     record_violations: bool,
     caller_pid: u32,
+    extent_handled: bool,
 ) -> MirageStatus {
     contained(|| {
         if handle.is_null() || transferred.is_null() || (output.is_null() && output_len != 0) {
@@ -708,6 +767,30 @@ unsafe fn read_impl(
         let Ok(file) = index.file_by_index(file_ordinal) else {
             return MirageStatus::IntegrityFailure;
         };
+        if !extent_handled && let Some(inode) = handle.inode {
+            // A file with no durable extent history takes the immutable page
+            // path; seeded maps contain a single unwritten base extent and
+            // fall through the same way.
+            if let Ok(maps) = extent_map_for(handle, inode)
+                && let Some(map) = maps.get(&inode)
+                && !map.is_plain_base()
+            {
+                let status = unsafe {
+                    read_via_extents(
+                        handle,
+                        map,
+                        offset,
+                        output,
+                        output_len,
+                        transferred,
+                        record_violations,
+                        caller_pid,
+                    )
+                };
+                drop(maps);
+                return status;
+            }
+        }
         let Ok(spans) = mirage_index::resolve_range(file, offset, output_len) else {
             return MirageStatus::IntegrityFailure;
         };
@@ -1278,9 +1361,36 @@ pub unsafe extern "C" fn mirage_enumerate(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> MirageStatus {
     contained(|| {
-        if !handle.is_null() {
-            unsafe {
-                drop(Box::from_raw(handle));
+        if handle.is_null() {
+            return MirageStatus::Ok;
+        }
+        let file = unsafe { Box::from_raw(handle) };
+        // Release share-mode accounting; the last close of a delete-pending
+        // tombstone finalizes the durable delete.
+        if let (Some(inode), Some(db)) = (file.inode, &file.db)
+            && let Ok(true) = file
+                .handles
+                .close(inode, file.desired_access, file.share_access)
+            && let (Some(index), Some(path)) = (&file.index, file.logical_path.get().cloned())
+        {
+            let volume = index.header().repository_id;
+            let normalized = path.replace('\\', "/");
+            let trimmed = normalized.trim_matches('/');
+            let (parent_path, name) = trimmed
+                .rsplit_once('/')
+                .map(|(parent, name)| (parent.to_string(), name.to_string()))
+                .unwrap_or_else(|| (String::new(), trimmed.to_string()));
+            if let Ok(parent) = resolve_parent(db, volume, &parent_path) {
+                let now = now_ns_i64();
+                if db.namespace_delete(volume, parent, &name, now).is_ok() {
+                    let _ = journal_namespace_operation(
+                        db,
+                        volume,
+                        mirage_db::OperationKind::Delete,
+                        trimmed.as_bytes().to_vec(),
+                        now,
+                    );
+                }
             }
         }
         MirageStatus::Ok
@@ -1568,4 +1678,289 @@ fn mutation_status(error: &MirageError) -> MirageStatus {
         MirageErrorKind::IntegrityMismatch => MirageStatus::IntegrityFailure,
         _ => MirageStatus::IoError,
     }
+}
+
+/// Loads (or replays) the extent map for `inode` from the durable extent
+/// store; a file with no extent history seeds a single base extent covering
+/// its committed size so partial writes never need the base first.
+fn extent_map_for(
+    handle: &MirageFileHandle,
+    inode: InodeId,
+) -> Result<
+    std::sync::MutexGuard<'_, HashMap<InodeId, mirage_engine::extent_map::ExtentMap>>,
+    MirageStatus,
+> {
+    let mut maps = handle.extents.lock().map_err(|_| MirageStatus::Internal)?;
+    if let std::collections::hash_map::Entry::Vacant(slot) = maps.entry(inode) {
+        let Some(db) = &handle.db else {
+            return Err(MirageStatus::BackendUnavailable);
+        };
+        let volume = handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id)
+            .ok_or(MirageStatus::IntegrityFailure)?;
+        let map = match db.extent_latest_version(volume, inode) {
+            Ok(Some(version)) => {
+                let extents = db
+                    .extents_at(volume, inode, version)
+                    .map_err(|_| MirageStatus::IoError)?;
+                mirage_engine::extent_map::ExtentMap::replay(volume, inode, &extents)
+            }
+            Ok(None) => {
+                let mut map = mirage_engine::extent_map::ExtentMap::default();
+                if handle.entry.size > 0 {
+                    // Seed one base extent so partial writes preserve the
+                    // committed content outside the written range.
+                    map.seed_base(
+                        handle.entry.size,
+                        mirage_types::PageHash::from_bytes([0; 32]),
+                    );
+                }
+                map
+            }
+            Err(_) => return Err(MirageStatus::IoError),
+        };
+        slot.insert(map);
+    }
+    Ok(maps)
+}
+
+fn persist_extent_map(
+    handle: &MirageFileHandle,
+    inode: InodeId,
+    map: &mirage_engine::extent_map::ExtentMap,
+    now_ns: i64,
+) -> Result<(), MirageStatus> {
+    let db = handle.db.as_ref().ok_or(MirageStatus::BackendUnavailable)?;
+    let volume = handle
+        .index
+        .as_ref()
+        .map(|index| index.header().repository_id)
+        .ok_or(MirageStatus::IntegrityFailure)?;
+    let extents = map.to_extents(volume, inode, map.version(), now_ns, || {
+        let mut id = [0u8; 16];
+        let _ = getrandom::fill(&mut id);
+        id
+    });
+    db.writer()
+        .extent_replace(volume, inode, map.version(), extents, now_ns)
+        .map_err(|_| MirageStatus::IoError)
+}
+
+/// Writes bytes at `offset` through the versioned extent store: the payload
+/// is staged and fsynced, the extent map advances one version, and a journal
+/// operation commits — all durable before this call returns success.
+///
+/// # Safety
+/// `handle` must be live; `bytes` must be readable for `bytes_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_write(
+    handle: *mut MirageFileHandle,
+    offset: u64,
+    bytes: *const u8,
+    bytes_len: usize,
+    transferred: *mut usize,
+) -> MirageStatus {
+    contained(|| {
+        if handle.is_null() || transferred.is_null() || (bytes.is_null() && bytes_len != 0) {
+            return MirageStatus::InvalidArgument;
+        }
+        unsafe { *transferred = 0 };
+        let handle = unsafe { &*handle };
+        let Some(inode) = handle.inode else {
+            return MirageStatus::AccessDenied;
+        };
+        let Some(state_root) = &handle.state_root else {
+            return MirageStatus::BackendUnavailable;
+        };
+        let data = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
+        let now = now_ns_i64();
+        let Some(db) = &handle.db else {
+            return MirageStatus::BackendUnavailable;
+        };
+        let Some(volume) = handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id)
+        else {
+            return MirageStatus::IntegrityFailure;
+        };
+        let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
+        let journal_dir = state_root.join("journal");
+        if std::fs::create_dir_all(&journal_dir).is_err() {
+            return MirageStatus::IoError;
+        }
+        let staged = match journal.stage_payload(&journal_dir, data) {
+            Ok(staged) => staged,
+            Err(_) => return MirageStatus::IoError,
+        };
+        let mut maps = match extent_map_for(handle, inode) {
+            Ok(maps) => maps,
+            Err(status) => return status,
+        };
+        let map = maps.get_mut(&inode).expect("map just inserted");
+        if map.write(offset, staged.bytes, staged.payload_id).is_err() {
+            return MirageStatus::InvalidArgument;
+        }
+        if persist_extent_map(handle, inode, map, now).is_err() {
+            return MirageStatus::IoError;
+        }
+        if journal_namespace_operation(
+            db,
+            volume,
+            mirage_db::OperationKind::Write,
+            inode.as_bytes().to_vec(),
+            now,
+        )
+        .is_err()
+        {
+            return MirageStatus::IoError;
+        }
+        unsafe { *transferred = bytes_len };
+        MirageStatus::Ok
+    })
+}
+
+/// Truncates a file's extent map: extents beyond the end drop, the last
+/// extent clips, and later extension reads zeros.
+///
+/// # Safety
+/// `handle` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_truncate(
+    handle: *mut MirageFileHandle,
+    new_size: u64,
+) -> MirageStatus {
+    contained(|| {
+        if handle.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let handle = unsafe { &*handle };
+        let Some(inode) = handle.inode else {
+            return MirageStatus::AccessDenied;
+        };
+        let now = now_ns_i64();
+        let mut maps = match extent_map_for(handle, inode) {
+            Ok(maps) => maps,
+            Err(status) => return status,
+        };
+        let map = maps.get_mut(&inode).expect("map just inserted");
+        if map.truncate(new_size).is_err() {
+            return MirageStatus::InvalidArgument;
+        }
+        if persist_extent_map(handle, inode, map, now).is_err() {
+            return MirageStatus::IoError;
+        }
+        MirageStatus::Ok
+    })
+}
+
+/// FlushFileBuffers: opens a flush fence over the volume's committed
+/// operations — a local-durability acknowledgement, not cloud completion.
+///
+/// # Safety
+/// `handle` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_flush(handle: *mut MirageFileHandle) -> MirageStatus {
+    contained(|| {
+        if handle.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let handle = unsafe { &*handle };
+        let Some(db) = &handle.db else {
+            return MirageStatus::Ok; // nothing durable to fence
+        };
+        let volume = match handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id)
+        {
+            Some(volume) => volume,
+            None => return MirageStatus::Ok,
+        };
+        let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
+        match journal.flush_fence(now_ns_i64()) {
+            Ok(_) => MirageStatus::Ok,
+            Err(_) => MirageStatus::IoError,
+        }
+    })
+}
+
+/// Extent-aware read: dirty slices come from journaled payload files, zero
+/// slices memset, and base slices recurse through the immutable page path
+/// with the extent branch disabled. An unreadable base slice fails honestly
+/// — never a silent zero.
+#[allow(clippy::too_many_arguments)]
+unsafe fn read_via_extents(
+    handle: &MirageFileHandle,
+    map: &mirage_engine::extent_map::ExtentMap,
+    offset: u64,
+    output: *mut u8,
+    output_len: usize,
+    transferred: *mut usize,
+    record_violations: bool,
+    caller_pid: u32,
+) -> MirageStatus {
+    let slices = match map.read(offset, output_len as u64) {
+        Ok(slices) => slices,
+        Err(_) => return MirageStatus::IntegrityFailure,
+    };
+    let journal_dir = handle.state_root.as_ref().map(|root| root.join("journal"));
+    for slice in slices {
+        let dst = (slice.start() - offset) as usize;
+        let len = slice.length() as usize;
+        match slice {
+            mirage_engine::extent_map::ExtentSlice::Zero { .. } => {
+                let destination = unsafe { std::slice::from_raw_parts_mut(output.add(dst), len) };
+                destination.fill(0);
+            }
+            mirage_engine::extent_map::ExtentSlice::Dirty {
+                payload_id,
+                payload_offset,
+                ..
+            } => {
+                let Some(journal_dir) = &journal_dir else {
+                    return MirageStatus::BackendUnavailable;
+                };
+                let mut hex = String::with_capacity(32);
+                for byte in payload_id {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                let path = journal_dir.join(format!("{hex}.payload"));
+                let Ok(file) = std::fs::File::open(&path) else {
+                    return MirageStatus::IoError;
+                };
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = file;
+                if file.seek(SeekFrom::Start(payload_offset)).is_err() {
+                    return MirageStatus::IoError;
+                }
+                let destination = unsafe { std::slice::from_raw_parts_mut(output.add(dst), len) };
+                if file.read_exact(destination).is_err() {
+                    return MirageStatus::IoError;
+                }
+            }
+            mirage_engine::extent_map::ExtentSlice::Base { start, length, .. } => {
+                let mut inner_transferred = 0usize;
+                let status = unsafe {
+                    read_impl(
+                        handle,
+                        start,
+                        output.add(dst),
+                        length as usize,
+                        &mut inner_transferred,
+                        record_violations,
+                        caller_pid,
+                        true,
+                    )
+                };
+                if status != MirageStatus::Ok {
+                    return status;
+                }
+            }
+        }
+    }
+    unsafe { *transferred = output_len };
+    MirageStatus::Ok
 }

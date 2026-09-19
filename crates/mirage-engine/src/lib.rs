@@ -7,6 +7,7 @@ pub mod allocator;
 pub mod api;
 pub mod capsule_materialize;
 pub mod copy;
+pub mod extent_map;
 pub mod file_handle;
 pub mod gc;
 pub mod generation;

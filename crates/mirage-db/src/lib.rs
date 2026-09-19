@@ -4,6 +4,7 @@
 
 pub mod cache;
 mod error;
+pub mod extent;
 pub mod generation;
 pub mod integrity;
 pub mod lease;
@@ -31,6 +32,7 @@ pub use cache::{
     CacheShardSpec, CacheSlotRecord, CacheSlotState, CacheSnapshot, CommitCacheSlotOutcome,
     ReserveCacheSlotOutcome, load_cache_snapshot,
 };
+pub use extent::{ByteExtent, ExtentKind};
 pub use generation::{ActiveGeneration, VerifiedGeneration};
 pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;

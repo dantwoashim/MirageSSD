@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,6 +225,10 @@ pub struct MirageEngineHandle {
     pub db: Option<mirage_db::Database>,
     /// Open-handle table for share modes and delete-pending semantics.
     pub handles: Arc<mirage_engine::handles::HandleTable>,
+    /// Per-inode extent maps shared with every file handle.
+    pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
+    /// State root holding journal payload files for dirty extents.
+    pub state_root: Option<PathBuf>,
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -247,6 +251,20 @@ pub struct MirageFileHandle {
     pub provider: Option<Arc<PageProviderHook>>,
     pub logical_path: std::sync::OnceLock<String>,
     pub caller_image: Mutex<Option<(u32, Arc<str>)>>,
+    /// Durable inode identity when the namespace resolved this handle.
+    pub inode: Option<mirage_types::InodeId>,
+    /// Control-plane database cloned from the engine for extent writes.
+    pub db: Option<mirage_db::Database>,
+    /// Shared open-handle table for share/delete-pending checks.
+    pub handles: Arc<mirage_engine::handles::HandleTable>,
+    /// Per-inode extent maps shared with the engine.
+    pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
+    /// State root holding journal payload files for dirty extents.
+    pub state_root: Option<PathBuf>,
+    /// Desired access this handle opened with, for handle-table accounting.
+    pub desired_access: mirage_engine::handles::DesiredAccess,
+    /// Share mode this handle granted, for handle-table accounting.
+    pub share_access: mirage_engine::handles::ShareAccess,
 }
 impl MirageFileHandle {
     pub fn caller_image(&self, pid: u32) -> Arc<str> {
@@ -283,6 +301,8 @@ impl MirageEngineHandle {
             provider: None,
             db: None,
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
+            extents: Arc::new(Mutex::new(HashMap::new())),
+            state_root: None,
         }
     }
     /// Owner-side origin decodes performed by this engine.

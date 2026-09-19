@@ -107,6 +107,14 @@ enum Command {
     FlushGroupMark(i64, i64, Reply<u64>),
     OperationPublish(Vec<[u8; 16]>, Reply<u64>),
     OperationReclaimPending(RepositoryId, i64, Reply<u64>),
+    ExtentReplace(
+        RepositoryId,
+        mirage_types::InodeId,
+        i64,
+        Vec<crate::extent::ByteExtent>,
+        i64,
+        Reply<()>,
+    ),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -413,6 +421,19 @@ impl DbWriter {
                             respond(
                                 reply,
                                 operation::reclaim_pending(&mut connection, volume_id, now),
+                            );
+                        }
+                        Command::ExtentReplace(volume, inode, version, extents, now, reply) => {
+                            respond(
+                                reply,
+                                crate::extent::replace_extents(
+                                    &mut connection,
+                                    volume,
+                                    inode,
+                                    version,
+                                    &extents,
+                                    now,
+                                ),
                             );
                         }
                         Command::CreateUpdateJournal(value, reply) => {
@@ -819,6 +840,20 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<u64, MirageError> {
         self.request(|reply| Command::OperationReclaimPending(volume_id, now_ns, reply))
+    }
+
+    /// Atomically replaces an inode's extent set at `version`.
+    pub fn extent_replace(
+        &self,
+        volume_id: RepositoryId,
+        inode: mirage_types::InodeId,
+        version: i64,
+        extents: Vec<crate::extent::ByteExtent>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::ExtentReplace(volume_id, inode, version, extents, now_ns, reply)
+        })
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {
