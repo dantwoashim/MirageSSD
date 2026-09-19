@@ -15,6 +15,7 @@ blake3.workspace = true
 bytes.workspace = true
 futures-executor.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 mirage-backend.workspace = true
 mirage-manifest.workspace = true
 mirage-pack.workspace = true

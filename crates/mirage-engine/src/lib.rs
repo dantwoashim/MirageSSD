@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod allocator;
 pub mod api;
 pub mod capsule_materialize;
 pub mod copy;

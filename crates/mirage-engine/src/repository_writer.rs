@@ -32,9 +32,7 @@ pub fn now_utc_ns() -> Result<i128, MirageError> {
         .map_err(|_| MirageError::internal_invariant("current timestamp overflows commit field"))
 }
 
-pub(crate) fn require_publish_capability(
-    backend: &dyn ObjectBackend,
-) -> Result<(), MirageError> {
+pub(crate) fn require_publish_capability(backend: &dyn ObjectBackend) -> Result<(), MirageError> {
     if backend.capabilities().can_publish() {
         Ok(())
     } else {

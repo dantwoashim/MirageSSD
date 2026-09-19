@@ -10,6 +10,7 @@ pub mod lease;
 mod migrate;
 pub mod namespace;
 mod open;
+pub mod physical;
 pub mod pin;
 pub mod remote_object;
 pub mod repository;
@@ -34,6 +35,9 @@ pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;
 pub use namespace::{DirEntry, NamespaceNodeKind, NamespaceSeedNode, NamespaceStat};
 pub use open::{APPLICATION_ID, ReadPool};
+pub use physical::{
+    PhysicalExtentRecord, PhysicalExtentState, PhysicalFileRecord, PhysicalReservationRecord,
+};
 pub use pin::{CachePinRecord, PersistentPinReason};
 pub use remote_object::{
     BackendAccount, RemoteObjectRecord, UploadSession, UpsertRemoteObjectOutcome,

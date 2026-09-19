@@ -12,6 +12,7 @@ use crate::cache::{
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
 use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
+use crate::physical::{self, PhysicalExtentRecord, PhysicalFileRecord, PhysicalReservationRecord};
 use crate::pin::{self, PersistentPinReason};
 use crate::remote_object::{
     self, BackendAccount, RemoteObjectRecord, UploadAdvance, UploadSession,
@@ -91,6 +92,13 @@ enum Command {
     NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
     NamespaceCheckpoint(RepositoryId, i64, Reply<(u64, [u8; 32])>),
     EnsureDeviceIdentity(i64, Reply<DeviceId>),
+    PhysicalRegisterFile(PhysicalFileRecord, Reply<()>),
+    PhysicalReserveExtent(PhysicalExtentRecord, PhysicalReservationRecord, Reply<()>),
+    PhysicalCommitExtent([u8; 16], mirage_types::PageHash, [u8; 32], i64, Reply<()>),
+    PhysicalReleaseExtent([u8; 16], i64, Reply<()>),
+    PhysicalMarkExtentDead([u8; 16], i64, Reply<()>),
+    PhysicalAdjustExtentPin([u8; 16], i64, Reply<()>),
+    PhysicalReapReservations(i64, Reply<u64>),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -320,6 +328,39 @@ impl DbWriter {
                             respond(
                                 reply,
                                 namespace::seed_volume(&mut connection, volume_id, nodes, now_ns),
+                            );
+                        }
+                        Command::PhysicalRegisterFile(record, reply) => {
+                            respond(reply, physical::register_file(&mut connection, &record));
+                        }
+                        Command::PhysicalReserveExtent(extent, reservation, reply) => {
+                            respond(
+                                reply,
+                                physical::reserve_extent(&mut connection, &extent, &reservation),
+                            );
+                        }
+                        Command::PhysicalCommitExtent(id, hash, checksum, now, reply) => {
+                            respond(
+                                reply,
+                                physical::commit_extent(&mut connection, &id, hash, checksum, now),
+                            );
+                        }
+                        Command::PhysicalReleaseExtent(id, now, reply) => {
+                            respond(reply, physical::release_extent(&mut connection, &id, now));
+                        }
+                        Command::PhysicalMarkExtentDead(id, now, reply) => {
+                            respond(reply, physical::mark_extent_dead(&mut connection, &id, now));
+                        }
+                        Command::PhysicalAdjustExtentPin(id, delta, reply) => {
+                            respond(
+                                reply,
+                                physical::adjust_extent_pin(&mut connection, &id, delta),
+                            );
+                        }
+                        Command::PhysicalReapReservations(now, reply) => {
+                            respond(
+                                reply,
+                                physical::reap_expired_reservations(&mut connection, now),
                             );
                         }
                         Command::CreateUpdateJournal(value, reply) => {
@@ -615,6 +656,64 @@ impl DbWriter {
     /// first use.
     pub fn ensure_device_id(&self, now_ns: i64) -> Result<DeviceId, MirageError> {
         self.request(|reply| Command::EnsureDeviceIdentity(now_ns, reply))
+    }
+
+    pub fn physical_register_file(&self, record: PhysicalFileRecord) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalRegisterFile(record, reply))
+    }
+
+    /// Durably reserves an extent; the reservation must exist before any
+    /// bytes are written to the covered arena range.
+    pub fn physical_reserve_extent(
+        &self,
+        extent: PhysicalExtentRecord,
+        reservation: PhysicalReservationRecord,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalReserveExtent(extent, reservation, reply))
+    }
+
+    /// Commits a written extent alive once its checksum is verified.
+    pub fn physical_commit_extent(
+        &self,
+        extent_id: [u8; 16],
+        page_hash: mirage_types::PageHash,
+        checksum: [u8; 32],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::PhysicalCommitExtent(extent_id, page_hash, checksum, now_ns, reply)
+        })
+    }
+
+    pub fn physical_release_extent(
+        &self,
+        extent_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalReleaseExtent(extent_id, now_ns, reply))
+    }
+
+    /// Transitions an alive extent to dead; pinned extents are fenced off.
+    pub fn physical_mark_extent_dead(
+        &self,
+        extent_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalMarkExtentDead(extent_id, now_ns, reply))
+    }
+
+    /// Pins (+1) or unpins (-1) an alive extent against eviction.
+    pub fn physical_adjust_extent_pin(
+        &self,
+        extent_id: [u8; 16],
+        delta: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalAdjustExtentPin(extent_id, delta, reply))
+    }
+
+    /// Reaps expired reservations, returning their extents to dead.
+    pub fn physical_reap_reservations(&self, now_ns: i64) -> Result<u64, MirageError> {
+        self.request(|reply| Command::PhysicalReapReservations(now_ns, reply))
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {
