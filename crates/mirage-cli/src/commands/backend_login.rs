@@ -287,7 +287,18 @@ fn resolve_token_path(explicit: Option<&Path>) -> Result<PathBuf, MirageError> {
 
 #[cfg(windows)]
 fn open_browser(url: &Url) -> Result<(), MirageError> {
-    let status = std::process::Command::new("rundll32.exe")
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new("rundll32.exe");
+    // Setup owns its worker tree, but the user's browser must survive setup
+    // cancellation or completion. Only the setup job permits this breakaway.
+    if std::env::var_os("MIRAGE_SETUP_JOB").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        command.creation_flags(0x0100_0000); // CREATE_BREAKAWAY_FROM_JOB
+    }
+    let status = command
+        .env_remove("MIRAGE_SETUP_JOB")
+        .env_remove("MIRAGE_SETUP_START_EVENT")
+        .env_remove("MIRAGE_SETUP_PARENT")
+        .env_remove("MIRAGE_SETUP_PARENT_STARTED")
         .arg("url.dll,FileProtocolHandler")
         .arg(url.as_str())
         .status()

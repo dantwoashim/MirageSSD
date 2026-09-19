@@ -1,3 +1,85 @@
+function Get-OrphanedSetupProcesses([object[]]$Processes, [string]$TempRoot) {
+  $prefix = [IO.Path]::GetFullPath($TempRoot).TrimEnd('\') + '\'
+  foreach ($process in $Processes) {
+    if ($process.Name -ne 'powershell.exe' -or -not $process.CommandLine) { continue }
+    $match = [regex]::Match($process.CommandLine, '(?i)-File\s+"([^"\r\n]+\\setup-miragessd\.ps1)"')
+    if (-not $match.Success) { continue }
+    $script = [IO.Path]::GetFullPath($match.Groups[1].Value)
+    if (-not $script.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+    $relative = $script.Substring($prefix.Length)
+    if ($relative -notmatch '^MirageSSD-Setup-[a-fA-F0-9]{32}\\MirageSSD-OneClick-\d{8}-\d{6}\\setup-miragessd\.ps1$') { continue }
+    $parent = $Processes | Where-Object { $_.ProcessId -eq $process.ParentProcessId -and $_.CreationDate -le $process.CreationDate } | Select-Object -First 1
+    if (-not $parent) { $process }
+  }
+}
+
+function Stop-OrphanedSetup([string]$TempRoot = [IO.Path]::GetTempPath()) {
+  $snapshot = @(Get-CimInstance Win32_Process)
+  $orphans = @(Get-OrphanedSetupProcesses $snapshot $TempRoot)
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  foreach ($orphan in $orphans) {
+    $owner = Invoke-CimMethod -InputObject $orphan -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.Sid -ne $sid) { continue }
+    $children = @($snapshot | Where-Object { $_.ParentProcessId -eq $orphan.ProcessId -and $_.CreationDate -ge $orphan.CreationDate -and $_.Name -eq 'mirage.exe' })
+    # Recheck creation time to avoid terminating a process that reused the PID.
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($orphan.ProcessId)"
+    if (-not $current -or $current.CreationDate -ne $orphan.CreationDate) { continue }
+    Stop-Process -Id $orphan.ProcessId -Force -ErrorAction Stop
+    foreach ($child in $children) {
+      $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)"
+      if ($current -and $current.CreationDate -eq $child.CreationDate) { Stop-Process -Id $child.ProcessId -Force -ErrorAction Stop }
+    }
+  }
+}
+
+function Write-DeviceJson([string]$Path, $Value) {
+  $temporary = $Path + '.new-' + [Guid]::NewGuid().ToString('N')
+  try {
+    [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
+    else { [IO.File]::Move($temporary, $Path) }
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+  }
+}
+
+function Register-DeviceRecovery([string]$Root, [string]$Cache, [string]$Mount, [string]$Task, [string]$Source) {
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  foreach ($name in @('device-lifecycle.ps1', 'uninstall-device-drive.ps1', 'run-powershell-hidden.vbs')) {
+    $from = [IO.Path]::GetFullPath((Join-Path $Source $name))
+    $to = [IO.Path]::GetFullPath((Join-Path $Root $name))
+    if ($from -ne $to) { Copy-Item -LiteralPath $from -Destination $to -Force }
+  }
+  Write-DeviceJson (Join-Path $Root 'device-install.json') @{ format='miragessd-device-install-v1'; owner_sid=$sid; task_name=$Task; cache_directory=$Cache; drive_letter=$Mount }
+  $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MirageSSDWritableDevice'
+  $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $uninstall = Join-Path $Root 'uninstall-device-drive.ps1'
+  New-Item -Path $key -Force | Out-Null
+  $values = @{ DisplayName='MirageSSD'; DisplayVersion='0.1.4'; Publisher='MirageSSD'; InstallLocation=$Root; UninstallString=('"' + $shell + '" -NoProfile -ExecutionPolicy Bypass -File "' + $uninstall + '"') }
+  foreach ($entry in $values.GetEnumerator()) { New-ItemProperty -Path $key -Name $entry.Key -Value $entry.Value -PropertyType String -Force | Out-Null }
+}
+
+function Get-DeviceInstallRecord([string]$Root) {
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $path = Join-Path $Root 'device-install.json'
+  if (Test-Path -LiteralPath $path -PathType Leaf) {
+    $record = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if ($record.format -ne 'miragessd-device-install-v1' -or $record.owner_sid -ne $sid -or $record.task_name -ne "MirageSSD Drive $sid") { throw 'Invalid installation ownership.' }
+    return $record
+  }
+  # Older/aborted setup can have a launcher and binaries but no manifest.
+  # Recover only local path settings; never execute launcher text or read tokens.
+  $launcher = Join-Path $Root 'mount-device.vbs'
+  if (Test-Path -LiteralPath $launcher -PathType Leaf) {
+    $text = (Get-Content -LiteralPath $launcher -Raw).Replace('""', '"')
+    $cacheMatch = [regex]::Match($text, '--cache-dir "([A-Za-z]:\\[^"\r\n]+)"')
+    $driveMatch = [regex]::Match($text, '--drive-letter ([D-Z])\b')
+    if (-not $cacheMatch.Success -or -not $driveMatch.Success) { throw 'The interrupted installation has an unrecognized launcher. No files were removed.' }
+    return [pscustomobject]@{ format='miragessd-device-install-v1'; owner_sid=$sid; task_name="MirageSSD Drive $sid"; cache_directory=$cacheMatch.Groups[1].Value; drive_letter=($driveMatch.Groups[1].Value + ':\') }
+  }
+  return $null
+}
+
 function Invoke-MirageCommand([string]$Mirage, [string[]]$Arguments) {
   # Native stderr becomes a terminating error under a strict preference, so run
   # each CLI call with an isolated, continuing preference and drop its stream.
@@ -35,7 +117,7 @@ function Read-AccountState {
 
 function Write-AccountState([bool]$SignedIn, [string]$AccountId) {
   $record = @{ format = 'miragessd-account-state-v1'; signed_in = $SignedIn; account_id = $AccountId }
-  [IO.File]::WriteAllText($stateFile, ($record | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+  Write-DeviceJson $stateFile $record
 }
 
 function Test-PendingUploads([string]$CacheDirectory) {
@@ -51,11 +133,27 @@ function Test-PendingUploads([string]$CacheDirectory) {
   }
 }
 
+function Get-DeviceDriveTasks([string]$TaskName, [string]$InstallRoot) {
+  $primary = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  if ($primary) { $primary }
+  if ($TaskName -eq 'MirageSSD Drive') { return }
+  $legacy = Get-ScheduledTask -TaskName 'MirageSSD Drive' -ErrorAction SilentlyContinue
+  if ($legacy -and $legacy.TaskName -eq 'MirageSSD Drive') {
+    $launcher = '"' + (Join-Path $InstallRoot 'mount-device.vbs') + '"'
+    $matches = @($legacy.Actions | Where-Object { $_.Arguments -and $_.Arguments.IndexOf($launcher, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+    if ($matches.Count) {
+      $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+      $owner = [string]$legacy.Principal.UserId
+      if ($owner -notmatch '^S-1-') { $owner = ([Security.Principal.NTAccount]::new($owner)).Translate([Security.Principal.SecurityIdentifier]).Value }
+      if ($owner -eq $currentSid) { $legacy }
+    }
+  }
+}
+
 function Stop-DeviceDrive([string]$TaskName, [string]$InstallRoot) {
-  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  if ($task) { Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null }
-  if ($task -and $task.State -eq 'Running') {
-    Stop-ScheduledTask -TaskName $TaskName
+  foreach ($task in @(Get-DeviceDriveTasks $TaskName $InstallRoot)) {
+    Disable-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop | Out-Null
+    if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $task.TaskName }
   }
   $binaries = @((Join-Path $InstallRoot 'mirage.exe'), (Join-Path $InstallRoot 'rclone.exe'))
   Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -in $binaries } | ForEach-Object {

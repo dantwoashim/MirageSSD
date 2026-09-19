@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
@@ -15,9 +16,22 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("MirageSSD Setup")]
 [assembly: AssemblyDescription("MirageSSD Windows friend preview installer")]
 [assembly: AssemblyCompany("MirageSSD")]
-[assembly: AssemblyVersion("0.1.3.0")]
+[assembly: AssemblyVersion("0.1.4.0")]
 internal static class FriendSetup
 {
+    private static readonly object OperationGate = new object();
+    private static SetupProcessJob currentJob;
+    private static bool cancellationRequested;
+
+    internal static void BeginOperation() { lock (OperationGate) { cancellationRequested = false; } }
+    internal static void CancelOperation()
+    {
+        lock (OperationGate)
+        {
+            cancellationRequested = true;
+            if (currentJob != null) currentJob.Cancel();
+        }
+    }
     private static string LocalApplicationData
     {
         get { return Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); }
@@ -37,6 +51,24 @@ internal static class FriendSetup
         }
     }
 
+    internal static bool HasInstallationFiles
+    {
+        get { return File.Exists(Path.Combine(DeviceRoot, "mirage.exe")) || File.Exists(Path.Combine(DeviceRoot, "mount-device.vbs")) || (File.Exists(Path.Combine(DeviceRoot, "device-install.json")) && File.Exists(Path.Combine(DeviceRoot, "uninstall-device-drive.ps1"))); }
+    }
+
+    internal static bool NeedsRepair
+    {
+        get
+        {
+            if (!IsInstalled) return HasInstallationFiles;
+            string state = Path.Combine(DeviceRoot, "setup-state.json");
+            if (!File.Exists(Path.Combine(DeviceRoot, "uninstall-device-drive.ps1"))) return true;
+            if (!File.Exists(state)) return false;
+            try { return !Regex.IsMatch(File.ReadAllText(state), "\"state\"\\s*:\\s*\"ready\""); }
+            catch { return true; }
+        }
+    }
+
     internal static bool IsSignedIn
     {
         get
@@ -48,6 +80,24 @@ internal static class FriendSetup
     [STAThread]
     private static int Main(string[] args)
     {
+#if LIFECYCLE_TEST
+        if (args.Length == 3 && args[0] == "--test-cancel")
+        {
+            Task.Run(delegate
+            {
+                DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+                while (!File.Exists(args[2]) && DateTime.UtcNow < deadline) System.Threading.Thread.Sleep(50);
+                CancelOperation();
+            });
+            try { RunScript(Path.GetFullPath(args[1]), "", delegate(string line) { return null; }, delegate(string line) { }); return 1; }
+            catch (OperationCanceledException) { return 0; }
+        }
+        if (args.Length == 2 && args[0] == "--test-child")
+        {
+            RunScript(Path.GetFullPath(args[1]), "", delegate(string line) { return null; }, delegate(string line) { });
+            return 0;
+        }
+#endif
         if (args.Length == 2 && args[0] == "--verify-only")
         {
             try
@@ -144,10 +194,37 @@ internal static class FriendSetup
         }
     }
 
+    internal static void RunMaintenance(bool uninstall, Action<string> progress)
+    {
+        using (Staging staging = Staging.Extract())
+        {
+            RunScript(staging.Script("recover-device.ps1"), "-Quiet", delegate(string line) { return line; }, progress);
+            if (uninstall)
+                RunScript(staging.Script("uninstall-device-drive.ps1"), "-Quiet -NoConfirm -InstallRoot \"" + DeviceRoot + "\"", delegate(string line) { return line; }, progress);
+        }
+    }
+
     private static void RunScript(string scriptPath, string arguments, Func<string, string> outputMessage, Action<string> progress)
     {
+        string gateName = "Local\\MirageSSD-Setup-" + Guid.NewGuid().ToString("N");
         var start = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe"));
-        start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + scriptPath + "\" " + arguments;
+        // The child waits before executing any installer code. This lets us
+        // assign its entire process tree to the job without a startup race.
+        string command = "$ErrorActionPreference='Stop'; $parent=Get-Process -Id $env:MIRAGE_SETUP_PARENT; "
+            + "if ($parent.StartTime.ToUniversalTime().Ticks -ne [long]$env:MIRAGE_SETUP_PARENT_STARTED) { exit 1 }; "
+            + "$gate=[Threading.EventWaitHandle]::OpenExisting($env:MIRAGE_SETUP_START_EVENT); "
+            + "try { while (-not $gate.WaitOne(200)) { if ($parent.HasExited) { exit 1 } } } finally { $gate.Dispose() }; "
+            + "$ErrorActionPreference='Stop'; try { & '" + scriptPath.Replace("'", "''") + "' " + arguments
+            + "; if (-not $?) { exit 1 }; exit 0 } catch { Write-Error $_; exit 1 }";
+        start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+            + Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
+        start.EnvironmentVariables["MIRAGE_SETUP_START_EVENT"] = gateName;
+        start.EnvironmentVariables["MIRAGE_SETUP_JOB"] = "1";
+        using (var parent = Process.GetCurrentProcess())
+        {
+            start.EnvironmentVariables["MIRAGE_SETUP_PARENT"] = parent.Id.ToString();
+            start.EnvironmentVariables["MIRAGE_SETUP_PARENT_STARTED"] = parent.StartTime.ToUniversalTime().Ticks.ToString();
+        }
         start.WorkingDirectory = Path.GetDirectoryName(scriptPath);
         // Do not inherit another host's module paths into Windows PowerShell 5.1.
         start.EnvironmentVariables["PSModulePath"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\Modules");
@@ -158,8 +235,15 @@ internal static class FriendSetup
         start.RedirectStandardError = true;
         var output = new StringBuilder();
         var errors = new StringBuilder();
+        using (var gate = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.ManualReset, gateName))
+        using (var job = new SetupProcessJob())
         using (var process = new Process())
         {
+            lock (OperationGate)
+            {
+                if (cancellationRequested) throw new OperationCanceledException("Setup cancelled. You can retry or uninstall.");
+                currentJob = job;
+            }
             process.StartInfo = start;
             process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs item)
             {
@@ -173,15 +257,94 @@ internal static class FriendSetup
                 if (item.Data != null) lock (errors) { if (errors.Length < 12000) errors.AppendLine(item.Data); }
             };
             process.Start();
+            try { job.Add(process); }
+            catch { try { process.Kill(); } catch { } throw; }
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
+            lock (OperationGate)
+            {
+                if (cancellationRequested) job.Cancel();
+                else gate.Set();
+            }
             process.WaitForExit();
+            lock (OperationGate) { if (cancellationRequested) throw new OperationCanceledException("Setup cancelled. You can retry or uninstall."); }
             if (process.ExitCode != 0)
             {
                 string detail = errors.ToString().Trim();
                 if (String.IsNullOrEmpty(detail)) detail = output.ToString().Trim();
                 if (detail.Length > 3500) detail = detail.Substring(detail.Length - 3500);
                 throw new InvalidOperationException("MirageSSD could not finish. Your existing files were not deleted.\r\n\r\n" + detail);
+            }
+        }
+    }
+
+    // Windows releases the job handle even if Task Manager terminates setup.
+    // Its PowerShell and CLI children cannot outlive it and retain a mutex or
+    // a working-directory handle. Scheduled tasks are launched independently.
+    private sealed class SetupProcessJob : IDisposable
+    {
+        private IntPtr handle;
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BasicLimits
+        {
+            public long ProcessTime, JobTime;
+            public uint Flags;
+            public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters { public ulong ReadOperations, WriteOperations, OtherOperations, ReadBytes, WriteBytes, OtherBytes; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ExtendedLimits
+        {
+            public BasicLimits Basic;
+            public IoCounters Io;
+            public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimits info, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr value);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        internal SetupProcessJob()
+        {
+            handle = CreateJobObject(IntPtr.Zero, null);
+            if (handle == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+            var limits = new ExtendedLimits();
+            // Only explicitly marked launches (the user's browser) may escape.
+            limits.Basic.Flags = 0x2000 | 0x0800; // KILL_ON_JOB_CLOSE | BREAKAWAY_OK
+            if (!SetInformationJobObject(handle, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits))))
+            {
+                int error = Marshal.GetLastWin32Error();
+                Dispose();
+                throw new System.ComponentModel.Win32Exception(error);
+            }
+        }
+        internal void Add(Process process)
+        {
+            if (!AssignProcessToJobObject(handle, process.Handle)) throw new System.ComponentModel.Win32Exception();
+        }
+        internal void Cancel()
+        {
+            if (handle != IntPtr.Zero && !TerminateJobObject(handle, 1223)) throw new System.ComponentModel.Win32Exception();
+        }
+        public void Dispose()
+        {
+            lock (OperationGate)
+            {
+                if (Object.ReferenceEquals(currentJob, this)) currentJob = null;
+                if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
             }
         }
     }
@@ -266,6 +429,8 @@ internal sealed class SetupWindow : Form
     private readonly Button primary;
     private readonly Button secondary;
     private readonly Button reinstall;
+    private readonly Button uninstall;
+    private readonly Button recover;
     private readonly ProgressBar progress;
     private bool busy;
     private bool finished;
@@ -275,7 +440,7 @@ internal sealed class SetupWindow : Form
     internal SetupWindow()
     {
         Text = "MirageSSD Setup";
-        ClientSize = new Size(600, 410);
+        ClientSize = new Size(600, 460);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -299,11 +464,26 @@ internal sealed class SetupWindow : Form
         Controls.Add(primary);
         FormClosing += delegate(object sender, FormClosingEventArgs args)
         {
-            if (busy) { args.Cancel = true; MessageBox.Show(this, "MirageSSD is still working. Complete or cancel the Google sign-in in your browser, then wait for it to finish.", "MirageSSD"); }
+            if (busy)
+            {
+                args.Cancel = true;
+                if (MessageBox.Show(this, "Cancel the current operation? You can repair or uninstall afterward. Cached files will be kept.", "MirageSSD", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    FriendSetup.CancelOperation();
+            }
         };
         reinstall = new Button { Text = "Update / reinstall", Left = 34, Top = 358, Width = 200, Height = 32 };
         reinstall.Click += async delegate { await RunInstall(); };
         Controls.Add(reinstall);
+        uninstall = new Button { Text = "Uninstall", Left = 246, Top = 358, Width = 320, Height = 32 };
+        uninstall.Click += async delegate { await RunMaintenance(true); };
+        Controls.Add(uninstall);
+        recover = new Button { Text = "Recover interrupted setup", Left = 34, Top = 404, Width = 532, Height = 32 };
+        recover.Click += async delegate
+        {
+            if (busy) FriendSetup.CancelOperation();
+            else await RunMaintenance(false);
+        };
+        Controls.Add(recover);
         RefreshState();
     }
 
@@ -312,7 +492,15 @@ internal sealed class SetupWindow : Form
         installed = FriendSetup.IsInstalled;
         signedIn = installed && FriendSetup.IsSignedIn;
         reinstall.Visible = installed;
-        if (!installed)
+        uninstall.Visible = FriendSetup.HasInstallationFiles;
+        if (FriendSetup.NeedsRepair)
+        {
+            status.Text = "An incomplete installation was found. Repair it, or uninstall while keeping cached files and sign-in details.";
+            primary.Text = "Repair installation";
+            primary.Visible = true;
+            secondary.Visible = false;
+        }
+        else if (!installed)
         {
             status.Text = "Friend preview: cloud files need internet; cached writes upload in the background. Keep originals until verified.";
             primary.Text = "Install and connect Google Drive";
@@ -355,17 +543,21 @@ internal sealed class SetupWindow : Form
 
     private void SetWorking(bool working)
     {
+        if (working) FriendSetup.BeginOperation();
         busy = working;
         primary.Enabled = !working;
         secondary.Enabled = !working;
         reinstall.Enabled = !working;
+        uninstall.Enabled = !working;
+        recover.Enabled = true;
+        recover.Text = working ? "Cancel operation" : "Recover interrupted setup";
         progress.Visible = working;
     }
 
     private async void PrimaryClicked(object sender, EventArgs args)
     {
         if (finished) { Close(); return; }
-        if (!installed)
+        if (!installed || FriendSetup.NeedsRepair)
         {
             await RunInstall();
         }
@@ -405,10 +597,29 @@ internal sealed class SetupWindow : Form
         }
         catch (Exception error)
         {
+            RefreshState();
             status.Text = "Setup needs attention. Check the message, then retry. If Google blocks access, ask the developer to add your Google email as a test user.";
             MessageBox.Show(this, error.Message, "MirageSSD setup", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             primary.Text = "Retry setup";
         }
+        finally { SetWorking(false); }
+    }
+
+    private async Task RunMaintenance(bool remove)
+    {
+        string question = remove
+            ? "Close files using MirageSSD. Uninstall the app and disconnect its drive? Cached files, cloud files and sign-in details are kept."
+            : "Close other MirageSSD setup windows first. Recover an interrupted setup? Cached files and sign-in details are kept.";
+        if (MessageBox.Show(this, question, "MirageSSD", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        SetWorking(true);
+        try
+        {
+            await Task.Run(delegate { FriendSetup.RunMaintenance(remove, UpdateStatus); });
+            finished = false;
+            RefreshState();
+            status.Text = remove ? "MirageSSD was uninstalled. Cached files and sign-in details were kept." : "Recovery finished. You can retry installation or uninstall.";
+        }
+        catch (Exception error) { MessageBox.Show(this, error.Message, "MirageSSD", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         finally { SetWorking(false); }
     }
 

@@ -78,6 +78,10 @@ jobs:
         run: |
           ./scripts/test-device-lifecycle.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-setup-interruption.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-setup-recovery.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/test-device-prefetch.ps1
           ./scripts/test-capability-inventory.ps1
 

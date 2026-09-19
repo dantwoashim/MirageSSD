@@ -65,10 +65,9 @@ $operationHeld = $false
 try {
 try { $operationHeld = $operation.WaitOne(0) } catch [Threading.AbandonedMutexException] { $operationHeld = $true }
 if (-not $operationHeld) { throw 'Another MirageSSD setup or account operation is running.' }
-$previous = $null
+$previous = Get-DeviceInstallRecord $installRoot
 $configurationPath = Join-Path $installRoot 'device-install.json'
-if (Test-Path -LiteralPath $configurationPath -PathType Leaf) {
-  $previous = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+if ($previous) {
   if ($previous.format -ne 'miragessd-device-install-v1' -or $previous.owner_sid -ne $sid -or $previous.task_name -ne "MirageSSD Drive $sid") { throw 'Invalid existing installation owner.' }
   $cachePath = [IO.Path]::GetFullPath([string]$previous.cache_directory)
   $mount = [string]$previous.drive_letter
@@ -88,14 +87,22 @@ if (Test-Path -LiteralPath $mount) { throw 'The previous drive has not disconnec
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
-Copy-Item -LiteralPath $mirageSource -Destination $installedMirage -Force
-Copy-Item -LiteralPath $rcloneSource -Destination $installedRclone -Force
 
 foreach ($path in @($installRoot, $logRoot, $cachePath)) {
   & icacls.exe $path /inheritance:r /grant:r "*$($sid):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to secure $path."
   }
+}
+
+Register-DeviceRecovery $installRoot $cachePath $mount "MirageSSD Drive $sid" $PSScriptRoot
+Write-DeviceJson (Join-Path $installRoot 'setup-state.json') @{ state='installing'; version='0.1.4' }
+foreach ($binary in @(@($mirageSource, $installedMirage), @($rcloneSource, $installedRclone))) {
+  if ([IO.Path]::GetFullPath($binary[0]) -eq [IO.Path]::GetFullPath($binary[1])) { continue }
+  $stagedBinary = $binary[1] + '.install-new'
+  Copy-Item -LiteralPath $binary[0] -Destination $stagedBinary -Force
+  if (Test-Path -LiteralPath $binary[1]) { [IO.File]::Replace($stagedBinary, $binary[1], [NullString]::Value) }
+  else { [IO.File]::Move($stagedBinary, $binary[1]) }
 }
 
 $tokenStore = Join-Path $env:LOCALAPPDATA 'MirageSSD\credentials\drive-token.json'
@@ -195,16 +202,6 @@ New-Item -Path $runKey -Force | Out-Null
 $startupCommand = (Quote-TaskArgument (Join-Path $env:SystemRoot 'System32\schtasks.exe')) + ' /Run /TN ' + (Quote-TaskArgument $taskName)
 New-ItemProperty -Path $runKey -Name 'MirageSSDWritableDevice' -PropertyType String -Value $startupCommand -Force | Out-Null
 
-Start-ScheduledTask -TaskName $taskName
-
-$deadline = [DateTime]::UtcNow.AddSeconds(55)
-while (-not (Test-Path -LiteralPath $mount) -and [DateTime]::UtcNow -lt $deadline) {
-  Start-Sleep -Milliseconds 250
-}
-if (-not (Test-Path -LiteralPath $mount)) {
-  throw 'The persistent MirageSSD task was installed but the drive did not become ready.'
-}
-
 $driveRecord = Join-Path $installRoot 'drive-letter.txt'
 [IO.File]::WriteAllText($driveRecord, $mount, [Text.UTF8Encoding]::new($false))
 & icacls.exe $driveRecord /inheritance:r /grant:r "*$($sid):F" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
@@ -252,7 +249,7 @@ $configuration = @{format='miragessd-device-install-v1';task_name=$taskName;cach
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MirageSSDWritableDevice'
 New-Item -Path $uninstallKey -Force | Out-Null
 $uninstallCommand = (Quote-TaskArgument $wscript) + ' //B //NoLogo ' + (Quote-TaskArgument $hiddenRunner) + ' ' + (Quote-TaskArgument $uninstallScript)
-$uninstallProperties = @{DisplayName='MirageSSD (Friend Preview)';DisplayVersion='0.1.0';Publisher='MirageSSD';InstallLocation=$installRoot;UninstallString=$uninstallCommand}
+$uninstallProperties = @{DisplayName='MirageSSD';DisplayVersion='0.1.4';Publisher='MirageSSD';InstallLocation=$installRoot;UninstallString=$uninstallCommand}
 $uninstallProperties.GetEnumerator() | ForEach-Object {
   New-ItemProperty -Path $uninstallKey -Name $_.Key -Value $_.Value -PropertyType String -Force | Out-Null
 }
@@ -284,6 +281,17 @@ if ($programs -and (Test-Path -LiteralPath $accountScript -PathType Leaf)) {
   $shortcut.Save()
 }
 
+Start-ScheduledTask -TaskName $taskName
+
+$deadline = [DateTime]::UtcNow.AddSeconds(55)
+while (-not (Test-Path -LiteralPath $mount) -and [DateTime]::UtcNow -lt $deadline) {
+  Start-Sleep -Milliseconds 250
+}
+if (-not (Test-Path -LiteralPath $mount)) {
+  throw 'The persistent MirageSSD task was installed but the drive did not become ready.'
+}
+
+Write-DeviceJson (Join-Path $installRoot 'setup-state.json') @{ state='ready'; version='0.1.4' }
 [pscustomobject]@{
   Installed = $true
   PersistentAtLogon = $true

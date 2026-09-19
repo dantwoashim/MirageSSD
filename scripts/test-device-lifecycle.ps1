@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
-$root = Join-Path ([IO.Path]::GetTempPath()) ('mirage-lifecycle-' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $root | Out-Null
+$root = if ($env:MIRAGE_TEST_FIXTURE_ROOT) { $env:MIRAGE_TEST_FIXTURE_ROOT } else { Join-Path ([IO.Path]::GetTempPath()) ('mirage-lifecycle-' + [Guid]::NewGuid().ToString('N')) }
+New-Item -ItemType Directory -Path $root -Force | Out-Null
 $originalLocal = $env:LOCALAPPDATA
 $env:LOCALAPPDATA = Join-Path $root 'local'
-$fixture = @{ Mounted = $false; Task = $null; Registry = @{}; Cases = 0 }
+$fixture = @{ Root = $root; Mounted = $false; Task = $null; Registry = @{}; Cases = 0 }
 function Assert-True([bool]$Value, [string]$Message) { if (-not $Value) { throw $Message } }
 function Assert-Rejected([scriptblock]$Body) {
   $rejected = $false
@@ -50,7 +50,7 @@ function New-Item {
   if ([string]$Path -like 'HKCU:*') { return }
   Microsoft.PowerShell.Management\New-Item -Path $Path -ItemType $ItemType -Force:$Force
 }
-function New-ItemProperty { param($Path, $Name, $PropertyType, $Value, [switch]$Force) $fixture.Registry[$Name] = $Value }
+function New-ItemProperty { param($Path, $Name, $PropertyType, $Value, [switch]$Force) $fixture.Registry[$Name] = $Value; $fixture.Registry | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $fixture.Root 'registry.json') }
 function New-Object {
   param($ComObject)
   if ($ComObject -ne 'WScript.Shell') { throw 'Unexpected COM access.' }
@@ -75,7 +75,14 @@ class FakeMirage {
     string token = Path.Combine(root, "drive-token.json");
     int index = Array.IndexOf(args, "--token-store");
     if (index >= 0) token = args[index + 1];
-    if (Array.IndexOf(args, "login") >= 0) File.WriteAllText(token, Environment.GetEnvironmentVariable("MIRAGE_TEST_ACCOUNT") ?? "account-a");
+    if (Array.IndexOf(args, "login") >= 0) {
+      string marker = Environment.GetEnvironmentVariable("MIRAGE_TEST_PAUSE_LOGIN");
+      if (!String.IsNullOrEmpty(marker)) {
+        File.WriteAllText(marker, System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+        System.Threading.Thread.Sleep(600000);
+      }
+      File.WriteAllText(token, Environment.GetEnvironmentVariable("MIRAGE_TEST_ACCOUNT") ?? "account-a");
+    }
     if (Array.IndexOf(args, "logout") >= 0) { File.Delete(token); Console.WriteLine("{\"ok\":true}"); return 0; }
     if (Array.IndexOf(args, "authorize-device") >= 0 && Environment.GetEnvironmentVariable("MIRAGE_TEST_AUTH_FAIL") == "1") return 1;
     bool authenticated = File.Exists(token);
@@ -142,6 +149,20 @@ class FakeMirage {
   $result = & (Join-Path $PSScriptRoot 'install-device-drive.ps1') @parameters
   Assert-True (($result -join "`n" | ConvertFrom-Json).Installed) 'Reinstall after uninstall failed.'
   Assert-True ((Get-Content -LiteralPath $token -Raw) -eq 'account-b') 'Reinstall changed the account.'
+  $fixture.Cases++
+  # An open executable must fail safely without hiding the uninstall entry.
+  $locked = [IO.File]::Open($installedBinary, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  try {
+    & (Join-Path $PSScriptRoot 'uninstall-device-drive.ps1') -InstallRoot $device -Quiet -NoConfirm | Out-Null
+    Assert-True ($LASTEXITCODE -eq 1) 'Locked executable did not block uninstall.'
+    Assert-True ($fixture.Registry.DisplayName -eq 'MirageSSD') 'Failed uninstall removed its Settings entry.'
+  } finally { $locked.Dispose() }
+  $fixture.Cases++
+  # The old installer did not write a manifest until mounting succeeded.
+  Remove-Item -LiteralPath (Join-Path $device 'device-install.json')
+  & (Join-Path $PSScriptRoot 'uninstall-device-drive.ps1') -InstallRoot $device -Quiet -NoConfirm | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $installedBinary)) 'Legacy manifest-free uninstall failed.'
+  Assert-True (Test-Path -LiteralPath $token) 'Legacy recovery removed credentials.'
   $fixture.Cases++
   Assert-Rejected { Clear-VfsCache 'D:\' }
   Assert-Rejected { Clear-VfsCache 'D:\fixture\..' }
