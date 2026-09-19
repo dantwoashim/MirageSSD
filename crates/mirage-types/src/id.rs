@@ -94,15 +94,15 @@ macro_rules! define_id128_type {
             }
 
             /// Parses a 32-character lowercase canonical hex string.
-            pub fn from_canonical_hex(s: &str) -> Result<Self, crate::error::MirageError> {
-                crate::id::parse_canonical_hex_16(s).map(Self)
+            pub fn from_canonical_hex(s: &str) -> Result<Self, $crate::error::MirageError> {
+                $crate::id::parse_canonical_hex_16(s).map(Self)
             }
 
             /// Performs constant-time comparison with another identifier.
             #[inline]
             #[must_use]
             pub fn constant_time_eq(&self, other: &Self) -> bool {
-                crate::id::constant_time_eq_16(&self.0, &other.0)
+                $crate::id::constant_time_eq_16(&self.0, &other.0)
             }
         }
 
@@ -142,20 +142,20 @@ macro_rules! define_id128_type {
                     f,
                     "{}({})",
                     stringify!($name),
-                    crate::id::encode_canonical_hex_16(&self.0)
+                    $crate::id::encode_canonical_hex_16(&self.0)
                 )
             }
         }
 
         impl core::fmt::Display for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                write!(f, "{}", crate::id::encode_canonical_hex_16(&self.0))
+                write!(f, "{}", $crate::id::encode_canonical_hex_16(&self.0))
             }
         }
 
         impl core::fmt::LowerHex for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                write!(f, "{}", crate::id::encode_canonical_hex_16(&self.0))
+                write!(f, "{}", $crate::id::encode_canonical_hex_16(&self.0))
             }
         }
 
@@ -187,7 +187,10 @@ macro_rules! define_id128_type {
             where
                 S: serde::Serializer,
             {
-                serde::Serializer::serialize_str(serializer, &crate::id::encode_canonical_hex_16(&self.0))
+                serde::Serializer::serialize_str(
+                    serializer,
+                    &$crate::id::encode_canonical_hex_16(&self.0),
+                )
             }
         }
 

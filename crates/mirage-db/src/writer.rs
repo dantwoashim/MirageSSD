@@ -12,7 +12,6 @@ use crate::cache::{
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
 use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
-use mirage_types::{InodeId, RepositoryId};
 use crate::pin::{self, PersistentPinReason};
 use crate::remote_object::{
     self, BackendAccount, RemoteObjectRecord, UploadAdvance, UploadSession,
@@ -24,6 +23,7 @@ use crate::session::{
 };
 use crate::space_lease::{self, NewSpaceLease, SpaceLeaseState, SpaceLeaseTransition};
 use crate::update::{self, NativeSnapshot, NewUpdateJournal, OverlayPage, UpdateTransition};
+use mirage_types::{DeviceId, InodeId, RepositoryId};
 
 const COMMAND_CAPACITY: usize = 64;
 type Reply<T> = SyncSender<Result<T, MirageError>>;
@@ -77,7 +77,7 @@ enum Command {
         i64,
         Reply<()>,
     ),
-    NamespaceDelete(RepositoryId, InodeId, String, Reply<()>),
+    NamespaceDelete(RepositoryId, InodeId, String, i64, Reply<()>),
     NamespaceSetFileRoots(
         RepositoryId,
         InodeId,
@@ -89,6 +89,8 @@ enum Command {
     ),
     NamespaceRecordLegacy(RepositoryId, String, InodeId, Reply<()>),
     NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
+    NamespaceCheckpoint(RepositoryId, i64, Reply<(u64, [u8; 32])>),
+    EnsureDeviceIdentity(i64, Reply<DeviceId>),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -265,10 +267,16 @@ impl DbWriter {
                                 ),
                             );
                         }
-                        Command::NamespaceDelete(volume_id, parent, name, reply) => {
+                        Command::NamespaceDelete(volume_id, parent, name, now_ns, reply) => {
                             respond(
                                 reply,
-                                namespace::delete_node(&mut connection, volume_id, parent, &name),
+                                namespace::delete_node(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    now_ns,
+                                ),
                             );
                         }
                         Command::NamespaceSetFileRoots(
@@ -298,6 +306,15 @@ impl DbWriter {
                                 reply,
                                 namespace::record_legacy(&mut connection, volume_id, &path, inode),
                             );
+                        }
+                        Command::NamespaceCheckpoint(volume_id, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_checkpoint(&mut connection, volume_id, now_ns),
+                            );
+                        }
+                        Command::EnsureDeviceIdentity(now_ns, reply) => {
+                            respond(reply, namespace::ensure_device_id(&mut connection, now_ns));
                         }
                         Command::NamespaceSeed(volume_id, nodes, now_ns, reply) => {
                             respond(
@@ -535,9 +552,10 @@ impl DbWriter {
         volume_id: RepositoryId,
         parent: InodeId,
         name: &str,
+        now_ns: i64,
     ) -> Result<(), MirageError> {
         let name = name.to_owned();
-        self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, reply))
+        self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, now_ns, reply))
     }
 
     pub fn namespace_set_file_roots(
@@ -581,6 +599,22 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<usize, MirageError> {
         self.request(|reply| Command::NamespaceSeed(volume_id, nodes, now_ns, reply))
+    }
+
+    /// Snapshots the live namespace into an immutable checkpoint document;
+    /// returns the new checkpoint sequence and its content hash.
+    pub fn namespace_checkpoint(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<(u64, [u8; 32]), MirageError> {
+        self.request(|reply| Command::NamespaceCheckpoint(volume_id, now_ns, reply))
+    }
+
+    /// Returns this installation's durable device identity, minting it on
+    /// first use.
+    pub fn ensure_device_id(&self, now_ns: i64) -> Result<DeviceId, MirageError> {
+        self.request(|reply| Command::EnsureDeviceIdentity(now_ns, reply))
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {

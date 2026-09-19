@@ -22,7 +22,19 @@ pub struct PublishedGeneration {
 
 /// Refuses to start a publishing transaction against an origin that does not
 /// advertise archive mutation, before any object is uploaded.
-pub fn require_publish_capability(backend: &dyn ObjectBackend) -> Result<(), MirageError> {
+pub fn now_utc_ns() -> Result<i128, MirageError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            MirageError::internal_invariant("system clock predates Unix epoch").with_source(error)
+        })?;
+    i128::try_from(duration.as_nanos())
+        .map_err(|_| MirageError::internal_invariant("current timestamp overflows commit field"))
+}
+
+pub(crate) fn require_publish_capability(
+    backend: &dyn ObjectBackend,
+) -> Result<(), MirageError> {
     if backend.capabilities().can_publish() {
         Ok(())
     } else {
@@ -102,8 +114,8 @@ pub async fn publish_base_generation(
                 .map(|object| object.content_hash)
                 .collect(),
         ),
-        created_utc_ns: 0,
-        writer_device_id: DeviceId::from_bytes([0; 16]),
+        created_utc_ns: now_utc_ns()?,
+        writer_device_id: DeviceId::from_bytes(signer.key_id()),
         update_journal_id: None,
     };
     let commit_body = sign_commit(body, signer)?;
@@ -199,8 +211,8 @@ pub async fn publish_successor_generation(
                 .map(|object| object.content_hash)
                 .collect(),
         ),
-        created_utc_ns: 0,
-        writer_device_id: DeviceId::from_bytes([0; 16]),
+        created_utc_ns: now_utc_ns()?,
+        writer_device_id: DeviceId::from_bytes(signer.key_id()),
         update_journal_id: Some(update_id),
     };
     let commit_body = sign_commit(body, signer)?;

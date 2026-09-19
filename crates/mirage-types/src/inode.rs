@@ -34,8 +34,8 @@ pub const MAX_NAME_UNITS: usize = 255;
 
 const RESERVED_STEMS: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
-    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-    "LPT7", "LPT8", "LPT9",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+    "LPT8", "LPT9",
 ];
 
 /// Validates one display name under the v1 Windows naming policy and returns
@@ -56,7 +56,11 @@ pub fn fold_name(display_name: &str) -> Result<String, MirageError> {
         ));
     }
     for character in display_name.chars() {
-        if character.is_control() || matches!(character, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        if character.is_control()
+            || matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            )
         {
             return Err(MirageError::invalid_argument(
                 "name contains a character that is invalid on Windows",
@@ -73,8 +77,5 @@ pub fn fold_name(display_name: &str) -> Result<String, MirageError> {
             "name uses a reserved Windows device name",
         ));
     }
-    Ok(display_name
-        .chars()
-        .flat_map(char::to_uppercase)
-        .collect())
+    Ok(display_name.chars().flat_map(char::to_uppercase).collect())
 }

@@ -68,6 +68,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0011_namespace.sql",
         sql: include_str!("../../../migrations/0011_namespace.sql"),
     },
+    Migration {
+        version: 12,
+        name: "0012_namespace_history.sql",
+        sql: include_str!("../../../migrations/0012_namespace_history.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

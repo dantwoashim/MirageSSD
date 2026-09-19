@@ -1157,7 +1157,9 @@ name = "mirage-db"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "getrandom 0.3.4",
  "mirage-backend",
+ "mirage-manifest",
  "mirage-types",
  "rusqlite",
  "serde",

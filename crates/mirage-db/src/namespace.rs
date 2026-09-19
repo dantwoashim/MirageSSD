@@ -56,9 +56,9 @@ pub struct DirEntry {
 }
 
 fn decode_inode(bytes: &[u8]) -> Result<InodeId, MirageError> {
-    let array: [u8; 16] = bytes.try_into().map_err(|_| {
-        MirageError::integrity_mismatch("namespace inode has invalid length")
-    })?;
+    let array: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| MirageError::integrity_mismatch("namespace inode has invalid length"))?;
     Ok(InodeId::from_bytes(array))
 }
 
@@ -98,7 +98,11 @@ pub fn create_volume(
         .execute(
             "INSERT INTO inodes(volume_id, inode, kind, size, created_ns, modified_ns)
              VALUES (?1, ?2, 'directory', 0, ?3, ?3)",
-            params![volume_id.as_bytes().as_slice(), root.as_bytes().as_slice(), now_ns],
+            params![
+                volume_id.as_bytes().as_slice(),
+                root.as_bytes().as_slice(),
+                now_ns
+            ],
         )
         .map_err(|e| sqlite(e, "failed to seed namespace root"))?;
     transaction
@@ -144,9 +148,8 @@ pub fn lookup(
                 display_name,
                 folded_name,
                 kind: NamespaceNodeKind::parse(&kind)?,
-                size: u64::try_from(size).map_err(|_| {
-                    MirageError::integrity_mismatch("namespace size is negative")
-                })?,
+                size: u64::try_from(size)
+                    .map_err(|_| MirageError::integrity_mismatch("namespace size is negative"))?,
             })
         })
         .transpose()
@@ -177,19 +180,21 @@ pub fn stat(
         )
         .optional()
         .map_err(|e| sqlite(e, "namespace stat failed"))?
-        .map(|(inode, kind, size, version_root, extent_root, created_ns, modified_ns)| {
-            Ok(NamespaceStat {
-                inode: decode_inode(&inode)?,
-                kind: NamespaceNodeKind::parse(&kind)?,
-                size: u64::try_from(size).map_err(|_| {
-                    MirageError::integrity_mismatch("namespace size is negative")
-                })?,
-                version_root: decode_blob32(version_root)?,
-                extent_root: decode_blob32(extent_root)?,
-                created_ns,
-                modified_ns,
-            })
-        })
+        .map(
+            |(inode, kind, size, version_root, extent_root, created_ns, modified_ns)| {
+                Ok(NamespaceStat {
+                    inode: decode_inode(&inode)?,
+                    kind: NamespaceNodeKind::parse(&kind)?,
+                    size: u64::try_from(size).map_err(|_| {
+                        MirageError::integrity_mismatch("namespace size is negative")
+                    })?,
+                    version_root: decode_blob32(version_root)?,
+                    extent_root: decode_blob32(extent_root)?,
+                    created_ns,
+                    modified_ns,
+                })
+            },
+        )
         .transpose()
 }
 
@@ -247,9 +252,8 @@ pub fn list_children(
             display_name,
             folded_name,
             kind: NamespaceNodeKind::parse(&kind)?,
-            size: u64::try_from(size).map_err(|_| {
-                MirageError::integrity_mismatch("namespace size is negative")
-            })?,
+            size: u64::try_from(size)
+                .map_err(|_| MirageError::integrity_mismatch("namespace size is negative"))?,
         });
     }
     Ok(entries)
@@ -340,9 +344,8 @@ pub fn create_node(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace create"))?;
-    let parent_stat = stat(&transaction, volume_id, parent)?.ok_or_else(|| {
-        MirageError::invalid_argument("namespace parent inode is missing")
-    })?;
+    let parent_stat = stat(&transaction, volume_id, parent)?
+        .ok_or_else(|| MirageError::invalid_argument("namespace parent inode is missing"))?;
     if parent_stat.kind != NamespaceNodeKind::Directory {
         return Err(MirageError::invalid_argument(
             "namespace parent is not a directory",
@@ -379,6 +382,19 @@ pub fn create_node(
             "namespace entry already exists",
         ));
     }
+    record_delta(
+        &transaction,
+        volume_id,
+        mirage_manifest::namespace::NamespaceOp::Create {
+            parent,
+            inode,
+            display_name: display_name.to_owned(),
+            folded_name: folded.clone(),
+            directory: kind == NamespaceNodeKind::Directory,
+            size: 0,
+        },
+        now_ns,
+    )?;
     transaction
         .commit()
         .map_err(|e| sqlite(e, "namespace create commit failed"))?;
@@ -410,8 +426,9 @@ pub fn rename(
         .map_err(|e| sqlite(e, "failed to begin namespace rename"))?;
     let entry = lookup(&transaction, volume_id, from_parent, from_name)?
         .ok_or_else(|| MirageError::invalid_argument("namespace rename source is missing"))?;
-    let to_stat = stat(&transaction, volume_id, to_parent)?
-        .ok_or_else(|| MirageError::invalid_argument("namespace rename target parent is missing"))?;
+    let to_stat = stat(&transaction, volume_id, to_parent)?.ok_or_else(|| {
+        MirageError::invalid_argument("namespace rename target parent is missing")
+    })?;
     if to_stat.kind != NamespaceNodeKind::Directory {
         return Err(MirageError::invalid_argument(
             "namespace rename target parent is not a directory",
@@ -431,7 +448,10 @@ pub fn rename(
                 .query_row(
                     "SELECT parent_inode FROM dirents
                      WHERE volume_id = ?1 AND child_inode = ?2",
-                    params![volume_id.as_bytes().as_slice(), ancestor.as_bytes().as_slice()],
+                    params![
+                        volume_id.as_bytes().as_slice(),
+                        ancestor.as_bytes().as_slice()
+                    ],
                     |row| row.get(0),
                 )
                 .optional()
@@ -478,9 +498,22 @@ pub fn rename(
         transaction
             .execute(
                 "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2",
-                params![volume_id.as_bytes().as_slice(), victim.inode.as_bytes().as_slice()],
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    victim.inode.as_bytes().as_slice()
+                ],
             )
             .map_err(|e| sqlite(e, "namespace victim inode removal failed"))?;
+        record_delta(
+            &transaction,
+            volume_id,
+            mirage_manifest::namespace::NamespaceOp::Delete {
+                parent: to_parent,
+                folded_name: victim.folded_name.clone(),
+                inode: victim.inode,
+            },
+            now_ns,
+        )?;
     }
     let moved = transaction
         .execute(
@@ -504,9 +537,26 @@ pub fn rename(
     transaction
         .execute(
             "UPDATE inodes SET modified_ns = ?1 WHERE volume_id = ?2 AND inode = ?3",
-            params![now_ns, volume_id.as_bytes().as_slice(), entry.inode.as_bytes().as_slice()],
+            params![
+                now_ns,
+                volume_id.as_bytes().as_slice(),
+                entry.inode.as_bytes().as_slice()
+            ],
         )
         .map_err(|e| sqlite(e, "namespace rename inode touch failed"))?;
+    record_delta(
+        &transaction,
+        volume_id,
+        mirage_manifest::namespace::NamespaceOp::Rename {
+            inode: entry.inode,
+            from_parent,
+            from_folded,
+            to_parent,
+            display_name: to_name.to_owned(),
+            folded_name: to_folded,
+        },
+        now_ns,
+    )?;
     transaction
         .commit()
         .map_err(|e| sqlite(e, "namespace rename commit failed"))
@@ -519,6 +569,7 @@ pub fn delete_node(
     volume_id: RepositoryId,
     parent: InodeId,
     name: &str,
+    now_ns: i64,
 ) -> Result<(), MirageError> {
     let folded = fold_name(name)?;
     let transaction = connection
@@ -531,7 +582,10 @@ pub fn delete_node(
             .query_row(
                 "SELECT COUNT(*) FROM dirents
                  WHERE volume_id = ?1 AND parent_inode = ?2",
-                params![volume_id.as_bytes().as_slice(), entry.inode.as_bytes().as_slice()],
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    entry.inode.as_bytes().as_slice()
+                ],
                 |row| row.get(0),
             )
             .map_err(|e| sqlite(e, "namespace delete emptiness check failed"))?;
@@ -554,9 +608,22 @@ pub fn delete_node(
     transaction
         .execute(
             "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2",
-            params![volume_id.as_bytes().as_slice(), entry.inode.as_bytes().as_slice()],
+            params![
+                volume_id.as_bytes().as_slice(),
+                entry.inode.as_bytes().as_slice()
+            ],
         )
         .map_err(|e| sqlite(e, "namespace inode delete failed"))?;
+    record_delta(
+        &transaction,
+        volume_id,
+        mirage_manifest::namespace::NamespaceOp::Delete {
+            parent,
+            folded_name: folded,
+            inode: entry.inode,
+        },
+        now_ns,
+    )?;
     transaction
         .commit()
         .map_err(|e| sqlite(e, "namespace delete commit failed"))
@@ -572,7 +639,10 @@ pub fn set_file_roots(
     extent_root: Option<[u8; 32]>,
     now_ns: i64,
 ) -> Result<(), MirageError> {
-    let changed = connection
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin namespace roots update"))?;
+    let changed = transaction
         .execute(
             "UPDATE inodes
              SET size = ?1, version_root = ?2, extent_root = ?3, modified_ns = ?4
@@ -593,7 +663,20 @@ pub fn set_file_roots(
             "namespace file inode is missing",
         ));
     }
-    Ok(())
+    record_delta(
+        &transaction,
+        volume_id,
+        mirage_manifest::namespace::NamespaceOp::SetRoots {
+            inode,
+            size,
+            version_root,
+            extent_root,
+        },
+        now_ns,
+    )?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace roots commit failed"))
 }
 
 /// Records the explicit translation of a legacy path-derived identity.
@@ -655,8 +738,9 @@ impl crate::Database {
         marker: Option<&str>,
         limit: usize,
     ) -> Result<Vec<DirEntry>, MirageError> {
-        self.reads()
-            .with_connection(|connection| list_children(connection, volume_id, parent, marker, limit))
+        self.reads().with_connection(|connection| {
+            list_children(connection, volume_id, parent, marker, limit)
+        })
     }
 
     pub fn namespace_resolve_path(
@@ -699,8 +783,14 @@ impl crate::Database {
         to_name: &str,
         now_ns: i64,
     ) -> Result<(), MirageError> {
-        self.writer()
-            .namespace_rename(volume_id, from_parent, from_name, to_parent, to_name, now_ns)
+        self.writer().namespace_rename(
+            volume_id,
+            from_parent,
+            from_name,
+            to_parent,
+            to_name,
+            now_ns,
+        )
     }
 
     pub fn namespace_delete(
@@ -708,8 +798,10 @@ impl crate::Database {
         volume_id: RepositoryId,
         parent: InodeId,
         name: &str,
+        now_ns: i64,
     ) -> Result<(), MirageError> {
-        self.writer().namespace_delete(volume_id, parent, name)
+        self.writer()
+            .namespace_delete(volume_id, parent, name, now_ns)
     }
 
     pub fn namespace_set_file_roots(
@@ -721,8 +813,14 @@ impl crate::Database {
         extent_root: Option<[u8; 32]>,
         now_ns: i64,
     ) -> Result<(), MirageError> {
-        self.writer()
-            .namespace_set_file_roots(volume_id, inode, size, version_root, extent_root, now_ns)
+        self.writer().namespace_set_file_roots(
+            volume_id,
+            inode,
+            size,
+            version_root,
+            extent_root,
+            now_ns,
+        )
     }
 
     /// Records the explicit legacy path-to-inode translation; legacy IDs are
@@ -796,7 +894,11 @@ pub fn seed_volume(
             .execute(
                 "INSERT INTO inodes(volume_id, inode, kind, size, created_ns, modified_ns)
                  VALUES (?1, ?2, 'directory', 0, ?3, ?3)",
-                params![volume_id.as_bytes().as_slice(), root.as_bytes().as_slice(), now_ns],
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    root.as_bytes().as_slice(),
+                    now_ns
+                ],
             )
             .map_err(|e| sqlite(e, "namespace root insert failed"))?;
     }
@@ -821,7 +923,8 @@ pub fn seed_volume(
                 .expect("blake3 output is 32 bytes"),
         ))
     };
-    let mut path_inode: std::collections::HashMap<String, InodeId> = std::collections::HashMap::new();
+    let mut path_inode: std::collections::HashMap<String, InodeId> =
+        std::collections::HashMap::new();
     path_inode.insert(String::new(), root);
     let mut seeded = 0usize;
     let mut insert_inode = transaction
@@ -843,7 +946,11 @@ pub fn seed_volume(
         )
         .map_err(|e| sqlite(e, "namespace seed legacy prepare failed"))?;
     for node in nodes {
-        let components: Vec<&str> = node.path.split('/').filter(|part| !part.is_empty()).collect();
+        let components: Vec<&str> = node
+            .path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
         if components.is_empty() {
             continue;
         }
@@ -921,4 +1028,267 @@ pub fn seed_volume(
         .commit()
         .map_err(|e| sqlite(e, "namespace seed commit failed"))?;
     Ok(seeded)
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: device identity + versioned namespace history
+// ---------------------------------------------------------------------------
+
+/// Returns the durable device identity for this database, creating it on
+/// first use inside the writer's transaction.
+pub fn ensure_device_id(
+    connection: &mut Connection,
+    now_ns: i64,
+) -> Result<mirage_types::DeviceId, MirageError> {
+    if let Some(bytes) = connection
+        .query_row(
+            "SELECT device_id FROM device_identity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|e| sqlite(e, "device identity lookup failed"))?
+    {
+        let array: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| MirageError::integrity_mismatch("device identity has invalid length"))?;
+        return Ok(mirage_types::DeviceId::from_bytes(array));
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| MirageError::internal_invariant("device identity generation failed"))?;
+    connection
+        .execute(
+            "INSERT INTO device_identity(singleton, device_id, created_ns) VALUES (1, ?1, ?2)",
+            params![bytes.as_slice(), now_ns],
+        )
+        .map_err(|e| sqlite(e, "device identity insert failed"))?;
+    Ok(mirage_types::DeviceId::from_bytes(bytes))
+}
+
+fn current_delta_segment(
+    connection: &Connection,
+    volume_id: RepositoryId,
+) -> Result<(i64, [u8; 32]), MirageError> {
+    connection
+        .query_row(
+            "SELECT checkpoint_seq, document_hash FROM namespace_checkpoints
+             WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
+            [volume_id.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| sqlite(e, "namespace checkpoint lookup failed"))?
+        .map(|(seq, hash)| {
+            let hash: [u8; 32] = hash.try_into().map_err(|_| {
+                MirageError::integrity_mismatch("namespace checkpoint hash has invalid length")
+            })?;
+            Ok((seq, hash))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or((0, [0; 32])))
+}
+
+/// Appends one mutation op to the open delta segment inside the mutation's
+/// own transaction, so history is durable exactly when the mutation is.
+fn record_delta(
+    transaction: &Connection,
+    volume_id: RepositoryId,
+    op: mirage_manifest::namespace::NamespaceOp,
+    now_ns: i64,
+) -> Result<(), MirageError> {
+    let (checkpoint_seq, base_hash) = current_delta_segment(transaction, volume_id)?;
+    let delta_seq: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(delta_seq) + 1, 0) FROM namespace_deltas
+             WHERE volume_id = ?1 AND checkpoint_seq = ?2",
+            params![volume_id.as_bytes().as_slice(), checkpoint_seq],
+            |row| row.get(0),
+        )
+        .map_err(|e| sqlite(e, "namespace delta sequence failed"))?;
+    let op_name = match &op {
+        mirage_manifest::namespace::NamespaceOp::Create { .. } => "create",
+        mirage_manifest::namespace::NamespaceOp::Rename { .. } => "rename",
+        mirage_manifest::namespace::NamespaceOp::Delete { .. } => "delete",
+        mirage_manifest::namespace::NamespaceOp::SetRoots { .. } => "set_roots",
+    };
+    let payload =
+        mirage_manifest::namespace::encode_delta(&mirage_manifest::namespace::NamespaceDelta {
+            volume_id,
+            base_document_hash: base_hash,
+            delta_seq: u64::try_from(delta_seq).map_err(|_| {
+                MirageError::internal_invariant("namespace delta sequence is negative")
+            })?,
+            ops: vec![op],
+        })?;
+    if payload.len() > 65_536 {
+        return Err(MirageError::manifest_invalid(
+            "namespace delta payload exceeds the durable bound",
+        ));
+    }
+    let payload_hash = blake3::hash(&payload);
+    transaction
+        .execute(
+            "INSERT INTO namespace_deltas(volume_id, checkpoint_seq, delta_seq, op,
+                payload_hash, payload, created_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                volume_id.as_bytes().as_slice(),
+                checkpoint_seq,
+                delta_seq,
+                op_name,
+                payload_hash.as_bytes().as_slice(),
+                payload,
+                now_ns,
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace delta record failed"))?;
+    Ok(())
+}
+
+/// Number of deltas pending against the newest checkpoint.
+pub fn delta_backlog(connection: &Connection, volume_id: RepositoryId) -> Result<i64, MirageError> {
+    let (checkpoint_seq, _) = current_delta_segment(connection, volume_id)?;
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM namespace_deltas
+             WHERE volume_id = ?1 AND checkpoint_seq = ?2",
+            params![volume_id.as_bytes().as_slice(), checkpoint_seq],
+            |row| row.get(0),
+        )
+        .map_err(|e| sqlite(e, "namespace delta backlog failed"))
+}
+
+/// Snapshots the live namespace into an immutable checkpoint document and
+/// records it. The next checkpoint sequence is one above the previous.
+/// Returns the checkpoint sequence and its canonical document hash.
+pub fn create_checkpoint(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    now_ns: i64,
+) -> Result<(u64, [u8; 32]), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin namespace checkpoint"))?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT i.inode, d.parent_inode, d.folded_name, d.display_name,
+                    i.kind, i.size, i.version_root, i.extent_root
+             FROM inodes i
+             LEFT JOIN dirents d
+               ON d.volume_id = i.volume_id AND d.child_inode = i.inode
+             WHERE i.volume_id = ?1
+             ORDER BY i.inode",
+        )
+        .map_err(|e| sqlite(e, "namespace checkpoint scan failed"))?;
+    let rows = statement
+        .query_map([volume_id.as_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })
+        .map_err(|e| sqlite(e, "namespace checkpoint rows failed"))?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        let (inode, parent, folded, display, kind, size, version_root, extent_root) =
+            row.map_err(|e| sqlite(e, "namespace checkpoint row decode failed"))?;
+        let parent_bytes: Option<[u8; 16]> = parent
+            .map(|bytes| bytes.try_into())
+            .transpose()
+            .map_err(|_| MirageError::integrity_mismatch("namespace parent has invalid length"))?;
+        nodes.push(mirage_manifest::namespace::NamespaceNodeRecord {
+            inode: decode_inode(&inode)?,
+            parent: parent_bytes.map(InodeId::from_bytes),
+            folded_name: folded.unwrap_or_default(),
+            display_name: display.unwrap_or_default(),
+            directory: kind == "directory",
+            size: u64::try_from(size)
+                .map_err(|_| MirageError::integrity_mismatch("namespace size is negative"))?,
+            version_root: decode_blob32(version_root)?,
+            extent_root: decode_blob32(extent_root)?,
+        });
+    }
+    drop(statement);
+    let (last_seq, _) = current_delta_segment(&transaction, volume_id)?;
+    let checkpoint_seq = u64::try_from(last_seq).unwrap_or(0) + 1;
+    let entry_count = nodes.len();
+    let checkpoint = mirage_manifest::namespace::NamespaceCheckpoint {
+        volume_id,
+        checkpoint_seq,
+        parent_commit: None,
+        nodes,
+    };
+    let document = mirage_manifest::namespace::encode_checkpoint(&checkpoint)?;
+    let document_hash = mirage_manifest::namespace::checkpoint_hash(&document);
+    transaction
+        .execute(
+            "INSERT INTO namespace_checkpoints(volume_id, checkpoint_seq, document_hash,
+                document, parent_commit, entry_count, created_ns)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![
+                volume_id.as_bytes().as_slice(),
+                i64::try_from(checkpoint_seq).map_err(|_| {
+                    MirageError::internal_invariant("namespace checkpoint sequence overflows")
+                })?,
+                document_hash.as_slice(),
+                document,
+                i64::try_from(entry_count).map_err(|_| {
+                    MirageError::internal_invariant("namespace entry count overflows")
+                })?,
+                now_ns,
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace checkpoint insert failed"))?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace checkpoint commit failed"))?;
+    Ok((checkpoint_seq, document_hash))
+}
+
+impl crate::Database {
+    /// Durable device identity for this installation.
+    pub fn device_id(&self, now_ns: i64) -> Result<mirage_types::DeviceId, MirageError> {
+        self.writer().ensure_device_id(now_ns)
+    }
+
+    /// Number of namespace deltas pending against the newest checkpoint.
+    pub fn namespace_delta_backlog(&self, volume_id: RepositoryId) -> Result<i64, MirageError> {
+        self.reads()
+            .with_connection(|connection| delta_backlog(connection, volume_id))
+    }
+
+    /// Writes an immutable namespace checkpoint for the volume; returns the
+    /// checkpoint sequence and canonical document hash.
+    pub fn namespace_checkpoint(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<(u64, [u8; 32]), MirageError> {
+        self.writer().namespace_checkpoint(volume_id, now_ns)
+    }
+
+    /// Reads the newest checkpoint document bytes for replay or publication.
+    pub fn namespace_latest_checkpoint_document(
+        &self,
+        volume_id: RepositoryId,
+    ) -> Result<Option<Vec<u8>>, MirageError> {
+        self.reads().with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT document FROM namespace_checkpoints
+                     WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
+                    [volume_id.as_bytes().as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(|e| sqlite(e, "namespace checkpoint document read failed"))
+        })
+    }
 }
