@@ -166,6 +166,7 @@ fn fetch_pool_reports_saturation() {
         workers: 1,
         queue_depth: 1,
         speculative_queue_depth: 0,
+        max_in_flight_bytes: 0,
     })
     .expect("pool");
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -199,4 +200,129 @@ fn fetch_pool_reports_saturation() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(pool.completed(), accepted as u64);
+}
+
+#[test]
+fn expired_deadline_jobs_never_run() {
+    use std::sync::mpsc;
+    let (release, hold) = mpsc::channel::<()>();
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 8,
+        speculative_queue_depth: 0,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    // Block the only worker so the expired job sits in the queue.
+    pool.spawn(
+        mirage_scheduler::FetchPriority::P0Blocking,
+        u64::MAX,
+        Box::new(move || {
+            let _ = hold.recv();
+        }),
+    )
+    .expect("blocker");
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&ran);
+    pool.spawn(
+        mirage_scheduler::FetchPriority::P0Blocking,
+        1, // already in the past
+        Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        }),
+    )
+    .expect("expired job");
+    let start = std::time::Instant::now();
+    while pool.queued() < 1 && start.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::yield_now();
+    }
+    release.send(()).ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pool.completed() < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(pool.expired(), 1);
+}
+
+#[test]
+fn speculative_workers_cannot_occupy_every_slot() {
+    use std::sync::mpsc;
+    let (hold_tx, hold_rx) = mpsc::channel::<()>();
+    let hold_rx = std::sync::Arc::new(std::sync::Mutex::new(hold_rx));
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 2,
+        queue_depth: 8,
+        speculative_queue_depth: 4,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    // Two speculative jobs occupy both workers.
+    for _ in 0..2 {
+        let hold_rx = std::sync::Arc::clone(&hold_rx);
+        pool.spawn(
+            mirage_scheduler::FetchPriority::P4ReadAhead,
+            u64::MAX,
+            Box::new(move || {
+                let _ = hold_rx.lock().expect("hold lock").recv();
+            }),
+        )
+        .expect("speculative");
+    }
+    // A third speculative job must park: the protected demand slot is not
+    // consumed even though a worker appears free.
+    let third_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&third_ran);
+    pool.spawn(
+        mirage_scheduler::FetchPriority::P4ReadAhead,
+        u64::MAX,
+        Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        }),
+    )
+    .expect("third speculative");
+    // A demand job still runs while speculative work saturates.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    pool.spawn(
+        mirage_scheduler::FetchPriority::P0Blocking,
+        u64::MAX,
+        Box::new(move || {
+            done_tx.send(()).ok();
+        }),
+    )
+    .expect("demand job");
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok(),
+        "demand read starved behind speculative workers"
+    );
+    drop(hold_tx);
+}
+
+#[test]
+fn speculative_byte_budget_rejects_over_limit() {
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 8,
+        speculative_queue_depth: 8,
+        max_in_flight_bytes: 1024,
+    })
+    .expect("pool");
+    pool.spawn_metered(
+        mirage_scheduler::FetchPriority::P4ReadAhead,
+        u64::MAX,
+        800,
+        Box::new(|| {}),
+    )
+    .expect("within budget");
+    let error = pool
+        .spawn_metered(
+            mirage_scheduler::FetchPriority::P4ReadAhead,
+            u64::MAX,
+            800,
+            Box::new(|| {}),
+        )
+        .expect_err("over budget");
+    assert_eq!(error.kind, mirage_types::MirageErrorKind::CacheFull);
 }

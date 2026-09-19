@@ -51,6 +51,7 @@ impl<B: ObjectBackend> PageProvider<B> {
                 workers: DEFAULT_FETCH_WORKERS,
                 queue_depth: 256,
                 speculative_queue_depth: 64,
+                max_in_flight_bytes: 0,
             })
             .expect("fixed fetch pool configuration is valid"),
             budget,

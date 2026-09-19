@@ -20,6 +20,9 @@ pub struct FetchPoolConfig {
     /// Queue slots speculative work may occupy; 0 means speculative jobs never
     /// queue. Never exceeds `queue_depth`.
     pub speculative_queue_depth: usize,
+    /// Bytes of fetch body that may be queued or in flight at once; 0
+    /// disables the byte budget.
+    pub max_in_flight_bytes: u64,
 }
 
 impl FetchPoolConfig {
@@ -45,6 +48,7 @@ struct QueuedJob {
     priority: FetchPriority,
     deadline_ns: u64,
     sequence: u64,
+    bytes: u64,
     job: Job,
 }
 
@@ -73,6 +77,11 @@ struct PoolState {
     queue: BinaryHeap<QueuedJob>,
     queued_speculative: usize,
     running: usize,
+    /// Speculative jobs currently running; at least one worker slot stays
+    /// protected for demand so foreground reads never queue behind a fully
+    /// speculative fleet.
+    running_speculative: usize,
+    bytes_in_flight: u64,
     closed: bool,
     next_sequence: u64,
 }
@@ -82,17 +91,27 @@ struct Shared {
     wake: Condvar,
     completed: AtomicU64,
     panicked: AtomicU64,
+    expired: AtomicU64,
 }
 
 /// A panicking job still counts as completed for bookkeeping: the reservation
 /// slot ran to a definite end (success or panic), never leaks `running`.
-struct RunGuard<'a>(&'a Shared);
+struct RunGuard<'a> {
+    shared: &'a Shared,
+    speculative: bool,
+    bytes: u64,
+}
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        self.0.completed.fetch_add(1, AtomicOrdering::AcqRel);
-        if let Ok(mut state) = self.0.state.lock() {
+        self.shared.completed.fetch_add(1, AtomicOrdering::AcqRel);
+        if let Ok(mut state) = self.shared.state.lock() {
             state.running -= 1;
+            state.bytes_in_flight = state.bytes_in_flight.saturating_sub(self.bytes);
+            if self.speculative {
+                state.running_speculative -= 1;
+            }
         }
+        self.shared.wake.notify_all();
     }
 }
 
@@ -113,18 +132,22 @@ impl FetchPool {
                 queue: BinaryHeap::new(),
                 queued_speculative: 0,
                 running: 0,
+                running_speculative: 0,
+                bytes_in_flight: 0,
                 closed: false,
                 next_sequence: 0,
             }),
             wake: Condvar::new(),
             completed: AtomicU64::new(0),
             panicked: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
         });
+        let shared_workers = config.workers;
         for _ in 0..config.workers {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 loop {
-                    let job = {
+                    let job_meta = {
                         let mut state = match shared.state.lock() {
                             Ok(state) => state,
                             Err(_) => return,
@@ -133,13 +156,46 @@ impl FetchPool {
                             if state.closed {
                                 return;
                             }
-                            match state.queue.pop() {
-                                Some(queued) => {
-                                    if queued.priority.speculative() {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|elapsed| elapsed.as_nanos() as u64)
+                                .unwrap_or(0);
+                            match state.queue.peek() {
+                                Some(queued) if queued.deadline_ns < now => {
+                                    // Deadlines are enforced, not only
+                                    // sorted: an expired job never runs.
+                                    let expired = state.queue.pop().expect("peeked job");
+                                    if expired.priority.speculative() {
                                         state.queued_speculative -= 1;
                                     }
+                                    shared.expired.fetch_add(1, AtomicOrdering::AcqRel);
+                                }
+                                Some(queued)
+                                    if queued.priority.speculative()
+                                        && state.running_speculative
+                                            >= shared_workers.saturating_sub(1).max(1) =>
+                                {
+                                    // The protected demand slot stays free:
+                                    // a fully speculative fleet parks until
+                                    // a worker frees up.
+                                    state = match shared.wake.wait(state) {
+                                        Ok(state) => state,
+                                        Err(_) => return,
+                                    };
+                                }
+                                Some(_) => {
+                                    let queued = state.queue.pop().expect("peeked job");
+                                    if queued.priority.speculative() {
+                                        state.queued_speculative -= 1;
+                                        state.running_speculative += 1;
+                                    }
                                     state.running += 1;
-                                    break queued.job;
+                                    state.bytes_in_flight += queued.bytes;
+                                    break (
+                                        queued.job,
+                                        queued.priority.speculative(),
+                                        queued.bytes,
+                                    );
                                 }
                                 None => {
                                     state = match shared.wake.wait(state) {
@@ -150,8 +206,12 @@ impl FetchPool {
                             }
                         }
                     };
-                    let _guard = RunGuard(&shared);
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    let _guard = RunGuard {
+                        shared: &shared,
+                        speculative: job_meta.1,
+                        bytes: job_meta.2,
+                    };
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job_meta.0)).is_err() {
                         shared.panicked.fetch_add(1, AtomicOrdering::AcqRel);
                     }
                 }
@@ -164,6 +224,18 @@ impl FetchPool {
         &self,
         priority: FetchPriority,
         deadline_ns: u64,
+        job: Job,
+    ) -> Result<(), MirageError> {
+        self.spawn_metered(priority, deadline_ns, 0, job)
+    }
+
+    /// Spawns a job that holds `bytes` of the in-flight byte budget while it
+    /// is queued or running; speculative work beyond the budget is rejected.
+    pub fn spawn_metered(
+        &self,
+        priority: FetchPriority,
+        deadline_ns: u64,
+        bytes: u64,
         job: Job,
     ) -> Result<(), MirageError> {
         let mut state = self
@@ -185,6 +257,19 @@ impl FetchPool {
                 "speculative fetch credits are exhausted",
             ));
         }
+        if priority.speculative() && self.config.max_in_flight_bytes > 0 {
+            let queued_bytes: u64 = state.queue.iter().map(|queued| queued.bytes).sum();
+            if state
+                .bytes_in_flight
+                .saturating_add(queued_bytes)
+                .saturating_add(bytes)
+                > self.config.max_in_flight_bytes
+            {
+                return Err(MirageError::cache_full(
+                    "in-flight fetch byte budget is exhausted",
+                ));
+            }
+        }
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.wrapping_add(1);
         if priority.speculative() {
@@ -194,6 +279,7 @@ impl FetchPool {
             priority,
             deadline_ns,
             sequence,
+            bytes,
             job,
         });
         drop(state);
@@ -229,6 +315,13 @@ impl FetchPool {
     #[must_use]
     pub fn panicked(&self) -> u64 {
         self.shared.panicked.load(AtomicOrdering::Acquire)
+    }
+
+    /// Queued jobs dropped because their deadline passed before a worker
+    /// reached them.
+    #[must_use]
+    pub fn expired(&self) -> u64 {
+        self.shared.expired.load(AtomicOrdering::Acquire)
     }
 }
 

@@ -15,6 +15,7 @@ fn pool_runs_queued_jobs_in_priority_order() {
     let pool = FetchPool::new(FetchPoolConfig {
         workers: 1,
         queue_depth: 8,
+        max_in_flight_bytes: 0,
         speculative_queue_depth: 4,
     })
     .expect("pool");
@@ -56,6 +57,7 @@ fn speculative_credits_never_starve_demand() {
     let pool = FetchPool::new(FetchPoolConfig {
         workers: 1,
         queue_depth: 4,
+        max_in_flight_bytes: 0,
         speculative_queue_depth: 1,
     })
     .expect("pool");
@@ -91,6 +93,7 @@ fn demand_jobs_still_hit_the_queue_depth_bound() {
     let pool = FetchPool::new(FetchPoolConfig {
         workers: 1,
         queue_depth: 1,
+        max_in_flight_bytes: 0,
         speculative_queue_depth: 0,
     })
     .expect("pool");
@@ -124,6 +127,7 @@ fn a_panicking_job_never_kills_the_worker_or_leaks_running() {
     let pool = FetchPool::new(FetchPoolConfig {
         workers: 1,
         queue_depth: 4,
+        max_in_flight_bytes: 0,
         speculative_queue_depth: 0,
     })
     .expect("pool");

@@ -140,9 +140,11 @@ impl<B: ObjectBackend + 'static> PageProvider<B> {
         let max_window = self.max_window;
         let job_flight = Arc::clone(&flight);
         let priority = window.priority;
-        self.pool.spawn(
+        let bytes = window.range.len();
+        self.pool.spawn_metered(
             priority,
             deadline_ns,
+            bytes,
             Box::new(move || {
                 let _guard = CompleteOnDrop {
                     flights: flights.clone(),

@@ -585,6 +585,7 @@ fn pool_saturation_is_a_typed_budget_failure() {
         workers: 1,
         queue_depth: 1,
         speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
     })
     .expect("pool");
     let frames = [frame(0x11), frame(0x22), frame(0x33)];
