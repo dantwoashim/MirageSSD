@@ -295,7 +295,9 @@ impl VolumeCoordinator {
     /// volume is mounted, so a quiescing owner never starts new fetches.
     pub fn provide_page(&self, hash: PageHash) -> Result<crate::ProviderPage, MirageError> {
         if self.state() != VolumeState::Mounted {
-            return Err(MirageError::repository_conflict(
+            // Not mounted (or quiescing): no fetches may start, and callers
+            // treat this as no provider rather than a hard failure.
+            return Err(MirageError::provider_unavailable(
                 "volume is not mounted for provider reads",
             ));
         }
