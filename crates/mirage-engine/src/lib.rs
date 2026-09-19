@@ -36,10 +36,16 @@ pub use api::{EngineResult, ReadEngine};
 pub use capsule_materialize::{CapsulePageStore, MaterializeProgress, materialize_capsule};
 pub use file_handle::{AccessMask, FileHandleContext};
 pub use generation::MountGeneration;
+pub use get_or_fetch::ProviderPage;
 pub use observe::{ObservationEvent, SessionObserver, TelemetryMetrics};
 pub use outcome::{CacheTier, ReadOutcome, SealViolation};
 pub use page_location::{PageLocation, PageLocationMap};
 pub use page_provider::{DEFAULT_FETCH_WORKERS, FetchContext, PageProvider};
+
+/// Synchronous page-provider hook owned by the volume coordinator: admitted
+/// fetch with a bounded transient fallback, typed errors, no zero-fills.
+pub type ProviderHook =
+    dyn Fn(mirage_types::PageHash) -> Result<ProviderPage, mirage_types::MirageError> + Send + Sync;
 pub use read_request::{
     AccessPattern, BufferCacheMode, BufferingHint, ProcessRole, ReadContext, ReadPriority,
 };

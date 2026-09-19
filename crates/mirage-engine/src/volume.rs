@@ -106,6 +106,7 @@ struct CoordinatorShared {
     readers: Mutex<HashMap<PageHash, usize>>,
     readers_changed: std::sync::Condvar,
     state: Mutex<VolumeState>,
+    provider: Mutex<Option<std::sync::Arc<crate::ProviderHook>>>,
 }
 
 /// The single-owner lock and fencing state for one mounted volume.
@@ -155,6 +156,7 @@ impl VolumeCoordinator {
             readers: Mutex::new(HashMap::new()),
             readers_changed: std::sync::Condvar::new(),
             state: Mutex::new(state),
+            provider: Mutex::new(None),
         });
         Ok(Self {
             shared,
@@ -279,6 +281,31 @@ impl VolumeCoordinator {
             .lock()
             .map(|readers| readers.values().sum())
             .unwrap_or(0)
+    }
+
+    /// Installs the cloud-backed page provider for this mount. The
+    /// coordinator owns it so every read goes through the owning host.
+    pub fn set_provider(&self, hook: std::sync::Arc<crate::ProviderHook>) {
+        if let Ok(mut slot) = self.shared.provider.lock() {
+            *slot = Some(hook);
+        }
+    }
+
+    /// Serves one page through the installed provider; only legal while the
+    /// volume is mounted, so a quiescing owner never starts new fetches.
+    pub fn provide_page(&self, hash: PageHash) -> Result<crate::ProviderPage, MirageError> {
+        if self.state() != VolumeState::Mounted {
+            return Err(MirageError::repository_conflict(
+                "volume is not mounted for provider reads",
+            ));
+        }
+        let hook = self
+            .shared
+            .provider
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("provider slot lock poisoned"))?
+            .clone();
+        hook.ok_or_else(|| MirageError::provider_unavailable("volume has no cloud provider"))?(hash)
     }
 
     /// Move to `Quiescing`, wait for active readers to drain up to `timeout`,

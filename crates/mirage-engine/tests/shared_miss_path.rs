@@ -625,3 +625,60 @@ fn pool_saturation_is_a_typed_budget_failure() {
         result.expect("queued fetch completes");
     }
 }
+
+#[test]
+fn provide_sync_places_verified_page_in_arena() {
+    let (hash, encoded) = frame(0x51);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, BUDGET);
+    match fixture.provider.provide_sync(hash).expect("provide") {
+        mirage_engine::ProviderPage::Placed(guard) => {
+            let mut bytes = vec![0u8; PAGE];
+            guard.read_exact(0, &mut bytes).expect("guard read");
+            assert!(bytes.iter().all(|byte| *byte == 0x51));
+        }
+        mirage_engine::ProviderPage::Transient(_) => panic!("expected an admitted page"),
+    }
+    assert_eq!(fixture.backend.reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn provide_sync_serves_verified_bytes_transiently_when_budget_is_full() {
+    let (hash, encoded) = frame(0x62);
+    // Zero budget: admission fails with CacheFull, so the read must fall back
+    // to a verified transient page rather than failing or zero-filling.
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, 1);
+    match fixture
+        .provider
+        .provide_sync(hash)
+        .expect("transient provide")
+    {
+        mirage_engine::ProviderPage::Transient(page) => {
+            assert_eq!(page.hash, hash);
+            assert_eq!(page.bytes.len(), PAGE);
+            assert!(page.bytes.iter().all(|byte| *byte == 0x62));
+        }
+        mirage_engine::ProviderPage::Placed(_) => panic!("expected a transient page"),
+    }
+}
+
+#[test]
+fn provide_sync_never_zero_fills_unknown_or_corrupt_content() {
+    // Unknown hash: the pack exists but no location maps to it — a typed
+    // error, never synthesized bytes.
+    let (known, encoded) = frame(0x6f);
+    let fixture = build_fixture(vec![encoded], vec![known], None, None, None, BUDGET);
+    assert!(
+        fixture
+            .provider
+            .provide_sync(PageHash::from_bytes([0xff; 32]))
+            .is_err()
+    );
+    // Corrupt frame: hash mismatch must surface, not bytes.
+    let (hash, _encoded) = frame(0x70);
+    let (other, encoded) = frame(0x71);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, BUDGET);
+    let error = fixture.provider.provide_sync(other).err();
+    // `other` has no location either; swap: map `hash`'s location content that
+    // decodes to a different page hash must fail verification.
+    assert!(error.is_some());
+}

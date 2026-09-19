@@ -6,7 +6,7 @@ use mirage_db::Database;
 use mirage_types::{MirageError, PageHash};
 use tokio_util::sync::CancellationToken;
 
-use mirage_pack::PackReadEncryption;
+use mirage_pack::{PackReadEncryption, PlainPage};
 
 use crate::decode::decode_expected_with_encryption;
 use crate::validate::exact_body;
@@ -113,6 +113,60 @@ pub async fn fetch_window_with_encryption<B: ObjectBackend>(
     }
     Ok(results)
 }
+/// Fetches and verifies one window without admitting anything: bounded
+/// download, exact-range check, per-frame decrypt and hash verification. Used
+/// when the arena cannot admit the page — the caller serves the bytes
+/// transiently instead of failing the read.
+pub async fn fetch_transient_with_encryption<B: ObjectBackend>(
+    backend: &B,
+    window: FetchWindow,
+    cancel: CancellationToken,
+    maximum_window: u64,
+    encryption: Option<&PackReadEncryption>,
+) -> Result<Vec<PlainPage>, MirageError> {
+    let response = backend
+        .read_range(
+            &window.object,
+            window.range,
+            backend_class(window.priority),
+            cancel.clone(),
+        )
+        .await
+        .map_err(MirageError::from)?;
+    let returned = response.requested_range;
+    let body = response
+        .collect_bounded(maximum_window)
+        .await
+        .map_err(MirageError::from)?;
+    let body = exact_body(window.range, returned, body, maximum_window)?;
+    let mut pages = Vec::with_capacity(window.frames.len());
+    for mapping in window.frames {
+        let start = usize::try_from(mapping.window_offset)
+            .map_err(|_| MirageError::invalid_argument("frame offset exceeds address space"))?;
+        let length = usize::try_from(mapping.encoded_length)
+            .map_err(|_| MirageError::invalid_argument("frame length exceeds address space"))?;
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| {
+                MirageError::integrity_mismatch("frame mapping escapes response body")
+            })?;
+        let frame_offset = window
+            .range
+            .start()
+            .checked_add(mapping.window_offset)
+            .ok_or_else(|| MirageError::invalid_argument("frame offset overflows"))?;
+        let decoded = decode_expected_with_encryption(
+            &body[start..end],
+            mapping.page_hash,
+            frame_offset,
+            encryption,
+        )?;
+        pages.push(decoded.page);
+    }
+    Ok(pages)
+}
+
 const fn backend_class(priority: FetchPriority) -> FetchClass {
     match priority {
         FetchPriority::P0Blocking => FetchClass::BlockingRead,

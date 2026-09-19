@@ -8,7 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mirage_cache::{ArenaShard, ResidentIndex};
 use mirage_index::{MountIndex, NodeIndex};
 use mirage_pack::{PackReadEncryption, PackReader, PlainPage};
-use mirage_types::PageHash;
+use mirage_types::{MirageError, PageHash};
+/// Synchronous hook into the engine's `PageProvider`: admitted fetch with a
+/// bounded transient fallback. Returns typed errors so the read path can map
+/// offline, cancellation, corruption, and end-of-file distinctly.
+pub type PageProviderHook =
+    dyn Fn(PageHash) -> Result<mirage_engine::ProviderPage, MirageError> + Send + Sync;
+
 pub struct DecodedPageCache {
     entries: BTreeMap<PageHash, Arc<PlainPage>>,
     order: VecDeque<PageHash>,
@@ -211,6 +217,9 @@ pub struct MirageEngineHandle {
     /// Single-owner coordinator for the mounted volume; `None` for the
     /// legacy read-only engines that never own writable state.
     pub coordinator: Option<Arc<mirage_engine::volume::VolumeCoordinator>>,
+    /// Cloud-backed page provider for non-resident pages when no local
+    /// origin pack directory exists.
+    pub provider: Option<Arc<PageProviderHook>>,
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -229,6 +238,8 @@ pub struct MirageFileHandle {
     /// Shares the engine's volume coordinator so reads can lease pages
     /// against live eviction.
     pub coordinator: Option<Arc<mirage_engine::volume::VolumeCoordinator>>,
+    /// Cloud-backed page provider hook shared with the engine.
+    pub provider: Option<Arc<PageProviderHook>>,
     pub logical_path: std::sync::OnceLock<String>,
     pub caller_image: Mutex<Option<(u32, Arc<str>)>>,
 }
@@ -264,6 +275,7 @@ impl MirageEngineHandle {
             violations: None,
             trace_lookups: false,
             coordinator: None,
+            provider: None,
         }
     }
     /// Owner-side origin decodes performed by this engine.

@@ -119,6 +119,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             violations: None,
             trace_lookups: false,
             coordinator: None,
+            provider: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -192,6 +193,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             violations: None,
             trace_lookups: false,
             coordinator: None,
+            provider: None,
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -374,7 +376,12 @@ unsafe fn create_cache_impl(
             ))),
             trace_lookups: std::env::var_os("MIRAGE_TRACE_LOOKUPS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
-            coordinator: Some(coordinator),
+            coordinator: Some(Arc::clone(&coordinator)),
+            provider: {
+                let coordinator = Arc::clone(&coordinator);
+                Some(Arc::new(move |hash| coordinator.provide_page(hash))
+                    as Arc<handles::PageProviderHook>)
+            },
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -544,6 +551,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         coalesced: Arc::clone(&engine.coalesced),
                         violations: engine.violations.clone(),
                         coordinator: engine.coordinator.clone(),
+                        provider: engine.provider.clone(),
                         logical_path: Default::default(),
                         caller_image: Default::default(),
                     })),
@@ -572,6 +580,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     coalesced: Arc::clone(&engine.coalesced),
                     violations: engine.violations.clone(),
                     coordinator: engine.coordinator.clone(),
+                    provider: engine.provider.clone(),
                     logical_path: Default::default(),
                     caller_image: Default::default(),
                 })),
@@ -793,6 +802,57 @@ unsafe fn read_impl(
                         if !record_violations {
                             return MirageStatus::BackendUnavailable;
                         }
+                        // Managed path: a non-resident page is fetched through
+                        // the coordinator-backed PageProvider — single-flight,
+                        // authenticated, hash-verified, then admitted or served
+                        // transiently when the arena is full.
+                        if let Some(provider) = &handle.provider {
+                            match provider(hash) {
+                                Ok(mirage_engine::ProviderPage::Placed(guard)) => {
+                                    let dst = span.dst_offset as usize;
+                                    let start = span.page_offset;
+                                    let end = start + span.len;
+                                    let Some(window) =
+                                        output.get_mut(dst..(dst + span.len as usize))
+                                    else {
+                                        return MirageStatus::IntegrityFailure;
+                                    };
+                                    if guard.read_exact(start, window).is_err() {
+                                        return MirageStatus::IoError;
+                                    }
+                                    let _ = end;
+                                    span_index += 1;
+                                    continue;
+                                }
+                                Ok(mirage_engine::ProviderPage::Transient(page)) => {
+                                    let start = span.page_offset as usize;
+                                    let Some(end) = start.checked_add(span.len as usize) else {
+                                        return MirageStatus::IntegrityFailure;
+                                    };
+                                    let dst = span.dst_offset as usize;
+                                    let Some(dst_end) = dst.checked_add(span.len as usize) else {
+                                        return MirageStatus::IntegrityFailure;
+                                    };
+                                    let Some(source) = page.bytes.get(start..end) else {
+                                        return MirageStatus::IntegrityFailure;
+                                    };
+                                    let Some(destination) = output.get_mut(dst..dst_end) else {
+                                        return MirageStatus::IntegrityFailure;
+                                    };
+                                    destination.copy_from_slice(source);
+                                    span_index += 1;
+                                    continue;
+                                }
+                                Err(error) => {
+                                    // No provider installed falls through to
+                                    // the local-origin path for tests and
+                                    // legacy restore.
+                                    if !matches!(error.kind, MirageErrorKind::ProviderUnavailable) {
+                                        return provider_failure_status(&error);
+                                    }
+                                }
+                            }
+                        }
                         // Degraded read-through: a non-resident page falls back to
                         // the immutable origin when one is configured, and the
                         // violation record carries the outcome.
@@ -818,7 +878,44 @@ unsafe fn read_impl(
                     }
                 }
             }
-            if let Err(status) = read_span_from_origin(handle, page, span, output) {
+            let served = if let Some(provider) = &handle.provider {
+                match provider(hash) {
+                    Ok(mirage_engine::ProviderPage::Placed(guard)) => {
+                        let dst = span.dst_offset as usize;
+                        let Some(window) = output.get_mut(dst..(dst + span.len as usize)) else {
+                            return MirageStatus::IntegrityFailure;
+                        };
+                        if guard.read_exact(span.page_offset, window).is_err() {
+                            return MirageStatus::IoError;
+                        }
+                        true
+                    }
+                    Ok(mirage_engine::ProviderPage::Transient(page)) => {
+                        let start = span.page_offset as usize;
+                        let end = start + span.len as usize;
+                        let dst = span.dst_offset as usize;
+                        let dst_end = dst + span.len as usize;
+                        let Some(source) = page.bytes.get(start..end) else {
+                            return MirageStatus::IntegrityFailure;
+                        };
+                        let Some(destination) = output.get_mut(dst..dst_end) else {
+                            return MirageStatus::IntegrityFailure;
+                        };
+                        destination.copy_from_slice(source);
+                        true
+                    }
+                    Err(error) => {
+                        if matches!(error.kind, MirageErrorKind::ProviderUnavailable) {
+                            false
+                        } else {
+                            return provider_failure_status(&error);
+                        }
+                    }
+                }
+            } else {
+                false
+            };
+            if !served && let Err(status) = read_span_from_origin(handle, page, span, output) {
                 return status;
             }
             span_index += 1;
@@ -827,6 +924,25 @@ unsafe fn read_impl(
         unsafe { ptr::write(transferred, bytes) };
         MirageStatus::Ok
     })
+}
+
+/// Maps a provider failure to a distinct status: offline/unavailable,
+/// cancellation, corruption, and end-of-file never collapse into one code.
+fn provider_failure_status(error: &MirageError) -> MirageStatus {
+    match error.kind {
+        MirageErrorKind::Cancelled => MirageStatus::Cancelled,
+        MirageErrorKind::IntegrityMismatch | MirageErrorKind::ManifestInvalid => {
+            MirageStatus::IntegrityFailure
+        }
+        MirageErrorKind::BackendUnavailable
+        | MirageErrorKind::BackendRateLimited
+        | MirageErrorKind::BackendUnauthenticated
+        | MirageErrorKind::BackendPermissionDenied
+        | MirageErrorKind::ProviderUnavailable
+        | MirageErrorKind::RemoteObjectMissing => MirageStatus::BackendUnavailable,
+        MirageErrorKind::CacheFull => MirageStatus::WouldBlock,
+        _ => MirageStatus::IoError,
+    }
 }
 
 /// Serve one resolved span from the immutable origin pack directory. Shared by
