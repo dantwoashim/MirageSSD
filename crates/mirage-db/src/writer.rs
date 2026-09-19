@@ -12,6 +12,7 @@ use crate::cache::{
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
 use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
+use crate::operation::{self, OperationPayloadRecord, OperationRecord};
 use crate::physical::{self, PhysicalExtentRecord, PhysicalFileRecord, PhysicalReservationRecord};
 use crate::pin::{self, PersistentPinReason};
 use crate::remote_object::{
@@ -99,6 +100,13 @@ enum Command {
     PhysicalMarkExtentDead([u8; 16], i64, Reply<()>),
     PhysicalAdjustExtentPin([u8; 16], i64, Reply<()>),
     PhysicalReapReservations(i64, Reply<u64>),
+    OperationBegin(OperationRecord, Vec<OperationPayloadRecord>, Reply<()>),
+    OperationCommit([u8; 16], Reply<()>),
+    OperationPayloadFlushed([u8; 16], [u8; 32], i64, Reply<()>),
+    FlushGroupOpen(RepositoryId, i64, Reply<i64>),
+    FlushGroupMark(i64, i64, Reply<u64>),
+    OperationPublish(Vec<[u8; 16]>, Reply<u64>),
+    OperationReclaimPending(RepositoryId, i64, Reply<u64>),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -361,6 +369,50 @@ impl DbWriter {
                             respond(
                                 reply,
                                 physical::reap_expired_reservations(&mut connection, now),
+                            );
+                        }
+                        Command::OperationBegin(operation, payloads, reply) => {
+                            respond(
+                                reply,
+                                operation::begin_operation(&mut connection, &operation, &payloads),
+                            );
+                        }
+                        Command::OperationCommit(operation_id, reply) => {
+                            respond(
+                                reply,
+                                operation::commit_operation(&mut connection, &operation_id),
+                            );
+                        }
+                        Command::OperationPayloadFlushed(payload_id, checksum, now, reply) => {
+                            respond(
+                                reply,
+                                operation::mark_payload_flushed(
+                                    &mut connection,
+                                    &payload_id,
+                                    &checksum,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::FlushGroupOpen(volume_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::open_flush_group(&mut connection, volume_id, now),
+                            );
+                        }
+                        Command::FlushGroupMark(group_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::mark_group_flushed(&mut connection, group_id, now),
+                            );
+                        }
+                        Command::OperationPublish(ids, reply) => {
+                            respond(reply, operation::mark_published(&mut connection, &ids));
+                        }
+                        Command::OperationReclaimPending(volume_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::reclaim_pending(&mut connection, volume_id, now),
                             );
                         }
                         Command::CreateUpdateJournal(value, reply) => {
@@ -714,6 +766,59 @@ impl DbWriter {
     /// Reaps expired reservations, returning their extents to dead.
     pub fn physical_reap_reservations(&self, now_ns: i64) -> Result<u64, MirageError> {
         self.request(|reply| Command::PhysicalReapReservations(now_ns, reply))
+    }
+
+    /// Journals a pending operation with its payload references.
+    pub fn operation_begin(
+        &self,
+        operation: OperationRecord,
+        payloads: Vec<OperationPayloadRecord>,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationBegin(operation, payloads, reply))
+    }
+
+    /// Marks a payload durable after its bytes are flushed to disk.
+    pub fn operation_payload_flushed(
+        &self,
+        payload_id: [u8; 16],
+        checksum: [u8; 32],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationPayloadFlushed(payload_id, checksum, now_ns, reply))
+    }
+
+    /// Commits a pending operation; fails closed when any payload is
+    /// unflushed.
+    pub fn operation_commit(&self, operation_id: [u8; 16]) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationCommit(operation_id, reply))
+    }
+
+    /// Opens a flush group capturing the volume's committed operations.
+    pub fn flush_group_open(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<i64, MirageError> {
+        self.request(|reply| Command::FlushGroupOpen(volume_id, now_ns, reply))
+    }
+
+    /// Acknowledges local durability for every operation in the group.
+    pub fn flush_group_mark(&self, group_id: i64, now_ns: i64) -> Result<u64, MirageError> {
+        self.request(|reply| Command::FlushGroupMark(group_id, now_ns, reply))
+    }
+
+    /// Advances flushed operations to published after the remote commit.
+    pub fn operation_publish(&self, operation_ids: Vec<[u8; 16]>) -> Result<u64, MirageError> {
+        self.request(|reply| Command::OperationPublish(operation_ids, reply))
+    }
+
+    /// Reclaims pending operations after their payloads are deleted.
+    pub fn operation_reclaim_pending(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<u64, MirageError> {
+        self.request(|reply| Command::OperationReclaimPending(volume_id, now_ns, reply))
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {
