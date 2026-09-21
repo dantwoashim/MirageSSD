@@ -77,12 +77,8 @@ fn local_repository_reconstructs_and_answers_100k_deterministic_ranges() {
         resolve_range(file, offset, length).expect("boundary range resolves");
     }
 
-    let report = futures_executor::block_on(extract_virtual_files(
-        &backend,
-        &recovered.manifest,
-        &extracted,
-    ))
-    .expect("extract committed repository");
+    let report = extract_virtual_files(&backend, &recovered.manifest, &extracted)
+        .expect("extract committed repository");
     let reconstructed = std::fs::read(extracted.join("oracle.bin")).expect("reconstructed file");
     assert_eq!(report.files_written, 1);
     assert_eq!(reconstructed, original);

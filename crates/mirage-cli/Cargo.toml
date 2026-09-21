@@ -33,6 +33,7 @@ mirage-simulator.workspace = true
 mirage-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 zeroize.workspace = true

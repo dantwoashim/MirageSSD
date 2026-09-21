@@ -30,9 +30,12 @@ impl<'a> Reconciler<'a> {
     }
 
     /// Observes a remote head and a batch of changes, then classifies the
-    /// relationship against `local_head`. `is_ancestor` reports whether the
-    /// first commit descends from the second (the caller knows the commit
-    /// graph; the reconciler only records the outcome).
+    /// relationship against `local_head`. `remote_is_descendant_of_local`
+    /// and `local_is_ancestor_of_remote` are the *same* ancestry fact seen
+    /// from either direction — either being true means the remote head is
+    /// ahead. Only when neither holds (and the heads differ) is the volume
+    /// diverged; a stale remote head is `LocalAhead` via
+    /// [`observe_with_relation`](Self::observe_with_relation).
     ///
     /// On `Diverged` a divergence record is written and both heads stay
     /// visible — publication must not silently overwrite the remote.
@@ -49,13 +52,33 @@ impl<'a> Reconciler<'a> {
     ) -> Result<Relation, MirageError> {
         let relation = if remote_head.head_commit == local_head {
             Relation::Same
-        } else if remote_is_descendant_of_local && !local_is_ancestor_of_remote {
-            Relation::LocalAhead
-        } else if local_is_ancestor_of_remote && !remote_is_descendant_of_local {
+        } else if remote_is_descendant_of_local || local_is_ancestor_of_remote {
             Relation::RemoteAhead
         } else {
             Relation::Diverged
         };
+        self.observe_with_relation(
+            remote_head,
+            changes,
+            local_head,
+            relation,
+            base_commit,
+            now_ns,
+        )
+    }
+
+    /// Records an observation with a caller-verified relation — the commit
+    /// graph is owned by the caller, so a remote head that is a strict
+    /// ancestor of local reports `LocalAhead` and stays divergence-free.
+    pub fn observe_with_relation(
+        &self,
+        remote_head: RemoteHead,
+        changes: Vec<RemoteChange>,
+        local_head: [u8; 32],
+        relation: Relation,
+        base_commit: Option<[u8; 32]>,
+        now_ns: i64,
+    ) -> Result<Relation, MirageError> {
         for change in &changes {
             self.db.writer().remote_change_record(change.clone())?;
         }
@@ -154,12 +177,12 @@ mod tests {
     }
 
     #[test]
-    fn non_monotonic_cursor_is_rejected() {
+    fn opaque_cursor_tokens_are_stored_verbatim() {
         let (_d, db, volume) = setup();
         let reconciler = Reconciler::new(&db, volume);
         reconciler
             .observe(
-                head("c5", 1, 5, volume),
+                head("9", 1, 5, volume),
                 vec![],
                 [0; 32],
                 true,
@@ -168,20 +191,18 @@ mod tests {
                 1,
             )
             .unwrap();
-        assert!(
-            reconciler
-                .observe(
-                    head("c2", 2, 6, volume),
-                    vec![],
-                    [0; 32],
-                    true,
-                    false,
-                    None,
-                    2
-                )
-                .is_err(),
-            "backwards cursor must be rejected"
-        );
+        // "10" sorts before "9" lexically but is a valid opaque successor.
+        reconciler
+            .observe(
+                head("10", 2, 6, volume),
+                vec![],
+                [0; 32],
+                true,
+                false,
+                None,
+                2,
+            )
+            .unwrap();
     }
 
     #[test]

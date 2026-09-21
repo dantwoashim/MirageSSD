@@ -72,6 +72,16 @@ impl<B: ObjectBackend> PageProvider<B> {
         self
     }
 
+    /// The backend as a trait object for non-provider consumers (payload
+    /// publication, evicted-payload fetch).
+    #[must_use]
+    pub fn backend_arc(&self) -> Arc<dyn ObjectBackend>
+    where
+        B: 'static,
+    {
+        Arc::clone(&self.backend) as Arc<dyn ObjectBackend>
+    }
+
     /// In-flight flights, queued pool jobs, and running pool jobs.
     #[must_use]
     pub fn flight_metrics(&self) -> (usize, usize, usize) {

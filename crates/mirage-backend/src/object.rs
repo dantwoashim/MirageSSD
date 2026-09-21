@@ -73,6 +73,8 @@ pub enum ObjectKind {
     Manifest,
     Commit,
     Profile,
+    /// A managed-volume journal payload published as one immutable object.
+    Payload,
 }
 
 impl ObjectKind {
@@ -84,6 +86,7 @@ impl ObjectKind {
             Self::Manifest => "manifest",
             Self::Commit => "commit",
             Self::Profile => "profile",
+            Self::Payload => "payload",
         }
     }
 }

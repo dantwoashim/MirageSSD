@@ -34,7 +34,8 @@ impl FlightFailure {
             }
             FetchFailureCause::SourceMissing => MirageError::remote_object_missing(message),
             FetchFailureCause::Timeout => MirageError::backend_unavailable(message),
-            FetchFailureCause::BudgetExhausted => MirageError::cache_full(message),
+            FetchFailureCause::DeadlineExceeded => MirageError::deadline_exceeded(message),
+            FetchFailureCause::BudgetExceeded => MirageError::cache_full(message),
             FetchFailureCause::CallerCancelled => MirageError::cancelled(message),
             FetchFailureCause::MalformedResponse => MirageError::invalid_argument(message),
             FetchFailureCause::Internal => MirageError::internal_invariant(message),

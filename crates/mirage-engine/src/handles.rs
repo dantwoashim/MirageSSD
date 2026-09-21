@@ -189,6 +189,15 @@ impl HandleTable {
         }
     }
 
+    /// True while the inode has at least one open handle.
+    #[must_use]
+    pub fn is_open(&self, inode: InodeId) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|inner| inner.contains_key(&inode))
+    }
+
     /// True while the inode is an open delete-pending tombstone.
     #[must_use]
     pub fn is_delete_pending(&self, inode: InodeId) -> bool {

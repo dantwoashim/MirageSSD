@@ -42,7 +42,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations");
-    assert_eq!(migration_count, 19);
+    assert_eq!(migration_count, 24);
     drop(raw);
     drop(db);
 
@@ -54,7 +54,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations after restart");
-    assert_eq!(migration_count2, 19);
+    assert_eq!(migration_count2, 24);
     drop(raw2);
     drop(db2);
 }
@@ -128,7 +128,7 @@ fn future_unsupported_migration_version_is_rejected() {
     let raw = open_raw_connection(&db_path);
     raw.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at_ns)
-         VALUES (20, '0020_future.sql', ?1, 1000)",
+         VALUES (25, '0025_future.sql', ?1, 1000)",
         [[0xAA_u8; 32].as_slice()],
     )
     .expect("insert future migration");

@@ -64,25 +64,11 @@ impl DivergenceStatus {
     }
 }
 
-/// Observes a remote head; the changes cursor must be monotonically
-/// non-decreasing — a backwards cursor means the remote history was rewritten
-/// and is rejected rather than adopted.
+/// Observes a remote head. The changes cursor is an opaque provider token —
+/// never ordered lexically ("10" is a valid successor to "9"). The token only
+/// advances when a page was applied, which the caller decides; the ledger
+/// records what it is told and keeps the newest observed head.
 pub fn observe_head(connection: &mut Connection, head: &RemoteHead) -> Result<(), MirageError> {
-    let existing: Option<String> = connection
-        .query_row(
-            "SELECT changes_cursor FROM remote_heads WHERE volume_id = ?1",
-            [head.volume_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| sqlite(e, "remote head lookup failed"))?;
-    if let Some(previous) = existing
-        && head.changes_cursor < previous
-    {
-        return Err(MirageError::integrity_mismatch(
-            "remote changes cursor moved backwards",
-        ));
-    }
     connection
         .execute(
             "INSERT INTO remote_heads(volume_id, head_commit, head_seq, changes_cursor, observed_ns)
@@ -104,17 +90,25 @@ pub fn observe_head(connection: &mut Connection, head: &RemoteHead) -> Result<()
     Ok(())
 }
 
-/// Records one remote change under its cursor; same-cursor replays are
-/// idempotent.
+/// Records one remote change under its page cursor. A provider page carries
+/// many changes that share one opaque token, so entries are keyed by a
+/// device-local sequence; replay deduplicates on (cursor, kind, payload) so
+/// an interrupted and re-fetched page never double-applies.
 pub fn record_change(
     connection: &mut Connection,
     change: &RemoteChange,
 ) -> Result<(), MirageError> {
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin remote change record"))?;
+    transaction
         .execute(
-            "INSERT OR IGNORE INTO remote_changes
-             (volume_id, cursor, change_kind, payload, observed_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO remote_change_entries
+             (volume_id, entry_seq, cursor, change_kind, payload, observed_ns)
+             VALUES (?1,
+                     (SELECT COALESCE(MAX(entry_seq) + 1, 1)
+                      FROM remote_change_entries WHERE volume_id = ?1),
+                     ?2, ?3, ?4, ?5)",
             params![
                 change.volume_id.as_bytes().as_slice(),
                 change.cursor,
@@ -124,10 +118,15 @@ pub fn record_change(
             ],
         )
         .map_err(|e| sqlite(e, "remote change record failed"))?;
-    Ok(())
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "remote change record commit failed"))
 }
 
-/// Changes after `cursor` in cursor order — the replay stream.
+/// Changes recorded after the caller's last-applied cursor, in apply order.
+/// The token is opaque: "after" means entries sequenced past the newest
+/// entry recorded under that token; an empty or unseen cursor replays
+/// everything.
 pub fn changes_after(
     connection: &Connection,
     volume_id: RepositoryId,
@@ -136,8 +135,11 @@ pub fn changes_after(
     let mut statement = connection
         .prepare(
             "SELECT volume_id, cursor, change_kind, payload, observed_ns
-             FROM remote_changes WHERE volume_id = ?1 AND cursor > ?2
-             ORDER BY cursor",
+             FROM remote_change_entries
+             WHERE volume_id = ?1 AND entry_seq > (
+                 SELECT COALESCE(MAX(entry_seq), 0) FROM remote_change_entries
+                 WHERE volume_id = ?1 AND cursor = ?2)
+             ORDER BY entry_seq",
         )
         .map_err(|e| sqlite(e, "remote change scan prepare failed"))?;
     let rows = statement

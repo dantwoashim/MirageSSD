@@ -412,6 +412,34 @@ pub fn set_drive_origin(
     }))
 }
 
+/// Persists the repository's volume mode. Switching is refused while the
+/// repository is mounted so a live host never changes contract underneath
+/// the kernel client.
+pub fn set_volume_mode(
+    database: &Database,
+    repository_id: RepositoryId,
+    managed: bool,
+) -> Result<Value, MirageError> {
+    let state = database
+        .load_repository_state(repository_id)?
+        .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
+    if state != RepositoryState::ReadyUnmounted {
+        return Err(MirageError::repository_conflict(
+            "repository volume mode can change only while ready and unmounted",
+        ));
+    }
+    let mode = if managed {
+        mirage_db::VolumeMode::Managed
+    } else {
+        mirage_db::VolumeMode::Legacy
+    };
+    database.set_repository_volume_mode(repository_id, mode)?;
+    Ok(json!({
+        "repository_id": repository_id.to_string(),
+        "volume_mode": mode.as_str()
+    }))
+}
+
 pub fn convert(
     database: &Database,
     repository_id: RepositoryId,
@@ -2287,16 +2315,26 @@ pub fn validate_explorer_mount_ready(
             .map_err(|_| MirageError::unsupported_layout("mount index exceeds u32 pages"))?;
         hashes.insert(index.page_by_ordinal(ordinal)?.plaintext_hash());
     }
-    for hash in &hashes {
-        if verify_page(&resident, database, *hash, IntegrityClass::Clean)?
-            != VerifyOutcome::Verified
-        {
-            return Err(MirageError::repository_conflict(
-                "Explorer volume requires every repository page to be materialized and verified",
-            ));
+    let config = load_config(database, repository_id)?;
+    // A managed Drive volume fetches non-resident pages on demand, so the
+    // Explorer gate only needs the provider inputs (manifest + key), not
+    // upfront residency. Legacy mounts still require full verification.
+    let on_demand = database.load_repository_volume_mode(repository_id)?
+        == Some(mirage_db::VolumeMode::Managed)
+        && config.origin == RuntimeOrigin::Drive
+        && config.import_root.join(DRIVE_MANIFEST).is_file()
+        && config.import_root.join("repository-key.dpapi").is_file();
+    if !on_demand {
+        for hash in &hashes {
+            if verify_page(&resident, database, *hash, IntegrityClass::Clean)?
+                != VerifyOutcome::Verified
+            {
+                return Err(MirageError::repository_conflict(
+                    "Explorer volume requires every repository page to be materialized and verified",
+                ));
+            }
         }
     }
-    let config = load_config(database, repository_id)?;
     if config.origin == RuntimeOrigin::Drive && !config.import_root.join(DRIVE_MANIFEST).is_file() {
         return Err(MirageError::integrity_mismatch(
             "Drive publication metadata is unavailable",

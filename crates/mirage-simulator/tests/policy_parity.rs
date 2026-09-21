@@ -7,6 +7,7 @@ fn live_and_simulator_adapters_choose_identical_victims() {
         PolicyKind::Lru,
         PolicyKind::SegmentedLru,
         PolicyKind::TinyLfuHybrid,
+        PolicyKind::TwoQ,
     ] {
         let mut live = PolicyCore::new(kind, 3).expect("live");
         let mut sim = SimCachePolicy::new(kind, 3).expect("sim");

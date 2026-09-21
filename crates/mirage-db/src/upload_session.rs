@@ -237,12 +237,16 @@ fn load_session(
         .map_err(|e| sqlite(e, "upload session load failed"))
 }
 
-/// Advances the session phase; transitions are forward-only except
-/// `uploading`→`initiated`/`created` restarts allowed by recovery.
+/// Advances the session phase with a compare-and-swap on the expected
+/// predecessor: a transition recorded after a concurrent recovery or a
+/// double-drive only lands when the row still holds `expected_phase`.
+/// Progress is also monotone — a transition cannot lower the committed-byte
+/// counter or move a terminal session.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_phase(
     connection: &mut Connection,
     session_id: &[u8; 16],
+    expected_phase: SessionPhase,
     phase: SessionPhase,
     remote_upload_id: Option<&str>,
     session_uri: Option<&str>,
@@ -258,7 +262,9 @@ pub fn advance_phase(
                 session_uri = COALESCE(?3, session_uri), chunk_offset = ?4,
                 committed_bytes = ?5, error_class = ?6, updated_ns = ?7,
                 attempts = attempts + 1
-             WHERE session_id = ?8",
+             WHERE session_id = ?8 AND phase = ?9
+               AND ?5 >= committed_bytes
+               AND ?4 >= chunk_offset",
             params![
                 phase.as_str(),
                 remote_upload_id,
@@ -268,12 +274,13 @@ pub fn advance_phase(
                 error_class,
                 now_ns,
                 session_id.as_slice(),
+                expected_phase.as_str(),
             ],
         )
         .map_err(|e| sqlite(e, "upload session advance failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
-            "upload session is missing",
+            "upload session phase does not match the expected predecessor",
         ));
     }
     Ok(())

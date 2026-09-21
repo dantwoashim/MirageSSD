@@ -47,6 +47,40 @@ fn mounted_provider_matches_one_hundred_thousand_random_bytes() {
     let executable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../build/windows-msvc-debug/native/winfsp-adapter/Debug/mirage-fs.exe");
     assert!(executable.is_file(), "build native adapter before Gate B");
+    // A stale adapter cannot satisfy the gate: the binary must be newer than
+    // every adapter source and the Rust FFI library it links.
+    let adapter_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../native/winfsp-adapter");
+    let built_at = std::fs::metadata(&executable)
+        .and_then(|meta| meta.modified())
+        .expect("adapter mtime");
+    let mut stale_inputs = Vec::new();
+    for dir in [adapter_root.join("src"), adapter_root.join("include")] {
+        for entry in std::fs::read_dir(&dir).expect("adapter sources").flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|ext| ext == "cpp" || ext == "hpp")
+                && std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    > Some(built_at)
+            {
+                stale_inputs.push(path);
+            }
+        }
+    }
+    let rust_lib =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mirage_ffi.lib");
+    if let Ok(Ok(built)) = std::fs::metadata(&rust_lib).map(|meta| meta.modified())
+        && built > built_at
+    {
+        stale_inputs.push(rust_lib);
+    }
+    assert!(
+        stale_inputs.is_empty(),
+        "adapter binary is older than its inputs; rebuild windows-msvc-debug: {stale_inputs:?}"
+    );
     let program_files = std::env::var_os("ProgramFiles(x86)").expect("ProgramFiles(x86)");
     let runtime_bin = std::fs::read_dir(std::path::PathBuf::from(program_files).join("WinFsp/SxS"))
         .expect("installed WinFsp runtime")

@@ -16,7 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mirage_types::{MirageError, PageHash, RepositoryId};
 use serde::{Deserialize, Serialize};
 
-const OWNER_RECORD: &str = "volume-owner.json";
 const OWNER_FORMAT_VERSION: u32 = 1;
 
 /// Ownership lifecycle of a mounted volume. Transitions are monotonic except
@@ -126,7 +125,9 @@ impl VolumeCoordinator {
     /// starts in `Recovering` rather than `Starting`.
     pub fn acquire(state_root: &Path, repository_id: RepositoryId) -> Result<Self, MirageError> {
         let lock = VolumeOwnerLock::acquire(state_root, repository_id)?;
-        let record_path = state_root.join(OWNER_RECORD);
+        // One owner record per repository: a shared file would let a stale
+        // record for repo A permanently block mounts of repo B.
+        let record_path = state_root.join(format!("volume-owner-{repository_id}.json"));
         let previous = load_owner_record(&record_path, repository_id)?;
         let epoch = previous
             .as_ref()
@@ -561,17 +562,35 @@ mod tests {
         assert!(coordinator.transition(VolumeState::Quiescing).is_err());
         assert!(coordinator.transition(VolumeState::Mounted).is_ok());
         assert!(coordinator.transition(VolumeState::Mounted).is_err());
-        // A foreign repository's record must not be adopted.
+        // A foreign repository's record must not be adopted: the copied
+        // record names repo A's id, so acquiring repo B ignores it.
         let foreign = dir.path().join("foreign");
         std::fs::create_dir_all(&foreign).unwrap();
-        std::fs::copy(dir.path().join(OWNER_RECORD), foreign.join(OWNER_RECORD)).unwrap();
+        let record_name = format!("volume-owner-{repo}.json");
+        std::fs::copy(dir.path().join(&record_name), foreign.join(&record_name)).unwrap();
         assert!(
-            VolumeCoordinator::acquire(&foreign, RepositoryId::from_bytes([8; 16])).is_err()
-                || load_owner_record(
-                    &foreign.join(OWNER_RECORD),
-                    RepositoryId::from_bytes([8; 16])
-                )
-                .is_err()
+            load_owner_record(
+                &foreign.join(&record_name),
+                RepositoryId::from_bytes([8; 16])
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn owner_records_are_scoped_per_repository() {
+        let dir = root();
+        let repo_a = RepositoryId::from_bytes([1; 16]);
+        let repo_b = RepositoryId::from_bytes([2; 16]);
+        let a = VolumeCoordinator::acquire(dir.path(), repo_a).unwrap();
+        a.release().unwrap();
+        // A second repository must mount cleanly even after repo A left a
+        // durable owner record behind.
+        let b = VolumeCoordinator::acquire(dir.path(), repo_b).unwrap();
+        b.release().unwrap();
+        // Reacquiring A still sees its own record and continues the epoch.
+        let a2 = VolumeCoordinator::acquire(dir.path(), repo_a).unwrap();
+        assert_eq!(a2.epoch, 2);
+        a2.release().unwrap();
     }
 }

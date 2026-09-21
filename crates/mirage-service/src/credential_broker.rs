@@ -27,6 +27,7 @@ pub trait CredentialBroker: Send + Sync {
     fn access_capability(&self, account_id: &str) -> Result<AccessCapability, String>;
 }
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,9 +35,12 @@ use std::time::Duration;
 /// share one refresh, and a returned capability is only replaced once it is
 /// inside `refresh_margin` of expiry. Token expiry during a long session
 /// refreshes in place — no remount.
+///
+/// Capabilities are cached *per account*: a capability minted for account A
+/// must never be served to a caller asking for account B, even transiently.
 pub struct TokenBroker<B: CredentialBroker> {
     broker: B,
-    capability: Mutex<Option<Arc<AccessCapability>>>,
+    capabilities: Mutex<HashMap<String, Arc<AccessCapability>>>,
     refresh_lock: Mutex<()>,
     refresh_margin: Duration,
 }
@@ -46,7 +50,7 @@ impl<B: CredentialBroker> TokenBroker<B> {
     pub fn new(broker: B) -> Self {
         Self {
             broker,
-            capability: Mutex::new(None),
+            capabilities: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
             refresh_margin: Duration::from_secs(60),
         }
@@ -58,10 +62,10 @@ impl<B: CredentialBroker> TokenBroker<B> {
         self
     }
 
-    /// A capability valid for at least `refresh_margin`, refreshing
-    /// single-flight on expiry.
+    /// A capability for `account_id` valid for at least `refresh_margin`,
+    /// refreshing single-flight on expiry.
     pub fn access(&self, account_id: &str) -> Result<Arc<AccessCapability>, String> {
-        if let Some(capability) = self.current() {
+        if let Some(capability) = self.current(account_id) {
             return Ok(capability);
         }
         self.refresh(account_id)
@@ -74,14 +78,14 @@ impl<B: CredentialBroker> TokenBroker<B> {
             .refresh_lock
             .lock()
             .map_err(|_| "token broker lock poisoned".to_string())?;
-        if let Some(capability) = self.current() {
+        if let Some(capability) = self.current(account_id) {
             return Ok(capability);
         }
         let capability = Arc::new(self.broker.access_capability(account_id)?);
-        self.capability
+        self.capabilities
             .lock()
             .map_err(|_| "token broker capability lock poisoned".to_string())?
-            .replace(Arc::clone(&capability));
+            .insert(account_id.to_string(), Arc::clone(&capability));
         Ok(capability)
     }
 
@@ -93,15 +97,15 @@ impl<B: CredentialBroker> TokenBroker<B> {
             .lock()
             .map_err(|_| "token broker lock poisoned".to_string())?;
         let capability = Arc::new(self.broker.access_capability(account_id)?);
-        self.capability
+        self.capabilities
             .lock()
             .map_err(|_| "token broker capability lock poisoned".to_string())?
-            .replace(Arc::clone(&capability));
+            .insert(account_id.to_string(), Arc::clone(&capability));
         Ok(capability)
     }
 
-    fn current(&self) -> Option<Arc<AccessCapability>> {
-        let capability = self.capability.lock().ok()?.clone()?;
+    fn current(&self, account_id: &str) -> Option<Arc<AccessCapability>> {
+        let capability = self.capabilities.lock().ok()?.get(account_id).cloned()?;
         let fresh = capability
             .expires_at
             .duration_since(SystemTime::now())
@@ -199,7 +203,7 @@ mod tests {
         // Zero-lifetime capabilities expire immediately, so each scope's
         // access may refresh — but the broker never re-fetches while a
         // refresh is in flight.
-        assert!(shared.capability.lock().unwrap().is_some());
+        assert!(shared.capabilities.lock().unwrap().contains_key("acct"));
     }
 
     #[test]

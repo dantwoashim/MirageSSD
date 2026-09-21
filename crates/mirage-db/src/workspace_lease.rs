@@ -151,12 +151,18 @@ pub fn is_admitted(
     path: &str,
     now_ns: i64,
 ) -> Result<bool, MirageError> {
+    // Prefix match is literal — LIKE would treat `_`/`%` inside a stored
+    // lease prefix as wildcards and admit unrelated directories.
     connection
         .query_row(
             "SELECT 1 FROM workspace_leases
              WHERE volume_id = ?1 AND status = 'verified'
                AND (expires_ns IS NULL OR expires_ns > ?2)
-               AND (?3 = path_prefix OR ?3 LIKE path_prefix || '/%' OR path_prefix = '')
+               AND (?3 = path_prefix
+                    OR (length(?3) > length(path_prefix)
+                        AND substr(?3, 1, length(path_prefix)) = path_prefix
+                        AND substr(?3, length(path_prefix) + 1, 1) = '/')
+                    OR path_prefix = '')
              LIMIT 1",
             params![volume_id.as_bytes().as_slice(), now_ns, path],
             |row| row.get::<_, i64>(0),

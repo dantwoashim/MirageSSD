@@ -105,33 +105,61 @@ pub fn verify(
     )
 }
 
+/// Alternative content-key sources for `extract`: a DPAPI repository key
+/// record, or a recovery envelope opened with its secret file.
+pub struct ExtractKeySource<'a> {
+    pub repository_key: Option<&'a Path>,
+    pub envelope: Option<&'a Path>,
+    pub secret_file: Option<&'a Path>,
+}
+
+/// Resolves the pack-read key from the selected source.
+fn read_encryption(
+    repository_id: RepositoryId,
+    key_source: &ExtractKeySource<'_>,
+) -> Result<Option<PackReadEncryption>, MirageError> {
+    if let Some(path) = key_source.repository_key {
+        return Ok(Some(PackReadEncryption {
+            repository_id,
+            key: std::sync::Arc::new(load_repository_key(path, repository_id)?),
+        }));
+    }
+    if let Some(envelope) = key_source.envelope {
+        let secret_file = key_source
+            .secret_file
+            .ok_or_else(|| MirageError::invalid_argument("--envelope requires --secret-file"))?;
+        return Ok(Some(PackReadEncryption {
+            repository_id,
+            key: std::sync::Arc::new(crate::commands::recovery::envelope_content_key(
+                envelope,
+                secret_file,
+                repository_id,
+            )?),
+        }));
+    }
+    Ok(None)
+}
+
 pub fn extract(
     backend_root: &Path,
     destination: &Path,
     repository_id: RepositoryId,
     key_id_hex: &str,
     test_key_hex: &str,
-    repository_key: Option<&Path>,
+    key_source: ExtractKeySource<'_>,
     json: bool,
 ) -> Result<(), MirageError> {
     let signer = signer(key_id_hex, test_key_hex)?;
     let backend = LocalObjectBackend::open(backend_root, repository_id)?;
     let recovered =
         futures_executor::block_on(recover_repository(&backend, repository_id, &signer))?;
-    let encryption = repository_key
-        .map(|path| {
-            Ok::<PackReadEncryption, MirageError>(PackReadEncryption {
-                repository_id,
-                key: std::sync::Arc::new(load_repository_key(path, repository_id)?),
-            })
-        })
-        .transpose()?;
-    let report = futures_executor::block_on(extract_virtual_files_with_encryption(
+    let encryption = read_encryption(repository_id, &key_source)?;
+    let report = extract_virtual_files_with_encryption(
         &backend,
         &recovered.manifest,
         destination,
         encryption.as_ref(),
-    ))?;
+    )?;
     emit(
         json,
         serde_json::json!({

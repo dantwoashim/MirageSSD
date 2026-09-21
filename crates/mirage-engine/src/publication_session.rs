@@ -56,6 +56,10 @@ impl<'a> PublicationSession<'a> {
     /// Publishes `bytes` to `object_key`, resuming an existing session when
     /// one is open. Idempotent by object key: a second call for the same key
     /// completes without re-uploading committed bytes.
+    ///
+    /// The caller-supplied `content_hash` is only a claim — the session
+    /// re-computes the hash over `bytes` and refuses to upload or resume a
+    /// session whose identity does not match the payload being published.
     pub fn publish(
         &self,
         object_key: &str,
@@ -63,6 +67,11 @@ impl<'a> PublicationSession<'a> {
         bytes: &[u8],
         now_ns: i64,
     ) -> Result<UploadSession, MirageError> {
+        if blake3::hash(bytes).as_bytes() != &content_hash {
+            return Err(MirageError::integrity_mismatch(
+                "publication bytes do not match the declared content hash",
+            ));
+        }
         let session = self.open_or_create(object_key, content_hash, bytes.len() as u64, now_ns)?;
         self.step(session.session_id, bytes, now_ns)
     }
@@ -89,7 +98,7 @@ impl<'a> PublicationSession<'a> {
                         .transport
                         .initiate(&session.object_key, session.total_bytes)?;
                     self.advance(
-                        &session_id,
+                        &session,
                         SessionPhase::Initiated,
                         Some(&remote.upload_id),
                         Some(&remote.session_uri),
@@ -107,7 +116,7 @@ impl<'a> PublicationSession<'a> {
                     let total = session.total_bytes.unwrap_or(bytes.len() as u64);
                     if offset >= total {
                         self.advance(
-                            &session_id,
+                            &session,
                             SessionPhase::Uploaded,
                             None,
                             None,
@@ -129,7 +138,7 @@ impl<'a> PublicationSession<'a> {
                             })?;
                     let committed = self.transport.upload(&uri, offset, chunk)?;
                     self.advance(
-                        &session_id,
+                        &session,
                         SessionPhase::Uploading,
                         None,
                         None,
@@ -145,7 +154,7 @@ impl<'a> PublicationSession<'a> {
                     })?;
                     self.transport.commit(&uri)?;
                     self.advance(
-                        &session_id,
+                        &session,
                         SessionPhase::Committed,
                         None,
                         None,
@@ -174,14 +183,15 @@ impl<'a> PublicationSession<'a> {
         now_ns: i64,
     ) -> Result<(), MirageError> {
         let session = self.load(&session_id)?;
-        self.advance(
-            &session_id,
+        self.db.writer().upload_session_advance(
+            session.session_id,
+            session.phase,
             session.phase,
             None,
             None,
             session.chunk_offset,
             session.committed_bytes,
-            Some(error_class),
+            Some(error_class.to_string()),
             now_ns,
         )
     }
@@ -203,8 +213,20 @@ impl<'a> PublicationSession<'a> {
                 return Ok(existing);
             }
             if !existing.phase.is_terminal() {
+                // Resuming an unfinished session must bind the *same*
+                // content — hash and length — or the resume would upload a
+                // different payload under the old identity.
+                if existing.content_hash != Some(content_hash)
+                    || existing.total_bytes != Some(total_bytes)
+                {
+                    return Err(MirageError::integrity_mismatch(
+                        "existing upload session covers different content",
+                    ));
+                }
                 return Ok(existing);
             }
+            // A terminal session for *different* content under the same key
+            // is a new version — fall through and create a fresh session.
         }
         let mut session_id = [0u8; 16];
         getrandom::fill(&mut session_id)
@@ -240,10 +262,13 @@ impl<'a> PublicationSession<'a> {
             .ok_or_else(|| MirageError::repository_conflict("upload session is missing"))
     }
 
+    /// Advances `session` (just loaded) to `phase`, compare-and-swapping on
+    /// its observed predecessor so a stale driver or a concurrent recovery
+    /// cannot move a session twice.
     #[allow(clippy::too_many_arguments)]
     fn advance(
         &self,
-        session_id: &[u8; 16],
+        session: &UploadSession,
         phase: SessionPhase,
         remote_upload_id: Option<&str>,
         session_uri: Option<&str>,
@@ -253,7 +278,8 @@ impl<'a> PublicationSession<'a> {
         now_ns: i64,
     ) -> Result<(), MirageError> {
         self.db.writer().upload_session_advance(
-            *session_id,
+            session.session_id,
+            session.phase,
             phase,
             remote_upload_id.map(str::to_string),
             session_uri.map(str::to_string),

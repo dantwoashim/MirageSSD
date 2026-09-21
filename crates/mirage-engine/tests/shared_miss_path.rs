@@ -628,6 +628,88 @@ fn pool_saturation_is_a_typed_budget_failure() {
 }
 
 #[test]
+fn transient_fetch_is_rejected_when_the_pool_is_saturated() {
+    // The transient path shares the bounded pool: a queued-but-unstarted
+    // fetch plus a running one exhaust workers=1/queue_depth=1, so the next
+    // fetch must surface CacheFull rather than bypass the bound.
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 1,
+        speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    let frames = [frame(0xa1), frame(0xb2), frame(0xc3)];
+    let hashes: Vec<_> = frames.iter().map(|(hash, _)| *hash).collect();
+    let fixture = build_fixture(
+        frames.into_iter().map(|(_, encoded)| encoded).collect(),
+        hashes.clone(),
+        Some(gate_rx),
+        None,
+        Some(pool),
+        BUDGET,
+    );
+    let provider = &fixture.provider;
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            block_on(provider.fetch_transient(hashes[0], context(CancellationToken::new())))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.backend.reads.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fixture.backend.reads.load(Ordering::SeqCst), 1);
+        let second = scope.spawn(|| {
+            block_on(provider.fetch_transient(hashes[1], context(CancellationToken::new())))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.flight_metrics().1 == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            provider.flight_metrics().1,
+            1,
+            "second transient fetch must be queued behind the running one"
+        );
+        let error = match block_on(
+            provider.fetch_transient(hashes[2], context(CancellationToken::new())),
+        ) {
+            Ok(_) => panic!("saturated pool must reject the transient fetch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, MirageErrorKind::CacheFull);
+        gate_tx.send(()).expect("open gate");
+        let page = first.join().expect("first thread").expect("first page");
+        assert_eq!(page.bytes.as_ref(), &[0xa1; PAGE]);
+        let page = second.join().expect("second thread").expect("second page");
+        assert_eq!(page.bytes.as_ref(), &[0xb2; PAGE]);
+    });
+}
+
+#[test]
+fn transient_fetch_expired_while_queued_is_deadline_exceeded() {
+    // A queued job whose deadline passes never runs: the expiry hook resolves
+    // the shared flight and the caller sees DeadlineExceeded.
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 4,
+        speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    let (hash, encoded) = frame(0xd4);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, Some(pool), BUDGET);
+    let mut expired = context(CancellationToken::new());
+    expired.deadline_ns = 0;
+    let error = match block_on(fixture.provider.fetch_transient(hash, expired)) {
+        Ok(_) => panic!("expired fetch must not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, MirageErrorKind::DeadlineExceeded);
+}
+
+#[test]
 fn provide_sync_places_verified_page_in_arena() {
     let (hash, encoded) = frame(0x51);
     let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, BUDGET);

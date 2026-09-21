@@ -158,12 +158,12 @@ fn materialize_and_publish(
     encryption: &PackReadEncryption,
     record: &mut ActivationRecord,
 ) -> Result<Value, MirageError> {
-    let report = futures_executor::block_on(extract_virtual_files_with_encryption(
+    let report = extract_virtual_files_with_encryption(
         backend.as_ref(),
         manifest,
         &record.staging,
         Some(encryption),
-    ))?;
+    )?;
     if report.bytes_written != record.required_bytes {
         return Err(MirageError::integrity_mismatch(
             "native activation wrote a different byte count than the verified manifest",

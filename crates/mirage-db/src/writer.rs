@@ -48,6 +48,11 @@ enum Command {
     CreateRepository(NewRepository, Reply<()>),
     SetRepositoryOwnerSid(mirage_types::RepositoryId, String, String, Reply<()>),
     SetRepositoryState(RepositoryStateChange, Reply<RepositoryState>),
+    SetRepositoryVolumeMode(
+        mirage_types::RepositoryId,
+        crate::repository::VolumeMode,
+        Reply<()>,
+    ),
     InsertVerifiedGeneration(VerifiedGeneration, Reply<()>),
     ActivateGeneration(Activation, Reply<()>),
     RegisterBackendAccount(BackendAccount, Reply<()>),
@@ -91,6 +96,13 @@ enum Command {
     ),
     NamespaceRecordLegacy(RepositoryId, String, InodeId, Reply<()>),
     NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
+    NamespaceSeedManaged(
+        RepositoryId,
+        Vec<NamespaceSeedNode>,
+        [u8; 32],
+        i64,
+        Reply<Option<[u8; 32]>>,
+    ),
     NamespaceCheckpoint(RepositoryId, i64, Reply<(u64, [u8; 32])>),
     EnsureDeviceIdentity(i64, Reply<DeviceId>),
     PhysicalRegisterFile(PhysicalFileRecord, Reply<()>),
@@ -101,16 +113,41 @@ enum Command {
     PhysicalAdjustExtentPin([u8; 16], i64, Reply<()>),
     PhysicalReapReservations(i64, Reply<u64>),
     OperationBegin(OperationRecord, Vec<OperationPayloadRecord>, Reply<()>),
+    OperationAllocSeq(RepositoryId, Reply<i64>),
+    MutationCommit(
+        Option<crate::operation::ExtentMutation>,
+        OperationRecord,
+        Vec<OperationPayloadRecord>,
+        Option<crate::physical::PhysicalCommit>,
+        i64,
+        Reply<()>,
+    ),
     OperationCommit([u8; 16], Reply<()>),
     OperationPayloadFlushed([u8; 16], [u8; 32], i64, Reply<()>),
     FlushGroupOpen(RepositoryId, i64, Reply<i64>),
     FlushGroupMark(i64, i64, Reply<u64>),
     OperationPublish(Vec<[u8; 16]>, Reply<u64>),
     OperationReclaimPending(RepositoryId, i64, Reply<u64>),
+    /// Quiesce-time compaction: drop superseded extent versions and mark
+    /// unreferenced journal payload extents dead; returns `(payload_id,
+    /// length_bytes)` for each extent that transitioned.
+    ExtentCompactVolume(RepositoryId, [u8; 16], i64, Reply<Vec<([u8; 16], i64)>>),
+    /// Records one payload's remote publication; fails when the payload is
+    /// no longer referenced by any byte extent.
+    PayloadPublished(crate::payload_remote::PayloadRemoteObject, Reply<()>),
     ExtentReplace(
         RepositoryId,
         mirage_types::InodeId,
         i64,
+        Vec<crate::extent::ByteExtent>,
+        i64,
+        Reply<()>,
+    ),
+    ExtentReplaceEof(
+        RepositoryId,
+        mirage_types::InodeId,
+        i64,
+        u64,
         Vec<crate::extent::ByteExtent>,
         i64,
         Reply<()>,
@@ -133,6 +170,7 @@ enum Command {
     UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
     UploadSessionAdvance(
         [u8; 16],
+        crate::upload_session::SessionPhase,
         crate::upload_session::SessionPhase,
         Option<String>,
         Option<String>,
@@ -234,6 +272,12 @@ impl DbWriter {
                         }
                         Command::SetRepositoryState(value, reply) => {
                             respond(reply, repository::set_state(&mut connection, value));
+                        }
+                        Command::SetRepositoryVolumeMode(id, mode, reply) => {
+                            respond(
+                                reply,
+                                repository::set_volume_mode(&mut connection, id, mode),
+                            );
                         }
                         Command::InsertVerifiedGeneration(value, reply) => {
                             respond(reply, generation::insert_verified(&mut connection, value));
@@ -373,6 +417,24 @@ impl DbWriter {
                                 namespace::seed_volume(&mut connection, volume_id, nodes, now_ns),
                             );
                         }
+                        Command::NamespaceSeedManaged(
+                            volume_id,
+                            nodes,
+                            commit_hash,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::seed_managed_volume(
+                                    &mut connection,
+                                    volume_id,
+                                    nodes,
+                                    &commit_hash,
+                                    now_ns,
+                                ),
+                            );
+                        }
                         Command::PhysicalRegisterFile(record, reply) => {
                             respond(reply, physical::register_file(&mut connection, &record));
                         }
@@ -410,6 +472,32 @@ impl DbWriter {
                             respond(
                                 reply,
                                 operation::begin_operation(&mut connection, &operation, &payloads),
+                            );
+                        }
+                        Command::OperationAllocSeq(volume_id, reply) => {
+                            respond(
+                                reply,
+                                operation::allocate_device_seq(&mut connection, volume_id),
+                            );
+                        }
+                        Command::MutationCommit(
+                            extents,
+                            operation,
+                            payloads,
+                            physical,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                operation::commit_mutation(
+                                    &mut connection,
+                                    extents.as_ref(),
+                                    &operation,
+                                    &payloads,
+                                    physical.as_ref(),
+                                    now,
+                                ),
                             );
                         }
                         Command::OperationCommit(operation_id, reply) => {
@@ -450,6 +538,26 @@ impl DbWriter {
                                 operation::reclaim_pending(&mut connection, volume_id, now),
                             );
                         }
+                        Command::PayloadPublished(record, reply) => {
+                            respond(
+                                reply,
+                                crate::payload_remote::record_payload_publication(
+                                    &mut connection,
+                                    &record,
+                                ),
+                            );
+                        }
+                        Command::ExtentCompactVolume(volume_id, file_id, now, reply) => {
+                            respond(
+                                reply,
+                                crate::extent::compact_volume(
+                                    &mut connection,
+                                    volume_id,
+                                    file_id,
+                                    now,
+                                ),
+                            );
+                        }
                         Command::ExtentReplace(volume, inode, version, extents, now, reply) => {
                             respond(
                                 reply,
@@ -458,6 +566,28 @@ impl DbWriter {
                                     volume,
                                     inode,
                                     version,
+                                    &extents,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::ExtentReplaceEof(
+                            volume,
+                            inode,
+                            version,
+                            eof,
+                            extents,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                crate::extent::replace_extents_with_eof(
+                                    &mut connection,
+                                    volume,
+                                    inode,
+                                    version,
+                                    eof,
                                     &extents,
                                     now,
                                 ),
@@ -550,6 +680,7 @@ impl DbWriter {
                         }
                         Command::UploadSessionAdvance(
                             session_id,
+                            expected_phase,
                             phase,
                             upload_id,
                             uri,
@@ -564,6 +695,7 @@ impl DbWriter {
                                 crate::upload_session::advance_phase(
                                     &mut connection,
                                     &session_id,
+                                    expected_phase,
                                     phase,
                                     upload_id.as_deref(),
                                     uri.as_deref(),
@@ -682,6 +814,14 @@ impl DbWriter {
         self.request(|reply| {
             Command::SetRepositoryOwnerSid(repository_id, expected_owner_sid, new_owner_sid, reply)
         })
+    }
+
+    pub(crate) fn set_repository_volume_mode(
+        &self,
+        repository_id: mirage_types::RepositoryId,
+        mode: crate::repository::VolumeMode,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::SetRepositoryVolumeMode(repository_id, mode, reply))
     }
 
     pub(crate) fn set_repository_state(
@@ -853,6 +993,30 @@ impl DbWriter {
         self.request(|reply| Command::NamespaceSeed(volume_id, nodes, now_ns, reply))
     }
 
+    /// Managed-volume variant of [`namespace_seed`](Self::namespace_seed):
+    /// seed + durable marker in one transaction; returns the existing
+    /// marker's index hash when the volume was already seeded.
+    pub fn namespace_seed_managed(
+        &self,
+        volume_id: RepositoryId,
+        nodes: Vec<NamespaceSeedNode>,
+        commit_hash: [u8; 32],
+        now_ns: i64,
+    ) -> Result<Option<[u8; 32]>, MirageError> {
+        self.request(|reply| {
+            Command::NamespaceSeedManaged(volume_id, nodes, commit_hash, now_ns, reply)
+        })
+    }
+
+    /// Records a payload's remote publication; fails when the payload is no
+    /// longer referenced by extents (the upload is then orphaned).
+    pub fn payload_published(
+        &self,
+        record: crate::payload_remote::PayloadRemoteObject,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PayloadPublished(record, reply))
+    }
+
     /// Snapshots the live namespace into an immutable checkpoint document;
     /// returns the new checkpoint sequence and its content hash.
     pub fn namespace_checkpoint(
@@ -934,6 +1098,45 @@ impl DbWriter {
         payloads: Vec<OperationPayloadRecord>,
     ) -> Result<(), MirageError> {
         self.request(|reply| Command::OperationBegin(operation, payloads, reply))
+    }
+
+    /// Allocates the next durable device-local sequence for the volume.
+    /// Serialized through the single writer so interleaved callers always
+    /// receive distinct values; the reserved sequence stays allocated even
+    /// when the operation is never journaled.
+    pub fn operation_alloc_seq(&self, volume_id: RepositoryId) -> Result<i64, MirageError> {
+        self.request(|reply| Command::OperationAllocSeq(volume_id, reply))
+    }
+
+    /// One atomic mutation commit: extent replacement + pending operation +
+    /// already-flushed payload records + optional physical-extent commit +
+    /// commit transition in a single transaction. Callers must fsync the
+    /// payload file before this runs.
+    pub fn mutation_commit(
+        &self,
+        extents: Option<crate::operation::ExtentMutation>,
+        operation: OperationRecord,
+        payloads: Vec<OperationPayloadRecord>,
+        physical: Option<crate::physical::PhysicalCommit>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::MutationCommit(extents, operation, payloads, physical, now_ns, reply)
+        })
+    }
+
+    /// Quiesce-time compaction: drops superseded extent versions and marks
+    /// unreferenced journal payload extents dead. Returns the transitioned
+    /// `(payload_id, length_bytes)` pairs for file/budget cleanup.
+    pub fn extent_compact_volume(
+        &self,
+        volume_id: RepositoryId,
+        journal_file_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<Vec<([u8; 16], i64)>, MirageError> {
+        self.request(|reply| {
+            Command::ExtentCompactVolume(volume_id, journal_file_id, now_ns, reply)
+        })
     }
 
     /// Marks a payload durable after its bytes are flushed to disk.
@@ -1094,9 +1297,13 @@ impl DbWriter {
 
     /// Advances a session's phase, upload cursor, and error class.
     #[allow(clippy::too_many_arguments)]
+    /// Phase transitions compare-and-swap on `expected_phase` — a stale
+    /// driver cannot move a session that recovery already advanced.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_session_advance(
         &self,
         session_id: [u8; 16],
+        expected_phase: crate::upload_session::SessionPhase,
         phase: crate::upload_session::SessionPhase,
         remote_upload_id: Option<String>,
         session_uri: Option<String>,
@@ -1108,6 +1315,7 @@ impl DbWriter {
         self.request(|reply| {
             Command::UploadSessionAdvance(
                 session_id,
+                expected_phase,
                 phase,
                 remote_upload_id,
                 session_uri,
@@ -1120,7 +1328,8 @@ impl DbWriter {
         })
     }
 
-    /// Atomically replaces an inode's extent set at `version`.
+    /// Atomically replaces an inode's extent set at `version`; the durable
+    /// head EOF is derived from the extent set (0 for an empty set).
     pub fn extent_replace(
         &self,
         volume_id: RepositoryId,
@@ -1131,6 +1340,23 @@ impl DbWriter {
     ) -> Result<(), MirageError> {
         self.request(|reply| {
             Command::ExtentReplace(volume_id, inode, version, extents, now_ns, reply)
+        })
+    }
+
+    /// Atomically replaces an inode's extent set with an explicit logical
+    /// EOF — required when the file extends past the last extent (a
+    /// truncate-grow leaves a zero-filled hole).
+    pub fn extent_replace_eof(
+        &self,
+        volume_id: RepositoryId,
+        inode: mirage_types::InodeId,
+        version: i64,
+        eof: u64,
+        extents: Vec<crate::extent::ByteExtent>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::ExtentReplaceEof(volume_id, inode, version, eof, extents, now_ns, reply)
         })
     }
 

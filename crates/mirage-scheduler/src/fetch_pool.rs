@@ -50,6 +50,10 @@ struct QueuedJob {
     sequence: u64,
     bytes: u64,
     job: Job,
+    /// Runs when the job is discarded without executing — an expired
+    /// deadline or pool close. Lets the submitter resolve a shared flight
+    /// instead of leaving subscribers waiting forever.
+    on_expire: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl PartialEq for QueuedJob {
@@ -163,10 +167,22 @@ impl FetchPool {
                             match state.queue.peek() {
                                 Some(queued) if queued.deadline_ns < now => {
                                     // Deadlines are enforced, not only
-                                    // sorted: an expired job never runs.
-                                    let expired = state.queue.pop().expect("peeked job");
+                                    // sorted: an expired job never runs, and
+                                    // its submitter's completion hook fires so
+                                    // a shared flight resolves instead of
+                                    // hanging until caller cancellation.
+                                    let mut expired = state.queue.pop().expect("peeked job");
                                     if expired.priority.speculative() {
                                         state.queued_speculative -= 1;
+                                    }
+                                    if let Some(on_expire) = expired.on_expire.take() {
+                                        drop(state);
+                                        on_expire();
+                                        let next = match shared.state.lock() {
+                                            Ok(state) => state,
+                                            Err(_) => return,
+                                        };
+                                        state = next;
                                     }
                                     shared.expired.fetch_add(1, AtomicOrdering::AcqRel);
                                 }
@@ -238,6 +254,31 @@ impl FetchPool {
         bytes: u64,
         job: Job,
     ) -> Result<(), MirageError> {
+        self.spawn_metered_inner(priority, deadline_ns, bytes, job, None)
+    }
+
+    /// Like [`spawn_metered`](Self::spawn_metered) plus an `on_expire` hook
+    /// that runs when the job is discarded unstarted (deadline passed while
+    /// queued, or pool close).
+    pub fn spawn_metered_with_expiry(
+        &self,
+        priority: FetchPriority,
+        deadline_ns: u64,
+        bytes: u64,
+        job: Job,
+        on_expire: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), MirageError> {
+        self.spawn_metered_inner(priority, deadline_ns, bytes, job, Some(on_expire))
+    }
+
+    fn spawn_metered_inner(
+        &self,
+        priority: FetchPriority,
+        deadline_ns: u64,
+        bytes: u64,
+        job: Job,
+        on_expire: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<(), MirageError> {
         let mut state = self
             .shared
             .state
@@ -281,6 +322,7 @@ impl FetchPool {
             sequence,
             bytes,
             job,
+            on_expire,
         });
         drop(state);
         self.shared.wake.notify_one();
@@ -327,9 +369,20 @@ impl FetchPool {
 
 impl Drop for FetchPool {
     fn drop(&mut self) {
+        let mut expiry_hooks = Vec::new();
         if let Ok(mut state) = self.shared.state.lock() {
             state.closed = true;
+            // Queued jobs are dropped unstarted — run their expiry hooks so
+            // submitters resolve rather than leak.
+            while let Some(mut queued) = state.queue.pop() {
+                if let Some(on_expire) = queued.on_expire.take() {
+                    expiry_hooks.push(on_expire);
+                }
+            }
             self.shared.wake.notify_all();
+        }
+        for hook in expiry_hooks {
+            hook();
         }
     }
 }

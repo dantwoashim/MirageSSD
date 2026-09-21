@@ -47,6 +47,11 @@ impl<'a> WorkspaceAdmission<'a> {
     /// Verifies a declared lease: `verify` measures the covered bytes and
     /// pinned pages; the lease is only admitted when the measurement lands.
     /// The evidence is stored durably so a restart keeps the lease verified.
+    ///
+    /// A verification claim must be real: the measured bytes must cover the
+    /// declared scope and at least one page must be pinned — an empty claim
+    /// is rejected rather than converting a declared lease into an offline
+    /// guarantee.
     pub fn verify(
         &self,
         lease_id: [u8; 16],
@@ -55,6 +60,22 @@ impl<'a> WorkspaceAdmission<'a> {
         evidence: Vec<u8>,
         now_ns: i64,
     ) -> Result<(), MirageError> {
+        let declared = self
+            .db
+            .workspace_leases(self.volume)?
+            .into_iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .ok_or_else(|| MirageError::repository_conflict("lease is missing"))?;
+        if declared.status != LeaseStatus::Declared && declared.status != LeaseStatus::Verifying {
+            return Err(MirageError::repository_conflict(
+                "lease is not awaiting verification",
+            ));
+        }
+        if bytes_verified < declared.bytes_declared || pages_pinned == 0 {
+            return Err(MirageError::repository_conflict(
+                "verification does not cover the declared scope or pin any page",
+            ));
+        }
         self.db
             .writer()
             .lease_verify(lease_id, bytes_verified, pages_pinned, evidence, now_ns)

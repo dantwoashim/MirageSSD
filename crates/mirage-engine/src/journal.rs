@@ -40,7 +40,18 @@ impl LocalJournal {
         journal_dir: &Path,
         bytes: &[u8],
     ) -> Result<StagedPayload, MirageError> {
-        let payload_id = new_id();
+        self.stage_payload_as(journal_dir, bytes, new_id())
+    }
+
+    /// Same as [`stage_payload`](Self::stage_payload) with a caller-chosen
+    /// payload id, so a physical-ledger reservation can name the extent
+    /// before the bytes land.
+    pub fn stage_payload_as(
+        &self,
+        journal_dir: &Path,
+        bytes: &[u8],
+        payload_id: [u8; 16],
+    ) -> Result<StagedPayload, MirageError> {
         let file_name = format!("{}.payload", hex16(&payload_id));
         let path = journal_dir.join(&file_name);
         mirage_crypto::durable_file::write_atomic(&path, bytes)?;
@@ -131,7 +142,13 @@ impl LocalJournal {
         let reclaimable = self.db.reclaimable_operation_payloads(self.volume_id)?;
         for payload_id in &reclaimable {
             let path = journal_dir.join(format!("{}.payload", hex16(payload_id)));
-            let _ = std::fs::remove_file(path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // An already-missing file is fine; anything else must
+                // surface — a failed startup recovery must not report ready.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(MirageError::from(error)),
+            }
         }
         self.db
             .writer()

@@ -69,6 +69,16 @@ pub struct PhysicalReservationRecord {
     pub expires_ns: i64,
 }
 
+/// A reserved extent to commit alive inside a larger transaction — used by
+/// mutation commits so the physical ledger and the extent journal atomically
+/// agree on a staged payload.
+#[derive(Debug, Clone, Copy)]
+pub struct PhysicalCommit {
+    pub extent_id: [u8; 16],
+    pub page_hash: PageHash,
+    pub checksum: [u8; 32],
+}
+
 fn decode_extent(row: &rusqlite::Row<'_>) -> Result<(PhysicalExtentRecord,), rusqlite::Error> {
     let page_hash: Option<Vec<u8>> = row.get(5)?;
     let checksum: Option<Vec<u8>> = row.get(6)?;
@@ -258,6 +268,10 @@ pub fn commit_extent(
 }
 
 /// Releases a reservation without committing bytes; the slot becomes dead.
+/// This is the reservation-release path only — a live extent is never
+/// killed through this API (eviction goes through `mark_extent_dead`, which
+/// enforces the pin fence), and a pinned extent is refused even in the
+/// reserved state.
 pub fn release_extent(
     connection: &mut Connection,
     extent_id: &[u8; 16],
@@ -266,13 +280,35 @@ pub fn release_extent(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin physical release"))?;
-    transaction
+    let changed = transaction
         .execute(
             "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
-             WHERE extent_id = ?2 AND state IN ('reserved', 'alive')",
+             WHERE extent_id = ?2 AND state = 'reserved' AND pin_count = 0",
             params![now_ns, extent_id.as_slice()],
         )
         .map_err(|e| sqlite(e, "physical extent release failed"))?;
+    if changed != 1 {
+        // Either the extent is alive (committed — its bytes may be
+        // referenced) or it is pinned; releasing either would lose live
+        // data. Report the distinction honestly.
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM physical_extents WHERE extent_id = ?1",
+                [extent_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| sqlite(e, "physical extent lookup failed"))?;
+        return Err(match state.as_deref() {
+            Some("alive") => MirageError::repository_conflict(
+                "committed extent cannot be released through the reservation path",
+            ),
+            Some("reserved") => MirageError::repository_conflict("reserved extent is pinned"),
+            Some("dead") => MirageError::repository_conflict("extent is already dead"),
+            Some(_) => MirageError::repository_conflict("extent is not releasable"),
+            None => MirageError::repository_conflict("extent is missing"),
+        });
+    }
     transaction
         .execute(
             "DELETE FROM physical_reservations WHERE extent_id = ?1",

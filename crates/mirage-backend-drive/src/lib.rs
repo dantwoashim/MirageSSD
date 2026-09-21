@@ -1,6 +1,7 @@
 //! Google Drive immutable-object backend.
 #![forbid(unsafe_code)]
 pub mod backend;
+pub mod backend_refreshable;
 pub mod client;
 pub mod discover;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod token_store;
 pub mod upload;
 
 pub use backend::DriveObjectBackend;
+pub use backend_refreshable::RefreshableDriveBackend;
 pub use client::DriveClient;
 pub use http::{HttpRequest, HttpResponse, HttpTransport, Method};
 pub use native_http::{NativeHttpTransport, RetryingHttpTransport};

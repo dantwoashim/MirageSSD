@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,14 @@ pub struct HostSpec {
     /// Immutable origin pack directory used for degraded read-through on a
     /// cache miss; `None` keeps strict offline semantics.
     pub origin_root: Option<PathBuf>,
+    /// Writable managed volume (`--managed`); `false` launches a read-only
+    /// cache mount (`--cache`).
+    pub managed: bool,
+    /// `drive-manifest.cbor` enabling the managed host's on-demand Drive
+    /// provider; passed with `repository_key` or not at all.
+    pub drive_manifest: Option<PathBuf>,
+    /// `repository-key.dpapi` for the managed host's Drive provider.
+    pub repository_key: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExit {
@@ -57,6 +66,12 @@ pub enum HostState {
 pub trait ManagedChild: Send {
     fn wait_ready(&mut self, timeout: Duration) -> io::Result<bool>;
     fn try_exit(&mut self) -> io::Result<Option<HostExit>>;
+    /// Writes one control line (`TOKEN <bearer>`, …) on the retained stdin.
+    fn send_line(&mut self, line: &str) -> io::Result<()>;
+    /// Bounded tail of the host's stderr for launch-failure diagnosis.
+    fn stderr_tail(&self) -> String {
+        String::new()
+    }
     fn stop(&mut self) -> io::Result<HostExit>;
 }
 pub trait Launcher: Send + Sync {
@@ -68,6 +83,7 @@ pub struct StdChild {
     child: Child,
     stdin: Option<ChildStdin>,
     ready: Receiver<io::Result<()>>,
+    stderr_tail: Arc<Mutex<String>>,
 }
 impl ManagedChild for StdChild {
     fn wait_ready(&mut self, timeout: Duration) -> io::Result<bool> {
@@ -87,6 +103,23 @@ impl ManagedChild for StdChild {
                 code: status.code(),
             })
         })
+    }
+    fn send_line(&mut self, line: &str) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "filesystem host control pipe is unavailable",
+            )
+        })?;
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+    fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.clone())
+            .unwrap_or_default()
     }
     fn stop(&mut self) -> io::Result<HostExit> {
         if let Some(status) = self.child.try_wait()? {
@@ -131,17 +164,7 @@ impl Launcher for StdLauncher {
     type Child = StdChild;
     fn launch(&self, spec: &HostSpec) -> io::Result<StdChild> {
         let mut command = Command::new(&spec.executable);
-        command
-            .arg(&spec.mount_point)
-            .arg(&spec.index)
-            .arg(&spec.state_root)
-            .arg(&spec.owner_sid)
-            .arg("--cache")
-            .arg(spec.volume_total_bytes.to_string())
-            .arg(spec.volume_free_bytes.to_string());
-        if let Some(origin_root) = &spec.origin_root {
-            command.arg("--origin").arg(origin_root);
-        }
+        command.args(host_args(spec));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -161,6 +184,27 @@ impl Launcher for StdLauncher {
                 "filesystem host stdin was not captured",
             )
         })?;
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&stderr_tail);
+            thread::spawn(move || {
+                const CAP: usize = 8192;
+                let mut reader = BufReader::new(stderr);
+                let mut buf = [0_u8; 1024];
+                while let Ok(read) = reader.read(&mut buf) {
+                    if read == 0 {
+                        break;
+                    }
+                    if let Ok(mut guard) = tail.lock() {
+                        guard.push_str(&String::from_utf8_lossy(&buf[..read]));
+                        let excess = guard.len().saturating_sub(CAP);
+                        if excess > 0 {
+                            guard.drain(..excess);
+                        }
+                    }
+                }
+            });
+        }
         let (sender, ready) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let mut line = String::new();
@@ -182,8 +226,32 @@ impl Launcher for StdLauncher {
             child,
             stdin: Some(stdin),
             ready,
+            stderr_tail,
         })
     }
+}
+
+fn host_args(spec: &HostSpec) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        spec.mount_point.clone().into_os_string(),
+        spec.index.clone().into_os_string(),
+        spec.state_root.clone().into_os_string(),
+        spec.owner_sid.clone().into(),
+        std::ffi::OsString::from(if spec.managed { "--managed" } else { "--cache" }),
+        spec.volume_total_bytes.to_string().into(),
+        spec.volume_free_bytes.to_string().into(),
+    ];
+    if let Some(origin_root) = &spec.origin_root {
+        args.push("--origin".into());
+        args.push(origin_root.clone().into_os_string());
+    }
+    if let (Some(manifest), Some(key)) = (&spec.drive_manifest, &spec.repository_key) {
+        args.push("--drive-manifest".into());
+        args.push(manifest.clone().into_os_string());
+        args.push("--repository-key".into());
+        args.push(key.clone().into_os_string());
+    }
+    args
 }
 
 #[cfg(windows)]
@@ -279,6 +347,36 @@ impl<L: Launcher> Supervisor<L> {
             .expect("running host has child")
             .wait_ready(timeout)
     }
+    /// Writes one control line to a running host's stdin.
+    /// Bounded stderr tail of a live host, for launch-failure diagnosis.
+    pub fn stderr_tail(&self, id: &HostId) -> String {
+        self.hosts
+            .get(id)
+            .map(|host| {
+                host.child
+                    .as_ref()
+                    .map(|child| child.stderr_tail())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn send_line(&mut self, id: &HostId, line: &str) -> io::Result<()> {
+        let host = self
+            .hosts
+            .get_mut(id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown host"))?;
+        if host.state != HostState::Running {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "filesystem host is not running",
+            ));
+        }
+        host.child
+            .as_mut()
+            .expect("running host has child")
+            .send_line(line)
+    }
     pub fn stop(&mut self, id: &HostId) -> io::Result<HostState> {
         let host = self
             .hosts
@@ -311,10 +409,48 @@ impl<L: Launcher> Supervisor<L> {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    fn spec(managed: bool) -> HostSpec {
+        HostSpec {
+            executable: PathBuf::from("mirage-fs.exe"),
+            mount_point: PathBuf::from("M:"),
+            index: PathBuf::from("state/mount.idx"),
+            state_root: PathBuf::from("state"),
+            owner_sid: "S-1-1-0".into(),
+            volume_total_bytes: 1024,
+            volume_free_bytes: 512,
+            origin_root: Some(PathBuf::from("objects")),
+            managed,
+            drive_manifest: None,
+            repository_key: None,
+        }
+    }
+
+    #[test]
+    fn managed_host_args_carry_drive_provider_paths() {
+        let mut spec = spec(true);
+        spec.drive_manifest = Some(PathBuf::from("import/drive-manifest.cbor"));
+        spec.repository_key = Some(PathBuf::from("import/repository-key.dpapi"));
+        let args = host_args(&spec);
+        assert_eq!(args[9], "--drive-manifest");
+        assert_eq!(args[10], PathBuf::from("import/drive-manifest.cbor"));
+        assert_eq!(args[11], "--repository-key");
+        assert_eq!(args[12], PathBuf::from("import/repository-key.dpapi"));
+    }
+
+    #[test]
+    fn launcher_argv_selects_cache_or_managed_mode() {
+        let cache = host_args(&spec(false));
+        assert_eq!(cache[4], "--cache");
+        let managed = host_args(&spec(true));
+        assert_eq!(managed[4], "--managed");
+        assert_eq!(managed[7], "--origin");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn installed_winfsp_runtime_is_added_to_host_search_path() {
         let search_path = winfsp_runtime_search_path().expect("installed WinFsp runtime");

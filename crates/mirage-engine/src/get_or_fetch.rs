@@ -141,7 +141,11 @@ impl<B: ObjectBackend + 'static> PageProvider<B> {
         let job_flight = Arc::clone(&flight);
         let priority = window.priority;
         let bytes = window.range.len();
-        self.pool.spawn_metered(
+        // A job that expires while queued must still resolve its shared
+        // flight — subscribers see DeadlineExceeded, not a hang.
+        let expire_flights = flights.clone();
+        let expire_flight = Arc::clone(&flight);
+        self.pool.spawn_metered_with_expiry(
             priority,
             deadline_ns,
             bytes,
@@ -170,6 +174,11 @@ impl<B: ObjectBackend + 'static> PageProvider<B> {
                         })?
                         .result
                 });
+                if std::env::var_os("MIRAGE_DEBUG_PROVIDER").is_some()
+                    && let Err(error) = &result
+                {
+                    eprintln!("provider fetch failed: {error:?}");
+                }
                 // A placed page converts its reservation into committed bytes; a
                 // failed fetch releases them. A commit overflow is surfaced as the
                 // flight's failure rather than silently dropped.
@@ -181,6 +190,16 @@ impl<B: ObjectBackend + 'static> PageProvider<B> {
                     hash,
                     &job_flight,
                     result.map_err(|error| FlightFailure::from_error(&error)),
+                );
+            }),
+            Box::new(move || {
+                let _ = expire_flights.complete_owned(
+                    hash,
+                    &expire_flight,
+                    Err(FlightFailure {
+                        cause: FetchFailureCause::DeadlineExceeded,
+                        code: "MIRAGE_DEADLINE_EXCEEDED".into(),
+                    }),
                 );
             }),
         )
@@ -262,33 +281,111 @@ impl<B: ObjectBackend + 'static> PageProvider<B> {
                 }],
                 gap_bytes: 0,
             };
-            let result = mirage_scheduler::worker::fetch_transient_with_encryption(
-                self.backend.as_ref(),
-                window,
-                context.cancellation.clone(),
-                self.max_window,
-                self.encryption.as_ref(),
-            )
-            .await
-            .and_then(|mut pages| {
+            // Transient fetches run on the same bounded pool as admitted
+            // ones: a saturated pool rejects with CacheFull and a queued job
+            // whose deadline passes resolves its flight as DeadlineExceeded
+            // instead of bypassing the bound.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let backend = Arc::clone(&self.backend);
+            let cancellation = context.cancellation.clone();
+            let max_window = self.max_window;
+            let encryption = self.encryption.clone();
+            let job_flights = self.flights.clone();
+            let job_flight = Arc::clone(&flight);
+            let expire_flights = self.flights.clone();
+            let expire_flight = Arc::clone(&flight);
+            let expire_sender = sender.clone();
+            if let Err(error) = self.pool.spawn_metered_with_expiry(
+                context.priority,
+                context.deadline_ns,
+                window.range.len(),
+                Box::new(move || {
+                    let _guard = CompleteOnDrop {
+                        flights: job_flights.clone(),
+                        hash,
+                        flight: Arc::clone(&job_flight),
+                    };
+                    let result = futures_executor::block_on(
+                        mirage_scheduler::worker::fetch_transient_with_encryption(
+                            backend.as_ref(),
+                            window,
+                            cancellation,
+                            max_window,
+                            encryption.as_ref(),
+                        ),
+                    );
+                    let completion = match &result {
+                        Ok(_) => job_flights.complete_owned(hash, &job_flight, Ok(())),
+                        Err(error) => job_flights.complete_owned(
+                            hash,
+                            &job_flight,
+                            Err(FlightFailure::from_error(error)),
+                        ),
+                    };
+                    let _ = completion;
+                    let _ = sender.send(result);
+                }),
+                Box::new(move || {
+                    let _ = expire_flights.complete_owned(
+                        hash,
+                        &expire_flight,
+                        Err(FlightFailure {
+                            cause: FetchFailureCause::DeadlineExceeded,
+                            code: "MIRAGE_DEADLINE_EXCEEDED".into(),
+                        }),
+                    );
+                    let _ = expire_sender.send(Err(MirageError::deadline_exceeded(
+                        "transient fetch expired while queued",
+                    )));
+                }),
+            ) {
+                let failure = FlightFailure::from_error(&error);
+                let _ = self
+                    .flights
+                    .complete_owned(hash, handle.flight(), Err(failure));
+                return Err(error);
+            }
+            let result = loop {
+                match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if context.cancellation.is_cancelled() {
+                            handle.detach();
+                            return Err(MirageError::cancelled("page fetch cancelled by caller"));
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(MirageError::internal_invariant(
+                            "transient fetch job was dropped",
+                        ));
+                    }
+                }
+            };
+            return result.and_then(|mut pages| {
                 pages
                     .pop()
                     .ok_or_else(|| MirageError::internal_invariant("fetch returned no page"))
             });
-            let completion = match &result {
-                Ok(_) => self.flights.complete_owned(hash, &flight, Ok(())),
-                Err(error) => self.flights.complete_owned(
-                    hash,
-                    &flight,
-                    Err(FlightFailure::from_error(error)),
-                ),
-            };
-            let _ = completion;
-            return result;
         }
         Err(MirageError::internal_invariant(
             "transient fetch did not converge after shared flight",
         ))
+    }
+
+    /// Best-effort sequential readahead: runs `get_or_fetch` on a detached
+    /// thread at `P4ReadAhead` priority so the fetch occupies the bounded
+    /// speculative queue, never blocks the demand read, and shares the
+    /// single-flight map (a demand read on the same page joins it).
+    pub fn prefetch_readahead(self: &Arc<Self>, hash: PageHash) {
+        let provider = Arc::clone(self);
+        std::thread::spawn(move || {
+            let context = FetchContext {
+                priority: FetchPriority::P4ReadAhead,
+                deadline_ns: u64::MAX,
+                cancellation: CancellationToken::new(),
+            };
+            let _ = futures_executor::block_on(provider.get_or_fetch(hash, context));
+        });
     }
 }
 

@@ -132,3 +132,49 @@ fn capacity_protocol_is_bounded_redacted_and_authorized_by_mutation() {
         assert!(invalid.validate().is_err());
     }
 }
+
+#[test]
+fn mount_token_and_drive_token_supply_roundtrip() {
+    let request = Request {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: 11,
+        cancellation_id: None,
+        command: Command::Mount {
+            repository_id: RepositoryId::from_bytes([2; 16]),
+            generation: mirage_types::GenerationId::ZERO,
+            drive_letter: Some("R".into()),
+            drive_access_token: Some(SensitiveString::new("bearer-x".to_owned()).unwrap()),
+        },
+    };
+    let decoded: Request = decode_frame(&encode_frame(&request).unwrap()).unwrap();
+    assert_eq!(decoded, request);
+    decoded.validate().unwrap();
+
+    let supply = Request {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: 12,
+        cancellation_id: None,
+        command: Command::DriveTokenSupply {
+            repository_id: RepositoryId::from_bytes([2; 16]),
+            drive_access_token: SensitiveString::new("bearer-y".to_owned()).unwrap(),
+        },
+    };
+    let decoded: Request = decode_frame(&encode_frame(&supply).unwrap()).unwrap();
+    assert_eq!(decoded, supply);
+    assert!(supply.command.mutates());
+
+    // Backward compatibility: a Mount frame without the token field decodes.
+    let legacy = encode_frame(
+        &serde_json::json!({"protocol_version":1,"request_id":13,"command":{"command":"mount","body":{"repository_id":"02020202020202020202020202020202","generation":0,"drive_letter":"R"}}}),
+    )
+    .unwrap();
+    let decoded: Request = decode_frame(&legacy)
+        .unwrap_or_else(|error| panic!("legacy mount frame rejected: {error}"));
+    assert!(matches!(
+        decoded.command,
+        Command::Mount {
+            drive_access_token: None,
+            ..
+        }
+    ));
+}

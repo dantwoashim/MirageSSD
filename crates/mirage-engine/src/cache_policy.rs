@@ -23,6 +23,8 @@ pub struct TwoQ {
     am_order: BTreeMap<u64, PageHash>,
     am_index: HashMap<PageHash, u64>,
     am_capacity: usize,
+    /// Hard bound on a1in + am combined.
+    capacity: usize,
     tick: u64,
 }
 
@@ -42,8 +44,10 @@ pub enum Admission {
 }
 
 impl TwoQ {
-    /// `capacity` is the total resident-page budget. A1in gets ~25%, Am the
-    /// rest, and the ghost list tracks ~50% of capacity worth of history.
+    /// `capacity` is the total resident-page budget — probation plus
+    /// protected together never exceed it, even when `capacity` is smaller
+    /// than the number of queues. A1in gets ~25%, Am the rest, and the ghost
+    /// list tracks ~50% of capacity worth of history.
     pub fn new(capacity: usize) -> Self {
         Self {
             a1in: VecDeque::new(),
@@ -55,6 +59,7 @@ impl TwoQ {
             am_order: BTreeMap::new(),
             am_index: HashMap::new(),
             am_capacity: capacity.saturating_sub(capacity / 4).max(1),
+            capacity: capacity.max(1),
             tick: 0,
         }
     }
@@ -81,7 +86,8 @@ impl TwoQ {
             if let Some(pos) = self.a1in.iter().position(|entry| *entry == hash) {
                 self.a1in.remove(pos);
             }
-            return self.promote(hash);
+            let admission = self.promote(hash);
+            return self.enforce_capacity(admission);
         }
         if self.a1out_set.contains(&hash) {
             // Ghost hit: the page was evicted but reused — protect it.
@@ -89,7 +95,8 @@ impl TwoQ {
             if let Some(pos) = self.a1out.iter().position(|entry| *entry == hash) {
                 self.a1out.remove(pos);
             }
-            return self.promote(hash);
+            let admission = self.promote(hash);
+            return self.enforce_capacity(admission);
         }
         // First touch: probationary admission, possibly evicting into ghost.
         let evicted = if self.a1in.len() >= self.a1in_capacity {
@@ -99,19 +106,15 @@ impl TwoQ {
         };
         if let Some(evicted) = evicted {
             self.a1in_set.remove(&evicted);
-            self.a1out.push_back(evicted);
-            self.a1out_set.insert(evicted);
-            if self.a1out.len() > self.a1out_capacity
-                && let Some(ghost) = self.a1out.pop_front()
-            {
-                self.a1out_set.remove(&ghost);
-            }
+            self.ghost(evicted);
         }
         self.a1in.push_back(hash);
         self.a1in_set.insert(hash);
-        evicted
-            .map(Admission::Evict)
-            .unwrap_or(Admission::Probation)
+        self.enforce_capacity(
+            evicted
+                .map(Admission::Evict)
+                .unwrap_or(Admission::Probation),
+        )
     }
 
     /// Removes a page from every queue (evicted or invalidated).
@@ -148,6 +151,47 @@ impl TwoQ {
         self.am_index.insert(hash, self.tick);
         self.am_order.insert(self.tick, hash);
         evicted.map(Admission::Evict).unwrap_or(Admission::Protect)
+    }
+
+    /// Moves a page onto the ghost list, bounding it.
+    fn ghost(&mut self, hash: PageHash) {
+        self.a1out.push_back(hash);
+        self.a1out_set.insert(hash);
+        while self.a1out.len() > self.a1out_capacity {
+            if let Some(ghost) = self.a1out.pop_front() {
+                self.a1out_set.remove(&ghost);
+            }
+        }
+    }
+
+    /// Probation + protected together must never exceed the total budget.
+    /// When the split capacities sum above it (e.g. capacity 1), evict the
+    /// coldest page — probation front first, then the protected LRU — and
+    /// report the last victim to the caller.
+    fn enforce_capacity(&mut self, admission: Admission) -> Admission {
+        let mut last_evicted = match admission {
+            Admission::Evict(page) => Some(page),
+            _ => None,
+        };
+        while self.a1in.len() + self.am_index.len() > self.capacity {
+            if let Some(victim) = self.a1in.pop_front() {
+                self.a1in_set.remove(&victim);
+                self.ghost(victim);
+                last_evicted = Some(victim);
+                continue;
+            }
+            if let Some((&tick, _)) = self.am_order.iter().next() {
+                let victim = self.am_order.remove(&tick).expect("tick maps to a page");
+                self.am_index.remove(&victim);
+                last_evicted = Some(victim);
+                continue;
+            }
+            break;
+        }
+        match last_evicted {
+            Some(page) => Admission::Evict(page),
+            None => admission,
+        }
     }
 
     /// Sizes for diagnostics: (probationary, protected, ghost).

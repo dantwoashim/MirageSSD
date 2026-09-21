@@ -435,10 +435,14 @@ pub fn rename(
         ));
     }
     // Reject moving a directory into its own subtree: walk the destination's
-    // ancestor chain; meeting the moved inode closes a cycle.
+    // ancestor chain; meeting the moved inode closes a cycle. The walk is
+    // depth-bounded, but reaching the bound without reaching the root fails
+    // closed — an unexplored chain is not proof the destination is outside
+    // the subtree.
     if entry.kind == NamespaceNodeKind::Directory {
         let mut ancestor = to_parent;
-        for _ in 0..MAX_RENAME_DEPTH {
+        let mut hops = 0usize;
+        loop {
             if ancestor == entry.inode {
                 return Err(MirageError::repository_conflict(
                     "namespace rename would create a directory cycle",
@@ -459,6 +463,12 @@ pub fn rename(
             match parent {
                 Some(bytes) => ancestor = decode_inode(&bytes)?,
                 None => break,
+            }
+            hops += 1;
+            if hops >= MAX_RENAME_DEPTH {
+                return Err(MirageError::integrity_mismatch(
+                    "namespace ancestor chain exceeds the depth bound",
+                ));
             }
         }
     }
@@ -605,6 +615,15 @@ pub fn delete_node(
             ],
         )
         .map_err(|e| sqlite(e, "namespace dirent delete failed"))?;
+    transaction
+        .execute(
+            "DELETE FROM legacy_inode_map WHERE volume_id = ?1 AND inode = ?2",
+            params![
+                volume_id.as_bytes().as_slice(),
+                entry.inode.as_bytes().as_slice()
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace legacy binding delete failed"))?;
     transaction
         .execute(
             "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2",
@@ -767,6 +786,52 @@ impl crate::Database {
             .with_connection(|connection| resolve_path(connection, volume_id, path))
     }
 
+    /// Separator-independent resolution: callers that hold an OS path split
+    /// it into components and call this instead of string resolution.
+    pub fn namespace_resolve_components(
+        &self,
+        volume_id: RepositoryId,
+        components: &[String],
+    ) -> Result<Option<InodeId>, MirageError> {
+        self.reads()
+            .with_connection(|connection| resolve_components(connection, volume_id, components))
+    }
+
+    /// The recorded managed-seed marker's index hash, when the volume has
+    /// been seeded through `namespace_seed_managed`.
+    pub fn namespace_seed_marker(
+        &self,
+        volume_id: RepositoryId,
+    ) -> Result<Option<[u8; 32]>, MirageError> {
+        self.reads().with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT commit_hash FROM managed_namespace_seeds WHERE volume_id = ?1",
+                    [volume_id.as_bytes().as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(|e| sqlite(e, "managed seed marker lookup failed"))?
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        MirageError::integrity_mismatch("managed seed marker is malformed")
+                    })
+                })
+                .transpose()
+        })
+    }
+
+    /// Directory entry pointing at `inode` — used to finalize delete-pending
+    /// tombstones by inode identity rather than a stale open-time path.
+    pub fn namespace_entry(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+    ) -> Result<Option<(InodeId, String)>, MirageError> {
+        self.reads()
+            .with_connection(|connection| entry_of_child(connection, volume_id, inode))
+    }
+
     pub fn namespace_resolve_legacy(
         &self,
         volume_id: RepositoryId,
@@ -838,6 +903,27 @@ impl crate::Database {
         )
     }
 
+    /// The seed-time legacy (index) path recorded for an inode — the stable
+    /// bridge from durable inode identity to the committed pack content,
+    /// which survives renames of the namespace path.
+    pub fn namespace_legacy_path(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+    ) -> Result<Option<String>, MirageError> {
+        self.reads().with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT legacy_path FROM legacy_inode_map
+                     WHERE volume_id = ?1 AND inode = ?2",
+                    params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| sqlite(e, "legacy path lookup failed"))
+        })
+    }
+
     /// Records the explicit legacy path-to-inode translation; legacy IDs are
     /// only valid in the legacy format.
     pub fn namespace_record_legacy(
@@ -874,24 +960,20 @@ pub fn seed_volume(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace seed"))?;
+    let seeded = seed_volume_body(&transaction, volume_id, nodes, now_ns)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace seed commit failed"))?;
+    Ok(seeded)
+}
+
+fn seed_volume_body(
+    transaction: &Connection,
+    volume_id: RepositoryId,
+    nodes: impl IntoIterator<Item = NamespaceSeedNode>,
+    now_ns: i64,
+) -> Result<usize, MirageError> {
     let root = root_inode(volume_id);
-    let exists: bool = transaction
-        .query_row(
-            "SELECT 1 FROM namespace_volumes WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|e| sqlite(e, "namespace volume lookup failed"))?
-        .is_some();
-    if exists {
-        // A committed seed is a single transaction, so an existing volume is
-        // always complete; re-seeding is an idempotent no-op.
-        transaction
-            .commit()
-            .map_err(|e| sqlite(e, "namespace seed commit failed"))?;
-        return Ok(0);
-    }
     {
         transaction
             .execute(
@@ -1039,10 +1121,108 @@ pub fn seed_volume(
             params![sequence, volume_id.as_bytes().as_slice()],
         )
         .map_err(|e| sqlite(e, "namespace allocator commit failed"))?;
+    Ok(seeded)
+}
+
+/// Marker-aware managed seed: seeds the namespace and records the seed
+/// marker in the same transaction, so a crash mid-seed leaves no marker and
+/// the next start reseeds cleanly. When a marker already exists the namespace
+/// is authoritative and the seed is skipped entirely; the marker's recorded
+/// index hash is returned so the caller can log a generation change.
+pub fn seed_managed_volume(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    nodes: impl IntoIterator<Item = NamespaceSeedNode>,
+    commit_hash: &[u8; 32],
+    now_ns: i64,
+) -> Result<Option<[u8; 32]>, MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin managed namespace seed"))?;
+    let existing: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT commit_hash FROM managed_namespace_seeds WHERE volume_id = ?1",
+            [volume_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| sqlite(e, "managed seed marker lookup failed"))?;
+    if let Some(bytes) = existing {
+        let hash: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| MirageError::integrity_mismatch("managed seed marker is malformed"))?;
+        transaction
+            .commit()
+            .map_err(|e| sqlite(e, "managed seed marker commit failed"))?;
+        return Ok(Some(hash));
+    }
+    let volume_exists: bool = transaction
+        .query_row(
+            "SELECT 1 FROM namespace_volumes WHERE volume_id = ?1",
+            [volume_id.as_bytes().as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| sqlite(e, "namespace volume lookup failed"))?
+        .is_some();
+    if !volume_exists {
+        seed_volume_body(&transaction, volume_id, nodes, now_ns)?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO managed_namespace_seeds(volume_id, commit_hash, seeded_ns)
+             VALUES (?1, ?2, ?3)",
+            params![
+                volume_id.as_bytes().as_slice(),
+                commit_hash.as_slice(),
+                now_ns
+            ],
+        )
+        .map_err(|e| sqlite(e, "managed seed marker insert failed"))?;
     transaction
         .commit()
-        .map_err(|e| sqlite(e, "namespace seed commit failed"))?;
-    Ok(seeded)
+        .map_err(|e| sqlite(e, "managed namespace seed commit failed"))?;
+    Ok(None)
+}
+
+/// Resolves a normalized component list (already validated, separators
+/// removed) under the volume root. This is the separator-independent variant
+/// of [`resolve_path`]; callers that take OS paths must split them into
+/// components first.
+pub fn resolve_components(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    components: &[String],
+) -> Result<Option<InodeId>, MirageError> {
+    let mut current = root_inode(volume_id);
+    for component in components {
+        match lookup(connection, volume_id, current, component)? {
+            Some(entry) => current = entry.inode,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(current))
+}
+
+/// Returns the (parent inode, display name) directory entry pointing at
+/// `inode`, so a delete-pending close can finalize by inode identity rather
+/// than by a stale open-time path.
+pub fn entry_of_child(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+) -> Result<Option<(InodeId, String)>, MirageError> {
+    connection
+        .query_row(
+            "SELECT parent_inode, display_name FROM dirents
+             WHERE volume_id = ?1 AND child_inode = ?2",
+            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| sqlite(e, "namespace child entry lookup failed"))?
+        .map(|(parent, name)| decode_inode(&parent).map(|inode| (inode, name)))
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1467,25 @@ impl crate::Database {
         now_ns: i64,
     ) -> Result<(u64, [u8; 32]), MirageError> {
         self.writer().namespace_checkpoint(volume_id, now_ns)
+    }
+
+    /// Sequence of the newest namespace checkpoint, or `None` when the
+    /// volume has never been checkpointed.
+    pub fn namespace_latest_checkpoint_seq(
+        &self,
+        volume_id: RepositoryId,
+    ) -> Result<Option<i64>, MirageError> {
+        self.reads().with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT checkpoint_seq FROM namespace_checkpoints
+                     WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
+                    [volume_id.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| sqlite(e, "namespace checkpoint seq read failed"))
+        })
     }
 
     /// Reads the newest checkpoint document bytes for replay or publication.

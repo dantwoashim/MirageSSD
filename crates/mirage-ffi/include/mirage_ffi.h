@@ -7,13 +7,36 @@ extern "C" {
 #endif
 typedef struct MirageEngineHandle MirageEngineHandle;
 typedef struct MirageFileHandle MirageFileHandle;
-typedef enum MirageStatus { MIRAGE_OK=0, MIRAGE_INVALID_ARGUMENT=1, MIRAGE_NOT_FOUND=2, MIRAGE_ACCESS_DENIED=3, MIRAGE_WOULD_BLOCK=4, MIRAGE_CANCELLED=5, MIRAGE_INTEGRITY_FAILURE=6, MIRAGE_BACKEND_UNAVAILABLE=7, MIRAGE_IO_ERROR=8, MIRAGE_CONFLICT=9, MIRAGE_INTERNAL=255 } MirageStatus;
+typedef enum MirageStatus { MIRAGE_OK=0, MIRAGE_INVALID_ARGUMENT=1, MIRAGE_NOT_FOUND=2, MIRAGE_ACCESS_DENIED=3, MIRAGE_WOULD_BLOCK=4, MIRAGE_CANCELLED=5, MIRAGE_INTEGRITY_FAILURE=6, MIRAGE_BACKEND_UNAVAILABLE=7, MIRAGE_IO_ERROR=8, MIRAGE_CONFLICT=9, MIRAGE_DISK_FULL=10, MIRAGE_INTERNAL=255 } MirageStatus;
 MirageStatus mirage_engine_create_empty(MirageEngineHandle **output);
 MirageStatus mirage_engine_create_index(const uint16_t *path,size_t path_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_local(const uint16_t *index_path,size_t index_path_len,const uint16_t *object_root,size_t object_root_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_cache(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,MirageEngineHandle **output);
 /* Same as mirage_engine_create_cache but non-resident pages fall back to the immutable origin pack directory; violation records carry outcome=origin|failed. */
 MirageStatus mirage_engine_create_cache_with_origin(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,const uint16_t *origin_root,size_t origin_root_len,MirageEngineHandle **output);
+/* The writable managed volume: durable namespace + journaled mutations; the cache shard is used when provisioned but is not required. `object_root` (nullable) is the local pack directory mirroring committed content. */
+MirageStatus mirage_engine_create_managed(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,const uint16_t *object_root,size_t object_root_len,uint64_t dirty_budget_bytes,MirageEngineHandle **output);
+/* Drive-capable managed engine: when drive_manifest_path (drive-manifest.cbor) and repository_key_path (repository-key.dpapi) are given, an on-demand Drive fetch provider is prepared and installed at the first mirage_engine_set_drive_token call. */
+MirageStatus mirage_engine_create_managed_drive(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,const uint16_t *object_root,size_t object_root_len,uint64_t dirty_budget_bytes,const uint16_t *drive_manifest_path,size_t drive_manifest_len,const uint16_t *repository_key_path,size_t repository_key_len,MirageEngineHandle **output);
+/* Supplies or rotates the Drive bearer token for a managed engine; the first call installs the page provider. Token bytes are never logged. */
+MirageStatus mirage_engine_set_drive_token(MirageEngineHandle *engine,const uint8_t *token,size_t token_len);
+/* Remaining dirty-payload budget for a managed volume; legacy engines report their configured free space is unavailable. */
+MirageStatus mirage_engine_dirty_free(const MirageEngineHandle *engine,uint64_t *output);
+/* Payload publication counters for a managed volume. */
+typedef struct MiragePublicationStats {
+  uint64_t pending_payloads;
+  uint64_t pending_bytes;
+  uint64_t published_payloads;
+  uint64_t published_bytes;
+  uint64_t evicted_payloads;
+  uint64_t integrity_refusals;
+  uint8_t last_error_class[32];
+} MiragePublicationStats;
+MirageStatus mirage_engine_publication_stats(const MirageEngineHandle *engine,MiragePublicationStats *output);
+/* Quiesce-time compaction: drops superseded extent versions and reclaims
+   dead journal payloads. Never fails a mount/unmount — callers log and
+   continue on non-OK. No-op for engines without managed state. */
+MirageStatus mirage_engine_compact(const MirageEngineHandle *engine);
 MirageStatus mirage_engine_destroy(MirageEngineHandle *handle);
 /* Ownership epoch of the volume coordinator; 0 for legacy read-only engines. */
 MirageStatus mirage_engine_epoch(const MirageEngineHandle *engine,uint64_t *output);

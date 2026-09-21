@@ -101,6 +101,12 @@ impl ControlPlaneHandler {
             let capacity =
                 runtime::volume_capacity(&self.database, repository.repository_id, &index)?;
             let origin_root = local_origin_root(&self.database, repository.repository_id)?;
+            let managed = self
+                .database
+                .load_repository_volume_mode(repository.repository_id)?
+                == Some(mirage_db::VolumeMode::Managed);
+            let drive_provider =
+                drive_provider_paths(&self.database, repository.repository_id, managed)?;
             self.mounts
                 .lock()
                 .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
@@ -112,6 +118,10 @@ impl ControlPlaneHandler {
                     &owner_sid,
                     origin_root.as_deref(),
                     capacity,
+                    managed,
+                    drive_provider
+                        .as_ref()
+                        .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
                 )?;
             restored += 1;
         }
@@ -174,33 +184,45 @@ impl ControlPlaneHandler {
             .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
         let mut summary = summary_json(&repository);
         // Truthful durability state: pending journal depth, live divergence,
-        // and verified workspace coverage — never optimistic.
+        // and verified workspace coverage — a failed query fails the status
+        // rather than reporting an optimistic zero.
         let volume = repository_id;
-        let pending_operations = self
-            .database
-            .replayable_operations(volume)
-            .map(|operations| operations.len())
-            .unwrap_or(0);
+        let pending_operations = self.database.replayable_operations(volume)?.len();
         let diverged = self
             .database
-            .live_divergence(volume)
-            .ok()
-            .flatten()
+            .live_divergence(volume)?
             .is_some_and(|divergence| divergence.status == mirage_db::DivergenceStatus::Diverged);
         let verified_workspace_bytes: u64 = self
             .database
-            .workspace_leases(volume)
-            .map(|leases| {
-                leases
-                    .iter()
-                    .filter(|lease| lease.status == mirage_db::LeaseStatus::Verified)
-                    .map(|lease| lease.bytes_verified)
-                    .sum()
-            })
-            .unwrap_or(0);
+            .workspace_leases(volume)?
+            .iter()
+            .filter(|lease| lease.status == mirage_db::LeaseStatus::Verified)
+            .map(|lease| lease.bytes_verified)
+            .sum();
+        // Payload publication ledger for managed volumes: pending bytes are
+        // local-only data, published objects are cloud-backed and evictable.
+        let publication = self.database.payload_publication_stats(
+            volume,
+            &mirage_db::payload_remote::MANAGED_JOURNAL_FILE_ID,
+        )?;
+        summary["unpublished_payload_bytes"] = json!(publication.pending_bytes);
+        summary["unpublished_payloads"] = json!(publication.pending_payloads);
+        summary["published_payload_bytes"] = json!(publication.published_bytes);
+        summary["published_payload_objects"] = json!(publication.published_payloads);
+        summary["evicted_payloads"] = json!(publication.evicted_payloads);
         summary["pending_local_operations"] = json!(pending_operations);
         summary["diverged"] = json!(diverged);
         summary["verified_workspace_bytes"] = json!(verified_workspace_bytes);
+        // Origin/volume mode are only known for runtime-registered
+        // repositories; a bare registered fixture reports nulls.
+        if let Ok(config) = runtime::load_config(&self.database, repository_id) {
+            summary["origin"] = json!(config.origin.as_str());
+        }
+        summary["volume_mode"] = json!(
+            self.database
+                .load_repository_volume_mode(repository_id)?
+                .map_or("legacy", |mode| mode.as_str())
+        );
         Ok(ResponseBody::Json(summary))
     }
 
@@ -314,6 +336,18 @@ impl ControlPlaneHandler {
             .lock()
             .map_err(|_| MirageError::internal_invariant("storage lifecycle lock poisoned"))?;
         runtime::set_drive_origin(&self.database, repository_id, drive).map(ResponseBody::Json)
+    }
+
+    fn set_volume_mode(
+        &self,
+        repository_id: RepositoryId,
+        managed: bool,
+    ) -> Result<ResponseBody, MirageError> {
+        let _mount = self
+            .mount_lifecycle
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("mount lifecycle lock poisoned"))?;
+        runtime::set_volume_mode(&self.database, repository_id, managed).map(ResponseBody::Json)
     }
 
     fn acquire_capacity(
@@ -574,11 +608,27 @@ impl RequestHandler for ControlPlaneHandler {
                 repository_id,
                 drive,
             } => self.set_drive_origin(repository_id, drive),
+            Command::RepositorySetVolumeMode {
+                repository_id,
+                managed,
+            } => self.set_volume_mode(repository_id, managed),
             Command::Mount {
                 repository_id,
                 generation,
                 drive_letter,
-            } => self.mount(repository_id, generation, drive_letter.as_deref()),
+                drive_access_token,
+            } => self.mount(
+                repository_id,
+                generation,
+                drive_letter.as_deref(),
+                drive_access_token
+                    .as_ref()
+                    .map(mirage_ipc::SensitiveString::expose),
+            ),
+            Command::DriveTokenSupply {
+                repository_id,
+                drive_access_token,
+            } => self.supply_drive_token(repository_id, drive_access_token.expose()),
             Command::Unmount { repository_id } => self.unmount(repository_id),
             Command::ProfileConfigure {
                 repository_id,
@@ -720,6 +770,7 @@ impl ControlPlaneHandler {
         repository_id: RepositoryId,
         generation: mirage_types::GenerationId,
         drive_letter: Option<&str>,
+        drive_access_token: Option<&str>,
     ) -> Result<ResponseBody, MirageError> {
         let _lifecycle = self
             .mount_lifecycle
@@ -770,9 +821,22 @@ impl ControlPlaneHandler {
             .database
             .load_repository_owner_sid(repository_id)?
             .ok_or_else(|| MirageError::integrity_mismatch("repository owner SID is missing"))?;
-        let (volume_total_bytes, volume_free_bytes) =
+        let (mut volume_total_bytes, mut volume_free_bytes) =
             runtime::volume_capacity(&self.database, repository_id, &index)?;
         let origin_root = local_origin_root(&self.database, repository_id)?;
+        let managed = self.database.load_repository_volume_mode(repository_id)?
+            == Some(mirage_db::VolumeMode::Managed);
+        // For a managed volume `volume_free_bytes` is the dirty-write budget:
+        // without a Drive quota snapshot (on-demand mounts need no
+        // materialize) fall back to the repository's reviewed cache budget
+        // rather than a zero budget that rejects every write.
+        if managed && volume_free_bytes == 0 {
+            volume_free_bytes = runtime::load_config(&self.database, repository_id)?.cache_bytes;
+            volume_total_bytes = volume_total_bytes.max(volume_free_bytes);
+        }
+        // A managed Drive repository mounts with the publication manifest and
+        // content key so the host can fetch non-resident pages on demand.
+        let drive_provider = drive_provider_paths(&self.database, repository_id, managed)?;
         self.database.set_repository_state(
             repository_id,
             state,
@@ -791,8 +855,31 @@ impl ControlPlaneHandler {
                 &owner_sid,
                 origin_root.as_deref(),
                 (volume_total_bytes, volume_free_bytes),
+                managed,
+                drive_provider
+                    .as_ref()
+                    .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
             );
         if let Err(error) = mounted {
+            let _ = runtime::clear_mount_record(&self.database, repository_id);
+            self.recover_failed_mount(repository_id)?;
+            return Err(error);
+        }
+        // Deliver the bearer token only after the host reported ready; the
+        // provider stays uninstalled (reads fail unavailable) until then.
+        if let Some(token) = drive_access_token
+            && drive_provider.is_some()
+            && let Err(error) = self
+                .mounts
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
+                .send_drive_token(repository_id, token)
+        {
+            let _ = self
+                .mounts
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
+                .unmount(repository_id);
             let _ = runtime::clear_mount_record(&self.database, repository_id);
             self.recover_failed_mount(repository_id)?;
             return Err(error);
@@ -836,8 +923,29 @@ impl ControlPlaneHandler {
             "verified_volume_pages": verified_volume_pages,
             "volume_total_bytes": volume_total_bytes,
             "volume_free_bytes": volume_free_bytes,
-            "cloud_reads_in_filesystem_callbacks": false
+            "cloud_reads_in_filesystem_callbacks": drive_provider.is_some()
         })))
+    }
+
+    /// Forwards a bearer token to the repository's live filesystem host; the
+    /// token is never persisted — it leaves the service on the host's stdin.
+    fn supply_drive_token(
+        &self,
+        repository_id: RepositoryId,
+        token: &str,
+    ) -> Result<ResponseBody, MirageError> {
+        let mut mounts = self
+            .mounts
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?;
+        if !mounts.is_running(repository_id)? {
+            return Err(MirageError::repository_conflict(
+                "repository is not mounted; the token cannot be delivered",
+            ));
+        }
+        mounts
+            .send_drive_token(repository_id, token)
+            .map(|()| ResponseBody::Json(json!({"supplied": true})))
     }
 
     fn unmount(&self, repository_id: RepositoryId) -> Result<ResponseBody, MirageError> {
@@ -1174,7 +1282,9 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::RepositoryConvert { repository_id, .. }
         | Command::RepositoryRestoreNative { repository_id, .. }
         | Command::RepositorySetDriveOrigin { repository_id, .. }
+        | Command::RepositorySetVolumeMode { repository_id, .. }
         | Command::Mount { repository_id, .. }
+        | Command::DriveTokenSupply { repository_id, .. }
         | Command::Unmount { repository_id }
         | Command::Profile { repository_id, .. }
         | Command::ProfileConfigure { repository_id, .. }
@@ -1206,6 +1316,32 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
 
 /// Immutable origin directory used for degraded read-through on a cache miss:
 /// the repository's import root when its origin is local; `None` for Drive origins.
+/// The managed Drive provider inputs for a mounted repository:
+/// `drive-manifest.cbor` + `repository-key.dpapi` inside the verified import
+/// root. Only meaningful for a managed volume on the Drive origin; both files
+/// must exist or the mount proceeds without a provider (non-resident reads
+/// fail unavailable until a token-bearing remount).
+fn drive_provider_paths(
+    database: &Database,
+    repository_id: RepositoryId,
+    managed: bool,
+) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, MirageError> {
+    if !managed {
+        return Ok(None);
+    }
+    let config = runtime::load_config(database, repository_id)?;
+    if config.origin != runtime::RuntimeOrigin::Drive {
+        return Ok(None);
+    }
+    let manifest = config.import_root.join("drive-manifest.cbor");
+    let key = config.import_root.join("repository-key.dpapi");
+    if manifest.is_file() && key.is_file() {
+        Ok(Some((manifest, key)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn local_origin_root(
     database: &Database,
     repository_id: RepositoryId,

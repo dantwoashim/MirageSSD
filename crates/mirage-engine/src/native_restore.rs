@@ -4,7 +4,7 @@
 //! remote content may be deleted. Pages absent locally but promised offline
 //! block the export rather than writing placeholders.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use mirage_types::MirageError;
@@ -16,6 +16,14 @@ pub trait ContentSource: Send + Sync {
     /// Full verified bytes for `path`; `BackendUnavailable` when bytes are
     /// not locally present and cannot be fetched.
     fn file_bytes(&self, path: &str) -> Result<Vec<u8>, MirageError>;
+    /// Streams verified bytes for `path` into `sink`, returning the count.
+    /// The default writes `file_bytes` in one shot; backends override to
+    /// stream page by page without buffering whole files.
+    fn copy_file(&self, path: &str, sink: &mut dyn std::io::Write) -> Result<u64, MirageError> {
+        let bytes = self.file_bytes(path)?;
+        std::io::Write::write_all(sink, &bytes).map_err(MirageError::from)?;
+        Ok(bytes.len() as u64)
+    }
     /// Expected BLAKE3 content hash for `path`.
     fn content_hash(&self, path: &str) -> Result<[u8; 32], MirageError>;
     /// All exportable file paths with expected sizes.
@@ -44,7 +52,68 @@ pub struct RecoveryManifest {
     pub keep_app: Option<String>,
 }
 
-const MANIFEST_NAME: &str = ".mirage-recovery-manifest.json";
+/// File name of the recovery manifest persisted inside the destination.
+pub const MANIFEST_NAME: &str = ".mirage-recovery-manifest.json";
+/// Directory holding restore-owned staging files inside the destination.
+/// In-flight bytes land under a name the restore owns, so a resume never
+/// deletes a file it did not create — a pre-existing user file at the final
+/// path is untouched until a verified staging file replaces it atomically.
+pub const STAGING_NAME: &str = ".mirage-staging";
+
+/// Validates an export path is a contained relative path — no absolute
+/// roots, no parent traversal, no separators that escape the destination.
+fn contained_path(path: &str) -> Result<std::path::PathBuf, MirageError> {
+    let relative = std::path::Path::new(path);
+    let mut out = std::path::PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            _ => {
+                return Err(MirageError::invalid_argument(
+                    "export path escapes the destination",
+                ));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(MirageError::invalid_argument("export path is empty"));
+    }
+    Ok(out)
+}
+
+/// Write adapter that feeds every byte through the content hasher so a
+/// streamed copy is verified incrementally instead of buffered whole.
+struct HashingWriter {
+    inner: std::fs::File,
+    hasher: blake3::Hasher,
+}
+
+impl std::io::Write for HashingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streams-hash a file's current bytes.
+fn hash_file(path: &std::path::Path) -> Result<[u8; 32], MirageError> {
+    let mut file = std::fs::File::open(path).map_err(MirageError::from)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).map_err(MirageError::from)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// A random staging name the restore owns — a pre-existing user file can
+/// never collide with it, so resume only ever deletes restore-written data.
+fn staging_name() -> String {
+    let mut id = [0u8; 16];
+    let _ = getrandom::fill(&mut id);
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// Drives a resumable export of one volume tree.
 pub struct NativeRestore<'a> {
@@ -65,33 +134,83 @@ impl<'a> NativeRestore<'a> {
     /// Returns the manifest only when every file is complete and verified.
     pub fn run(&self) -> Result<RecoveryManifest, MirageError> {
         let mut manifest = self.load_manifest()?;
-        // Re-check the in-flight tail: a crash may have left a truncated file.
-        if let Some(path) = manifest.in_progress.take() {
-            self.drop_unverified(&path);
+        // The in-flight record names a staging file the restore owns; resume
+        // removes only that staging file — never the destination path.
+        if let Some(staging) = manifest.in_progress.take() {
+            let _ = std::fs::remove_file(self.destination.join(STAGING_NAME).join(&staging));
         }
-        // A completed entry whose file is missing or size-drifted is
-        // re-exported — the manifest only trusts what it re-verifies.
+        let entries = self.source.files()?;
+        for entry in &entries {
+            contained_path(&entry.path)?;
+        }
+        // A completed entry only counts when the on-disk file still matches
+        // the manifest hash AND the manifest hash still matches the source
+        // snapshot — a changed source re-exports rather than trusting a
+        // stale completion.
         let drifted: Vec<String> = manifest
             .completed
             .iter()
-            .filter(|(path, entry)| {
-                std::fs::metadata(self.destination.join(path))
-                    .map(|meta| meta.len() != entry.size)
+            .filter(|(path, recorded)| {
+                let current = entries.iter().find(|entry| entry.path == **path);
+                if current.is_none_or(|entry| {
+                    entry.size != recorded.size || entry.content_hash != recorded.content_hash
+                }) {
+                    return true;
+                }
+                let target = self.destination.join(path);
+                std::fs::metadata(&target)
+                    .map(|meta| meta.len() != recorded.size)
                     .unwrap_or(true)
             })
             .map(|(path, _)| path.clone())
             .collect();
+        // Paths the restore provably wrote before this run. A drifted entry
+        // may be replaced; anything else already sitting at a destination
+        // path is a pre-existing file and is never overwritten.
+        let restore_owned: BTreeSet<String> = manifest.completed.keys().cloned().collect();
         for path in drifted {
             manifest.completed.remove(&path);
         }
-        let entries = self.source.files()?;
         for entry in &entries {
             if manifest.completed.contains_key(&entry.path) {
                 continue;
             }
-            manifest.in_progress = Some(entry.path.clone());
+            let staging_name = staging_name();
+            manifest.in_progress = Some(staging_name.clone());
             self.save_manifest(&manifest)?;
-            let target = self.destination.join(&entry.path);
+            let staging = self.destination.join(STAGING_NAME).join(&staging_name);
+            if std::fs::create_dir_all(staging.parent().expect("staging parent")).is_err() {
+                return Err(MirageError::internal_invariant(
+                    "export staging directory could not be created",
+                ));
+            }
+            // Bytes are streamed and hash-verified before the staging file
+            // is renamed into place; an unavailable page fails the export
+            // without touching any pre-existing destination file.
+            let staging_file = std::fs::File::create(&staging).map_err(MirageError::from)?;
+            let mut hashing = HashingWriter {
+                inner: staging_file,
+                hasher: blake3::Hasher::new(),
+            };
+            let copied = self.source.copy_file(&entry.path, &mut hashing)?;
+            let staging_file = hashing.inner;
+            if copied != entry.size {
+                return Err(MirageError::integrity_mismatch(
+                    "exported file size does not match the manifest",
+                ));
+            }
+            if hashing.hasher.finalize().as_bytes() != &entry.content_hash {
+                return Err(MirageError::integrity_mismatch(
+                    "exported content hash does not match the manifest",
+                ));
+            }
+            staging_file.sync_all().map_err(MirageError::from)?;
+            let target = self.destination.join(contained_path(&entry.path)?);
+            if target.exists() && !restore_owned.contains(&entry.path) {
+                return Err(MirageError::repository_conflict(
+                    "export refuses to overwrite a file it did not create",
+                ));
+            }
             if let Some(parent) = target.parent()
                 && std::fs::create_dir_all(parent).is_err()
             {
@@ -99,20 +218,14 @@ impl<'a> NativeRestore<'a> {
                     "export directory could not be created",
                 ));
             }
-            // Bytes are fetched whole and hash-verified before the file is
-            // renamed into place; an unavailable page fails the export.
-            let bytes = self.source.file_bytes(&entry.path)?;
-            if bytes.len() as u64 != entry.size {
-                return Err(MirageError::integrity_mismatch(
-                    "exported file size does not match the manifest",
-                ));
+            if std::fs::rename(&staging, &target).is_err() {
+                // Windows refuses rename-over-existing; delete the old path
+                // only after the verified staging file is durable.
+                let _ = std::fs::remove_file(&target);
+                std::fs::rename(&staging, &target).map_err(|_| {
+                    MirageError::internal_invariant("export file could not be moved")
+                })?;
             }
-            if blake3::hash(&bytes).as_bytes() != &entry.content_hash {
-                return Err(MirageError::integrity_mismatch(
-                    "exported content hash does not match the manifest",
-                ));
-            }
-            mirage_crypto::durable_file::write_atomic(&target, &bytes)?;
             manifest.completed.insert(entry.path.clone(), entry.clone());
             manifest.in_progress = None;
             self.save_manifest(&manifest)?;
@@ -120,21 +233,39 @@ impl<'a> NativeRestore<'a> {
         Ok(manifest)
     }
 
-    /// The last-line completeness check: every manifest entry exists on disk
-    /// with the recorded size, and no entry is left in progress. Only after
-    /// this passes may remote content be reclaimed.
+    /// The last-line completeness check: every source entry is in the
+    /// manifest AND on disk with matching size and content hash, and no
+    /// entry is left in progress. Only after this passes may remote content
+    /// be reclaimed.
     pub fn verify_complete(&self, manifest: &RecoveryManifest) -> Result<(), MirageError> {
         if manifest.in_progress.is_some() {
             return Err(MirageError::integrity_mismatch(
                 "an export entry is still in flight",
             ));
         }
-        for (path, entry) in &manifest.completed {
-            let meta = std::fs::metadata(self.destination.join(path))
+        let entries = self.source.files()?;
+        for entry in &entries {
+            let recorded = manifest.completed.get(&entry.path).ok_or_else(|| {
+                MirageError::repository_conflict("manifest does not cover every source file")
+            })?;
+            if recorded.size != entry.size || recorded.content_hash != entry.content_hash {
+                return Err(MirageError::integrity_mismatch(
+                    "manifest entry does not match the source snapshot",
+                ));
+            }
+            let target = self.destination.join(contained_path(&entry.path)?);
+            let meta = std::fs::metadata(&target)
                 .map_err(|_| MirageError::repository_conflict("exported file is missing"))?;
             if meta.len() != entry.size {
                 return Err(MirageError::integrity_mismatch(
                     "exported file size drifted after completion",
+                ));
+            }
+            // Re-hash the exported bytes: same-length corruption must not
+            // pass completeness.
+            if hash_file(&target)? != entry.content_hash {
+                return Err(MirageError::integrity_mismatch(
+                    "exported file content drifted after completion",
                 ));
             }
         }
@@ -146,10 +277,6 @@ impl<'a> NativeRestore<'a> {
         let mut manifest = self.load_manifest()?;
         manifest.keep_app = Some(app.to_string());
         self.save_manifest(&manifest)
-    }
-
-    fn drop_unverified(&self, path: &str) {
-        let _ = std::fs::remove_file(self.destination.join(path));
     }
 
     fn manifest_path(&self) -> PathBuf {

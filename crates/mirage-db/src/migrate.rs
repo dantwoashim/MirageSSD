@@ -108,6 +108,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "0019_gc.sql",
         sql: include_str!("../../../migrations/0019_gc.sql"),
     },
+    Migration {
+        version: 20,
+        name: "0020_extent_heads.sql",
+        sql: include_str!("../../../migrations/0020_extent_heads.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "0021_repository_volume_mode.sql",
+        sql: include_str!("../../../migrations/0021_repository_volume_mode.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "0022_journal_physical_file.sql",
+        sql: include_str!("../../../migrations/0022_journal_physical_file.sql"),
+    },
+    Migration {
+        version: 23,
+        name: "0023_managed_namespace_seeds.sql",
+        sql: include_str!("../../../migrations/0023_managed_namespace_seeds.sql"),
+    },
+    Migration {
+        version: 24,
+        name: "0024_payload_remote_objects.sql",
+        sql: include_str!("../../../migrations/0024_payload_remote_objects.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

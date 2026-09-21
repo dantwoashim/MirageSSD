@@ -297,6 +297,18 @@ pub fn decode_checkpoint(encoded: &[u8]) -> Result<NamespaceCheckpoint, MirageEr
         }
     };
     let count = cursor.u32()? as usize;
+    // A node costs at least 36 bytes (inode + parent flag + two length
+    // fields + kind + size + two optional flags) — a claimed count that the
+    // remaining bytes cannot cover is rejected before allocating.
+    const MIN_NODE_BYTES: usize = 16 + 1 + 4 + 4 + 1 + 8 + 1 + 1;
+    if count
+        .checked_mul(MIN_NODE_BYTES)
+        .is_none_or(|minimum| minimum > cursor.bytes.len() - cursor.at)
+    {
+        return Err(MirageError::manifest_invalid(
+            "namespace node count exceeds the document bound",
+        ));
+    }
     let mut nodes = Vec::with_capacity(count.min(1 << 20));
     let mut previous: Option<InodeId> = None;
     for _ in 0..count {
@@ -334,16 +346,74 @@ pub fn decode_checkpoint(encoded: &[u8]) -> Result<NamespaceCheckpoint, MirageEr
         });
     }
     cursor.done()?;
-    // Referential integrity: every parent reference must resolve.
-    let known: std::collections::HashSet<[u8; 16]> =
-        nodes.iter().map(|node| *node.inode.as_bytes()).collect();
+    // Graph integrity: the checkpoint must describe exactly one rooted tree.
+    let known: std::collections::HashMap<[u8; 16], &NamespaceNodeRecord> = nodes
+        .iter()
+        .map(|node| (*node.inode.as_bytes(), node))
+        .collect();
+    let mut roots = 0usize;
     for node in &nodes {
-        if let Some(parent) = node.parent
-            && !known.contains(parent.as_bytes())
-        {
+        match node.parent {
+            None => {
+                if !node.directory {
+                    return Err(MirageError::manifest_invalid(
+                        "namespace checkpoint root is not a directory",
+                    ));
+                }
+                roots += 1;
+            }
+            Some(parent) => {
+                if parent == node.inode {
+                    return Err(MirageError::manifest_invalid(
+                        "namespace checkpoint node is its own parent",
+                    ));
+                }
+                let parent_node = known.get(parent.as_bytes()).ok_or_else(|| {
+                    MirageError::manifest_invalid(
+                        "namespace checkpoint references a missing parent",
+                    )
+                })?;
+                if !parent_node.directory {
+                    return Err(MirageError::manifest_invalid(
+                        "namespace checkpoint parent is not a directory",
+                    ));
+                }
+            }
+        }
+    }
+    if roots != 1 {
+        return Err(MirageError::manifest_invalid(
+            "namespace checkpoint must contain exactly one root",
+        ));
+    }
+    // Sibling folded names must be unique — a duplicated key makes lookups
+    // ambiguous.
+    let mut sibling_names: std::collections::HashSet<([u8; 16], &[u8])> =
+        std::collections::HashSet::new();
+    for node in &nodes {
+        let parent_key = node
+            .parent
+            .map(|parent| *parent.as_bytes())
+            .unwrap_or([0; 16]);
+        if !sibling_names.insert((parent_key, node.folded_name.as_bytes())) {
             return Err(MirageError::manifest_invalid(
-                "namespace checkpoint references a missing parent",
+                "namespace checkpoint duplicates a folded sibling name",
             ));
+        }
+    }
+    // Acyclicity: walking each node's ancestor chain must reach the root in
+    // fewer steps than the node count; anything longer is a cycle.
+    for node in &nodes {
+        let mut at = node;
+        let mut hops = 0usize;
+        while let Some(parent) = at.parent {
+            at = known[parent.as_bytes()];
+            hops += 1;
+            if hops >= nodes.len() {
+                return Err(MirageError::manifest_invalid(
+                    "namespace checkpoint contains a parent cycle",
+                ));
+            }
         }
     }
     Ok(NamespaceCheckpoint {
@@ -557,6 +627,19 @@ mod tests {
         assert_eq!(checkpoint_hash(&encoded), checkpoint_hash(&encoded));
     }
 
+    fn root() -> NamespaceNodeRecord {
+        NamespaceNodeRecord {
+            inode: inode(0xFF),
+            parent: None,
+            folded_name: String::new(),
+            display_name: String::new(),
+            directory: true,
+            size: 0,
+            version_root: None,
+            extent_root: None,
+        }
+    }
+
     #[test]
     fn unknown_version_and_trailing_bytes_are_rejected() {
         let volume = RepositoryId::from_bytes([9; 16]);
@@ -564,7 +647,7 @@ mod tests {
             volume_id: volume,
             checkpoint_seq: 0,
             parent_commit: None,
-            nodes: vec![],
+            nodes: vec![root()],
         };
         let mut encoded = encode_checkpoint(&checkpoint).unwrap();
         encoded[5] = 99; // bump format_version field
@@ -582,7 +665,7 @@ mod tests {
             volume_id: volume,
             checkpoint_seq: 0,
             parent_commit: None,
-            nodes: vec![],
+            nodes: vec![root()],
         })
         .unwrap();
         let delta = NamespaceDelta {

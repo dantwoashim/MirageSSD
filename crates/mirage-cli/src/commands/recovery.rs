@@ -45,7 +45,7 @@ pub fn export(
             "repository_id": repository_id.to_string(),
             "has_content_key": true,
             "has_signer_authority": signer.is_some(),
-            "envelope_sha256": blake3::hash(&bytes).to_hex().to_string(),
+            "envelope_sha256": envelope_sha256(&bytes),
         }),
         "recovery envelope exported; store it and the secret in separate safe places".to_owned(),
     )
@@ -159,6 +159,24 @@ pub fn import(
     )
 }
 
+/// Opens a recovery envelope and returns its repository content key,
+/// requiring it to be present and bound to `expected`. Shared by
+/// `recovery import` and `repo extract --envelope`.
+pub(crate) fn envelope_content_key(
+    envelope: &Path,
+    secret_file: &Path,
+    expected: RepositoryId,
+) -> Result<mirage_crypto::aead::RepositoryKey, MirageError> {
+    let bytes = std::fs::read(envelope).map_err(MirageError::from)?;
+    let secret = read_secret(secret_file)?;
+    let payload = open_envelope(&bytes, &secret, Some(expected))?;
+    payload.content_key.ok_or_else(|| {
+        MirageError::integrity_mismatch(
+            "recovery envelope has no content key; recovery is incomplete",
+        )
+    })
+}
+
 fn write_verified_record(
     import: &Path,
     payload: &RecoveryPayload,
@@ -172,7 +190,7 @@ fn write_verified_record(
         "repository_id": payload.repository_id.to_string(),
         "content_key_blake3": blake3::hash(content_key.secret_bytes().as_ref()).to_hex().to_string(),
         "has_signer_authority": payload.signer.is_some(),
-        "envelope_sha256": blake3::hash(envelope).to_hex().to_string(),
+        "envelope_sha256": envelope_sha256(envelope),
         "verified_at_ns": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as i64)
@@ -184,6 +202,13 @@ fn write_verified_record(
             .map_err(|_| MirageError::internal_invariant("verification record failed"))?
             .as_slice(),
     )
+}
+
+/// The field is named SHA-256, so the digest really is SHA-256 — a BLAKE3
+/// value under this name would mislead external verification tooling.
+fn envelope_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn read_secret(path: &Path) -> Result<Zeroizing<Vec<u8>>, MirageError> {

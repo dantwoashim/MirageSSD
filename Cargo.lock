@@ -1107,6 +1107,7 @@ dependencies = [
  "mirage-types",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio-util",
  "url",
@@ -1220,9 +1221,15 @@ dependencies = [
 name = "mirage-ffi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
+ "bytes",
+ "futures-executor",
+ "futures-util",
  "getrandom 0.3.4",
  "memmap2",
+ "mirage-backend",
+ "mirage-backend-drive",
  "mirage-cache",
  "mirage-crypto",
  "mirage-db",
@@ -1233,7 +1240,9 @@ dependencies = [
  "mirage-scheduler",
  "mirage-types",
  "tempfile",
+ "tokio-util",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1394,6 +1403,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio-util",
  "windows-service",

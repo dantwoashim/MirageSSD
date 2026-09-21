@@ -41,6 +41,41 @@ impl PageLocationMap {
         }
         Ok(map)
     }
+    /// Returns a copy where every location's `object` is replaced by the
+    /// provider-published object for the same pack content hash — e.g. the
+    /// Drive file id recorded in `drive-manifest.cbor` while the mount index
+    /// names the local pack. Fails closed when a pack has no published object
+    /// or the published object disagrees on kind or content hash.
+    pub fn remap_objects(
+        &self,
+        published: &BTreeMap<[u8; 32], RemoteObjectRef>,
+    ) -> Result<Self, MirageError> {
+        let mut map = Self::default();
+        for (hash, location) in &self.entries {
+            let object = published
+                .get(location.object.content_hash.as_bytes())
+                .ok_or_else(|| {
+                    MirageError::manifest_invalid("publication omits a required pack object")
+                })?;
+            if object.kind != ObjectKind::Pack
+                || object.content_hash != location.object.content_hash
+                || location.encoded_range.end_exclusive() > object.byte_length.as_u64()
+            {
+                return Err(MirageError::integrity_mismatch(
+                    "published object does not match the pack location",
+                ));
+            }
+            map.entries.insert(
+                *hash,
+                PageLocation {
+                    object: object.clone(),
+                    encoded_range: location.encoded_range,
+                    logical_length: location.logical_length,
+                },
+            );
+        }
+        Ok(map)
+    }
     pub fn insert(&mut self, hash: PageHash, location: PageLocation) -> Result<(), MirageError> {
         if location.object.kind != ObjectKind::Pack
             || location.encoded_range.end_exclusive() > location.object.byte_length.as_u64()

@@ -64,7 +64,8 @@ pub use readiness::{
     ScopeSpec, UnsupportedPlan, compile_readiness,
 };
 pub use repository_extract::{
-    ExtractReport, extract_virtual_files, extract_virtual_files_with_encryption,
+    ExtractReport, ManifestContentSource, extract_virtual_files,
+    extract_virtual_files_with_encryption,
 };
 pub use repository_reader::{
     RecoveredRepository, RecoveryHints, recover_repository, recover_repository_with_hints,

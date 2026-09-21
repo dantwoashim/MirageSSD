@@ -100,7 +100,16 @@ impl Iterator for SourcePager {
     type Item = Result<PlainPage, MirageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished || self.remaining == 0 {
+        if self.finished {
+            return None;
+        }
+        if self.remaining == 0 {
+            // An empty source still re-validates on the EOF transition —
+            // "no pages" must not mask a file that changed after open.
+            self.finished = true;
+            if let Err(error) = self.validate_unchanged() {
+                return Some(Err(error));
+            }
             return None;
         }
         let wanted = usize::try_from(self.remaining.min(self.page_size as u64))

@@ -1445,7 +1445,10 @@ mod tests {
             "repository_id": repository_id.to_string(),
             "content_key_blake3": blake3::hash(key.secret_bytes().as_ref()).to_hex().to_string(),
             "has_signer_authority": false,
-            "envelope_sha256": blake3::hash(b"fixture-envelope").to_hex().to_string(),
+            "envelope_sha256": format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(b"fixture-envelope")
+            ),
             "verified_at_ns": 1,
         });
         std::fs::write(

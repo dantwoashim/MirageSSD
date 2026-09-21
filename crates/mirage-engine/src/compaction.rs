@@ -74,14 +74,27 @@ impl<'a> Compaction<'a> {
     }
 
     /// Remote object keys safe to delete now: unreachable since an older
-    /// verified commit and past the reclamation window.
+    /// verified commit and past the reclamation window. Each candidate is
+    /// rechecked against the live reachability set at deletion time — an
+    /// object re-pinned or re-created since marking is cleared instead of
+    /// deleted.
     pub fn reclaimable(
         &self,
         reachable: &dyn ReachableSet,
         now_ns: i64,
     ) -> Result<Vec<String>, MirageError> {
-        self.db
-            .gc_reclaimable(self.volume, &reachable.latest_verified_commit(), now_ns)
+        let candidates =
+            self.db
+                .gc_reclaimable(self.volume, &reachable.latest_verified_commit(), now_ns)?;
+        let mut safe = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            if reachable.reachable(&key) {
+                self.db.writer().gc_unreachable_clear(self.volume, &key)?;
+            } else {
+                safe.push(key);
+            }
+        }
+        Ok(safe)
     }
 
     /// Clears a reclaimed candidate after the remote delete lands.

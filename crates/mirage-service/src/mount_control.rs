@@ -18,6 +18,14 @@ pub trait MountControl: Send {
         owner_sid: &str,
         origin_root: Option<&Path>,
         volume_capacity: (u64, u64),
+        managed: bool,
+        drive_provider: Option<(&Path, &Path)>,
+    ) -> Result<(), MirageError>;
+    /// Pushes a bearer token to the live host of a mounted repository.
+    fn send_drive_token(
+        &mut self,
+        repository_id: RepositoryId,
+        token: &str,
     ) -> Result<(), MirageError>;
     fn unmount(&mut self, repository_id: RepositoryId) -> Result<(), MirageError>;
     fn is_running(&mut self, repository_id: RepositoryId) -> Result<bool, MirageError>;
@@ -55,6 +63,8 @@ impl MountControl for NativeMountControl {
         owner_sid: &str,
         origin_root: Option<&Path>,
         volume_capacity: (u64, u64),
+        managed: bool,
+        drive_provider: Option<(&Path, &Path)>,
     ) -> Result<(), MirageError> {
         let (volume_total_bytes, volume_free_bytes) = volume_capacity;
         if !self.executable.is_file() {
@@ -88,22 +98,48 @@ impl MountControl for NativeMountControl {
                     volume_total_bytes,
                     volume_free_bytes,
                     origin_root: origin_root.map(Path::to_path_buf),
+                    managed,
+                    drive_manifest: drive_provider.map(|(manifest, _)| manifest.to_path_buf()),
+                    repository_key: drive_provider.map(|(_, key)| key.to_path_buf()),
                 },
             )
             .map_err(io_error)?;
-        if !self
-            .supervisor
-            .wait_ready(&id, Duration::from_secs(15))
-            .map_err(io_error)?
-        {
+        let ready = self.supervisor.wait_ready(&id, Duration::from_secs(15));
+        if let Err(error) = ready {
+            let tail = self.supervisor.stderr_tail(&id);
             let _ = self.supervisor.stop(&id);
-            return Err(MirageError::deadline_exceeded(
-                "filesystem host did not become ready before the startup deadline",
-            ));
+            return Err(MirageError::provider_unavailable(format!(
+                "filesystem host operation failed: {error}{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; host stderr: {}", tail.trim())
+                }
+            )));
+        }
+        if !ready.unwrap_or(false) {
+            let tail = self.supervisor.stderr_tail(&id);
+            let _ = self.supervisor.stop(&id);
+            return Err(MirageError::deadline_exceeded(format!(
+                "filesystem host did not become ready before the startup deadline{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; host stderr: {}", tail.trim())
+                }
+            )));
         }
         if let Err(error) = wait_for_mount_response(&mut self.supervisor, &id, mount_point) {
+            let tail = self.supervisor.stderr_tail(&id);
             let _ = self.supervisor.stop(&id);
-            return Err(error);
+            return Err(MirageError::provider_unavailable(format!(
+                "{error}{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; host stderr: {}", tail.trim())
+                }
+            )));
         }
         if self.supervisor.state(&id) != Some(HostState::Running) {
             return Err(MirageError::provider_unavailable(
@@ -111,6 +147,16 @@ impl MountControl for NativeMountControl {
             ));
         }
         Ok(())
+    }
+
+    fn send_drive_token(
+        &mut self,
+        repository_id: RepositoryId,
+        token: &str,
+    ) -> Result<(), MirageError> {
+        self.supervisor
+            .send_line(&host_id(repository_id)?, &format!("TOKEN {token}"))
+            .map_err(io_error)
     }
 
     fn unmount(&mut self, repository_id: RepositoryId) -> Result<(), MirageError> {
@@ -213,7 +259,14 @@ impl MountControl for UnavailableMountControl {
         _: &str,
         _: Option<&Path>,
         _: (u64, u64),
+        _: bool,
+        _: Option<(&Path, &Path)>,
     ) -> Result<(), MirageError> {
+        Err(MirageError::provider_unavailable(
+            "filesystem host is not configured",
+        ))
+    }
+    fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
         Err(MirageError::provider_unavailable(
             "filesystem host is not configured",
         ))

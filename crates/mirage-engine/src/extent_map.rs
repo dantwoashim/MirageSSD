@@ -5,6 +5,11 @@
 //! so writers never mutate a view in progress; truncate drops unreachable
 //! extents and clips the last one, and later extension always reads zeros —
 //! a shrunken file never exposes stale tail bytes.
+//!
+//! The logical EOF is tracked independently of the interval list: a
+//! truncate-to-zero still produces a versioned head (durable via
+//! `byte_extent_heads`), and a truncate-grow leaves a hole that reads as
+//! zeros without materializing zero extents.
 
 use mirage_db::{ByteExtent, ExtentKind};
 use mirage_types::{InodeId, MirageError, PageHash, RepositoryId};
@@ -61,27 +66,43 @@ enum ExtentSource {
         page_hash: PageHash,
         base_offset: u64,
     },
+    /// `payload_offset` is where this interval's bytes begin inside the
+    /// staged payload — a clip that drops the head must advance it so the
+    /// surviving tail never re-reads payload byte zero.
     Dirty {
         payload_id: [u8; 16],
+        payload_offset: u64,
     },
     Zero,
 }
 
 /// Per-inode extent map. Writers serialize per inode through `Mutex`-like
 /// external discipline; readers pin `version` for a stable view.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ExtentMap {
     intervals: Vec<Interval>,
     version: i64,
+    /// Logical EOF: tracked separately from the interval list so a
+    /// truncate-grow (zero hole) and a truncate-to-zero (no extents) both
+    /// report honest end-of-file.
+    file_size: u64,
+    /// The map was rebuilt from durable history — it must never take the
+    /// unchanged-base fast path even when the decode leaves no intervals.
+    historical: bool,
 }
 
 impl ExtentMap {
-    /// Rebuilds a map from durable extents at `version`.
+    /// Rebuilds a map from durable extents at `version`. The file size is the
+    /// last extent's end; callers that have the durable head should apply
+    /// `set_file_size` so a trailing hole or empty file reports its true EOF.
     pub fn replay(volume_id: RepositoryId, inode: InodeId, extents: &[ByteExtent]) -> Self {
         let _ = (volume_id, inode);
         let mut map = Self::default();
         for extent in extents {
             map.version = map.version.max(extent.version);
+            map.file_size = map
+                .file_size
+                .max(extent.start.saturating_add(extent.length));
             map.intervals.push(Interval {
                 start: extent.start,
                 length: extent.length,
@@ -92,12 +113,17 @@ impl ExtentMap {
                     },
                     ExtentKind::Dirty => ExtentSource::Dirty {
                         payload_id: extent.payload_id.unwrap_or([0; 16]),
+                        // Pre-migration dirty rows carry no payload offset;
+                        // zero is correct only for rows written before the
+                        // tail-corruption fix and never for a clipped tail.
+                        payload_offset: extent.payload_offset.unwrap_or(0),
                     },
                     ExtentKind::Zero => ExtentSource::Zero,
                 },
             });
         }
         map.intervals.sort_by_key(|interval| interval.start);
+        map.historical = true;
         map
     }
 
@@ -105,6 +131,40 @@ impl ExtentMap {
     #[must_use]
     pub fn version(&self) -> i64 {
         self.version
+    }
+
+    /// The current logical EOF.
+    #[must_use]
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Applies the durable head — an empty or hole-tailed extent set cannot
+    /// express its own newest version or EOF.
+    pub fn set_head(&mut self, version: i64, eof: u64) {
+        self.version = self.version.max(version);
+        self.file_size = eof;
+        self.historical = true;
+    }
+
+    /// A map is plain base only while it carries no mutation at all: exactly
+    /// one unwritten base extent covering the whole file, or nothing. Any
+    /// write, truncate, or replayed history disqualifies it, so a truncated
+    /// base can never be mistaken for the unchanged file by the fast path.
+    #[must_use]
+    pub fn is_plain_base(&self) -> bool {
+        if self.version != 0 || self.historical {
+            return false;
+        }
+        match self.intervals.as_slice() {
+            [] => true,
+            [interval] => {
+                interval.start == 0
+                    && interval.length == self.file_size
+                    && matches!(interval.source, ExtentSource::Base { base_offset: 0, .. })
+            }
+            _ => false,
+        }
     }
 
     /// Seeds the map with a single base extent covering `[0, length)` so a
@@ -121,10 +181,12 @@ impl ExtentMap {
                 base_offset: 0,
             },
         });
+        self.file_size = self.file_size.max(length);
     }
 
     /// Applies a dirty write of `length` bytes at `start`. Only the written
-    /// range is replaced — disjoint base extents are preserved untouched.
+    /// range is replaced — disjoint base extents are preserved untouched —
+    /// and the EOF extends when the write reaches past it.
     pub fn write(
         &mut self,
         start: u64,
@@ -143,9 +205,13 @@ impl ExtentMap {
             Interval {
                 start,
                 length,
-                source: ExtentSource::Dirty { payload_id },
+                source: ExtentSource::Dirty {
+                    payload_id,
+                    payload_offset: 0,
+                },
             },
         );
+        self.file_size = self.file_size.max(end);
         self.version += 1;
         Ok(())
     }
@@ -164,23 +230,25 @@ impl ExtentMap {
             kept.push(interval);
         }
         self.intervals = kept;
+        self.file_size = length;
         self.version += 1;
         Ok(())
     }
 
     /// Reads `length` bytes at `start` for the pinned version, resolving to
-    /// base/dirty/zero slices. Bytes past the end-of-file extent set are
-    /// zeros; bytes inside the set that no extent covers are zeros too —
-    /// holes are only created by explicit truncate/regrow or sparse writes
-    /// that recorded a ZERO extent, so an unavailable base slice fails at
-    /// fetch time, never silently.
+    /// base/dirty/zero slices. Bytes past the EOF are not emitted — a read
+    /// reaching past the end returns short, never a fabricated tail. Bytes
+    /// inside the EOF that no extent covers are zeros — holes are only
+    /// created by explicit truncate/regrow or sparse writes — so an
+    /// unavailable base slice fails at fetch time, never silently.
     pub fn read(&self, start: u64, length: u64) -> Result<Vec<ExtentSlice>, MirageError> {
-        if length == 0 {
+        if length == 0 || start >= self.file_size {
             return Ok(Vec::new());
         }
         let end = start
             .checked_add(length)
-            .ok_or_else(|| MirageError::invalid_argument("read range overflows"))?;
+            .ok_or_else(|| MirageError::invalid_argument("read range overflows"))?
+            .min(self.file_size);
         let mut slices = Vec::new();
         let mut cursor = start;
         for interval in &self.intervals {
@@ -188,12 +256,16 @@ impl ExtentMap {
                 continue;
             }
             if interval.start > cursor {
+                // Uncovered gap: emit zeros once and advance the cursor so a
+                // gap before the first extent is never emitted twice.
+                let gap_end = interval.start.min(end);
                 slices.push(ExtentSlice::Zero {
                     start: cursor,
-                    length: interval.start.min(end) - cursor,
+                    length: gap_end - cursor,
                 });
+                cursor = gap_end;
             }
-            if interval.start >= end {
+            if interval.start >= end || cursor >= end {
                 break;
             }
             let overlap_start = cursor.max(interval.start);
@@ -212,11 +284,14 @@ impl ExtentMap {
                     page_hash: *page_hash,
                     base_offset: base_offset + inside,
                 },
-                ExtentSource::Dirty { payload_id } => ExtentSlice::Dirty {
+                ExtentSource::Dirty {
+                    payload_id,
+                    payload_offset,
+                } => ExtentSlice::Dirty {
                     start: overlap_start,
                     length: overlap_end - overlap_start,
                     payload_id: *payload_id,
-                    payload_offset: inside,
+                    payload_offset: payload_offset + inside,
                 },
                 ExtentSource::Zero => ExtentSlice::Zero {
                     start: overlap_start,
@@ -237,31 +312,67 @@ impl ExtentMap {
         Ok(slices)
     }
 
-    /// Materializes the map as durable extents at `version` for the writer
-    /// actor.
+    /// Serializes the map as a version's extent set — written atomically
+    /// with the operation that produced it. Uncovered holes, including the
+    /// trailing hole of a truncate-grow, are materialized as Zero extents so
+    /// the durable set alone reproduces the file size and read semantics.
     pub fn to_extents(
         &self,
         volume_id: RepositoryId,
         inode: InodeId,
         version: i64,
         now_ns: i64,
-        mut next_id: impl FnMut() -> [u8; 16],
+        mut next_extent_id: impl FnMut() -> [u8; 16],
     ) -> Vec<ByteExtent> {
-        self.intervals
+        let mut intervals: Vec<Interval> = Vec::with_capacity(self.intervals.len() + 1);
+        let mut cursor = 0u64;
+        for interval in &self.intervals {
+            if interval.start > cursor {
+                intervals.push(Interval {
+                    start: cursor,
+                    length: interval.start - cursor,
+                    source: ExtentSource::Zero,
+                });
+            }
+            intervals.push(interval.clone());
+            cursor = cursor.max(interval.start + interval.length);
+        }
+        if cursor < self.file_size {
+            intervals.push(Interval {
+                start: cursor,
+                length: self.file_size - cursor,
+                source: ExtentSource::Zero,
+            });
+        }
+        intervals
             .iter()
             .map(|interval| {
-                let (kind, page_hash, base_offset, payload_id) = match &interval.source {
-                    ExtentSource::Base {
-                        page_hash,
-                        base_offset,
-                    } => (ExtentKind::Base, Some(*page_hash), Some(*base_offset), None),
-                    ExtentSource::Dirty { payload_id } => {
-                        (ExtentKind::Dirty, None, None, Some(*payload_id))
-                    }
-                    ExtentSource::Zero => (ExtentKind::Zero, None, None, None),
-                };
+                let (kind, page_hash, base_offset, payload_id, payload_offset) =
+                    match &interval.source {
+                        ExtentSource::Base {
+                            page_hash,
+                            base_offset,
+                        } => (
+                            ExtentKind::Base,
+                            Some(*page_hash),
+                            Some(*base_offset),
+                            None,
+                            None,
+                        ),
+                        ExtentSource::Dirty {
+                            payload_id,
+                            payload_offset,
+                        } => (
+                            ExtentKind::Dirty,
+                            None,
+                            None,
+                            Some(*payload_id),
+                            Some(*payload_offset),
+                        ),
+                        ExtentSource::Zero => (ExtentKind::Zero, None, None, None, None),
+                    };
                 ByteExtent {
-                    extent_id: next_id(),
+                    extent_id: next_extent_id(),
                     volume_id,
                     inode,
                     version,
@@ -271,66 +382,60 @@ impl ExtentMap {
                     page_hash,
                     base_offset,
                     payload_id,
+                    payload_offset,
                     created_ns: now_ns,
                 }
             })
             .collect()
     }
 
-    /// True when the map is a single base extent — equivalent to the
-    /// committed immutable content, so callers can take the plain page path.
-    #[must_use]
-    pub fn is_plain_base(&self) -> bool {
-        matches!(
-            self.intervals.as_slice(),
-            [Interval {
-                source: ExtentSource::Base { .. },
-                ..
-            }]
-        ) || self.intervals.is_empty()
-    }
-
-    /// Splice `[start, end)` out and insert `inserted`, splitting covered
-    /// intervals so disjoint writes to one page both survive.
-    fn splice(&mut self, start: u64, end: u64, inserted: Interval) {
-        let mut out = Vec::with_capacity(self.intervals.len() + 2);
-        for interval in std::mem::take(&mut self.intervals) {
-            let i_end = interval.start + interval.length;
-            if i_end <= start || interval.start >= end {
-                out.push(interval);
+    /// Replaces `[start, end)` with `interval`, splitting overlapped
+    /// intervals and preserving each survivor's offset into its own source —
+    /// a clipped dirty tail keeps pointing at its payload position.
+    fn splice(&mut self, start: u64, end: u64, interval: Interval) {
+        let mut next = Vec::with_capacity(self.intervals.len() + 2);
+        for existing in std::mem::take(&mut self.intervals) {
+            let existing_end = existing.start + existing.length;
+            if existing_end <= start || existing.start >= end {
+                next.push(existing);
                 continue;
             }
-            // Left remainder.
-            if interval.start < start {
-                out.push(Interval {
-                    start: interval.start,
-                    length: start - interval.start,
-                    source: interval.source.clone(),
+            if existing.start < start {
+                next.push(Interval {
+                    start: existing.start,
+                    length: start - existing.start,
+                    source: existing.source.clone(),
                 });
             }
-            // Right remainder — a base extent keeps the same page hash at an
-            // advanced offset.
-            if i_end > end {
-                let tail = interval.source.clone();
-                out.push(Interval {
-                    start: end,
-                    length: i_end - end,
-                    source: match tail {
-                        ExtentSource::Base {
-                            page_hash,
-                            base_offset,
-                        } => ExtentSource::Base {
-                            page_hash,
-                            base_offset: base_offset + (end - interval.start),
-                        },
-                        other => other,
+            if existing_end > end {
+                let clipped = end - existing.start;
+                let tail_source = match existing.source {
+                    ExtentSource::Base {
+                        page_hash,
+                        base_offset,
+                    } => ExtentSource::Base {
+                        page_hash,
+                        base_offset: base_offset + clipped,
                     },
+                    ExtentSource::Dirty {
+                        payload_id,
+                        payload_offset,
+                    } => ExtentSource::Dirty {
+                        payload_id,
+                        payload_offset: payload_offset + clipped,
+                    },
+                    ExtentSource::Zero => ExtentSource::Zero,
+                };
+                next.push(Interval {
+                    start: end,
+                    length: existing_end - end,
+                    source: tail_source,
                 });
             }
         }
-        out.push(inserted);
-        out.sort_by_key(|interval| interval.start);
-        self.intervals = out;
+        next.push(interval);
+        next.sort_by_key(|entry| entry.start);
+        self.intervals = next;
     }
 }
 
@@ -338,73 +443,117 @@ impl ExtentMap {
 mod tests {
     use super::*;
 
-    fn base_map() -> ExtentMap {
+    fn page() -> PageHash {
+        PageHash::from_bytes([3; 32])
+    }
+
+    #[test]
+    fn disjoint_writes_produce_disjoint_dirty_slices() {
         let mut map = ExtentMap::default();
-        map.intervals.push(Interval {
-            start: 0,
-            length: 8192,
-            source: ExtentSource::Base {
-                page_hash: PageHash::from_bytes([0xaa; 32]),
-                base_offset: 0,
-            },
-        });
-        map
-    }
-
-    #[test]
-    fn disjoint_partial_writes_both_survive() {
-        let mut map = base_map();
-        map.write(100, 4, [1; 16]).unwrap();
-        map.write(5000, 4, [2; 16]).unwrap();
-        let slices = map.read(0, 8192).unwrap();
-        let dirty: Vec<u64> = slices
+        map.seed_base(100, page());
+        map.write(10, 4, [1; 16]).unwrap();
+        map.write(50, 4, [2; 16]).unwrap();
+        let slices = map.read(0, 100).unwrap();
+        let dirty: Vec<_> = slices
             .iter()
-            .filter_map(|slice| match slice {
-                ExtentSlice::Dirty { start, .. } => Some(*start),
-                _ => None,
-            })
+            .filter(|slice| matches!(slice, ExtentSlice::Dirty { .. }))
             .collect();
-        assert_eq!(dirty, vec![100, 5000]);
-        let base_total: u64 = slices
-            .iter()
-            .filter_map(|slice| match slice {
-                ExtentSlice::Base { length, .. } => Some(*length),
-                _ => None,
-            })
-            .sum();
-        assert_eq!(base_total, 8192 - 8);
+        assert_eq!(dirty.len(), 2);
     }
 
     #[test]
-    fn shrink_then_grow_never_exposes_old_tail() {
-        let mut map = base_map();
-        map.truncate(100).unwrap();
-        let slices = map.read(0, 8192).unwrap();
-        let tail = slices.last().unwrap();
-        assert_eq!(
-            *tail,
-            ExtentSlice::Zero {
-                start: 100,
-                length: 8192 - 100
+    fn overlapping_write_splits_and_offsets_tail() {
+        let mut map = ExtentMap::default();
+        map.write(0, 10, [1; 16]).unwrap();
+        map.write(5, 4, [2; 16]).unwrap();
+        let slices = map.read(0, 10).unwrap();
+        let dirty: Vec<_> = slices
+            .iter()
+            .filter(|s| matches!(s, ExtentSlice::Dirty { .. }))
+            .collect();
+        assert_eq!(dirty.len(), 3);
+        match dirty[2] {
+            ExtentSlice::Dirty {
+                start,
+                length,
+                payload_id,
+                payload_offset,
+            } => {
+                assert_eq!((*start, *length), (9, 1));
+                assert_eq!(*payload_id, [1; 16]);
+                assert_eq!(*payload_offset, 9);
             }
+            _ => panic!("expected dirty tail"),
+        }
+    }
+
+    #[test]
+    fn truncate_shrinks_and_grows_with_zero_fill() {
+        let mut map = ExtentMap::default();
+        map.seed_base(100, page());
+        map.truncate(10).unwrap();
+        assert_eq!(map.file_size(), 10);
+        assert!(!map.is_plain_base());
+        let slices = map.read(0, 100).unwrap();
+        let covered: u64 = slices.iter().map(ExtentSlice::length).sum();
+        assert_eq!(covered, 10);
+        assert!(map.read(10, 4).unwrap().is_empty());
+        map.truncate(100).unwrap();
+        assert_eq!(map.file_size(), 100);
+        let tail = map.read(90, 10).unwrap();
+        assert_eq!(
+            tail,
+            vec![ExtentSlice::Zero {
+                start: 90,
+                length: 10
+            }]
         );
     }
 
     #[test]
-    fn partial_overwrite_splits_base_extent_offsets() {
-        let mut map = base_map();
-        map.write(4096, 100, [7; 16]).unwrap();
-        let slices = map.read(4000, 300).unwrap();
-        // 96 bytes of base (page offset 4000), 100 dirty, 104 base at 4196.
-        assert_eq!(slices.len(), 3);
-        match &slices[2] {
-            ExtentSlice::Base {
-                start, base_offset, ..
-            } => {
-                assert_eq!(*start, 4196);
-                assert_eq!(*base_offset, 4196);
-            }
-            _ => panic!("expected trailing base slice"),
+    fn truncate_to_zero_survives_replay() {
+        let mut map = ExtentMap::default();
+        map.write(0, 4, [1; 16]).unwrap();
+        map.truncate(0).unwrap();
+        assert!(map.read(0, 4).unwrap().is_empty());
+        let replayed = ExtentMap::replay(
+            RepositoryId::from_bytes([7; 16]),
+            InodeId::from_bytes([9; 16]),
+            &map.to_extents(
+                RepositoryId::from_bytes([7; 16]),
+                InodeId::from_bytes([9; 16]),
+                2,
+                1,
+                || [2; 16],
+            ),
+        );
+        assert_eq!(replayed.version(), 0);
+        assert!(replayed.read(0, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sparse_read_gaps_emit_single_zero_slice() {
+        let mut map = ExtentMap::default();
+        map.write(100, 4, [1; 16]).unwrap();
+        let slices = map.read(0, 10).unwrap();
+        assert_eq!(
+            slices,
+            vec![ExtentSlice::Zero {
+                start: 0,
+                length: 10
+            }]
+        );
+    }
+
+    #[test]
+    fn base_slice_tracks_base_offset() {
+        let mut map = ExtentMap::default();
+        map.seed_base(100, page());
+        map.write(0, 10, [1; 16]).unwrap();
+        let slices = map.read(10, 10).unwrap();
+        match &slices[0] {
+            ExtentSlice::Base { base_offset, .. } => assert_eq!(*base_offset, 10),
+            other => panic!("expected base slice, got {other:?}"),
         }
     }
 }

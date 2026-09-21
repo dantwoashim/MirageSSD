@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +9,8 @@ use mirage_cache::{ArenaShard, ResidentIndex};
 use mirage_index::{MountIndex, NodeIndex};
 use mirage_pack::{PackReadEncryption, PackReader, PlainPage};
 use mirage_types::{MirageError, PageHash};
+
+use crate::status::MirageStatus;
 /// Synchronous hook into the engine's `PageProvider`: admitted fetch with a
 /// bounded transient fallback. Returns typed errors so the read path can map
 /// offline, cancellation, corruption, and end-of-file distinctly.
@@ -194,6 +196,25 @@ pub struct CoalescedReads {
     /// Pages covered by those runs.
     pub pages: AtomicU64,
 }
+/// Managed dirty-payload ledger: the physical-ledger file id for the volume
+/// journal, the configured byte budget, currently committed dirty bytes, and
+/// the next unique slot index. `mutex` serializes the budget check and the
+/// durable reservation so two writers cannot both pass the check.
+pub struct DirtyLedger {
+    pub file_id: [u8; 16],
+    pub budget_bytes: u64,
+    pub used: AtomicU64,
+    pub next_slot: AtomicI64,
+    pub mutex: Mutex<()>,
+}
+impl DirtyLedger {
+    /// Remaining budget, saturating at zero.
+    #[must_use]
+    pub fn free(&self) -> u64 {
+        self.budget_bytes
+            .saturating_sub(self.used.load(Ordering::Acquire))
+    }
+}
 pub struct MirageEngineHandle {
     pub entries: BTreeMap<Vec<u16>, Entry>,
     pub index: Option<Arc<MountIndex>>,
@@ -229,6 +250,132 @@ pub struct MirageEngineHandle {
     pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
     /// State root holding journal payload files for dirty extents.
     pub state_root: Option<PathBuf>,
+    /// Managed writable volume: the durable namespace is authoritative for
+    /// names and mutation exports are enabled.
+    pub managed: bool,
+    /// Dirty-payload budget ledger for a managed volume; `None` on legacy
+    /// read-only engines.
+    pub dirty: Option<Arc<DirtyLedger>>,
+    /// A provider that can be installed on the coordinator once credentials
+    /// arrive; `None` when the managed engine has no cloud/provider source.
+    pub managed_provider: Option<Arc<ManagedProvider>>,
+    /// Payload publisher for the managed volume: uploads committed journal
+    /// payloads as immutable remote objects so their local copies become
+    /// evictable. Present whenever a provider exists.
+    pub publisher: Option<Arc<crate::publisher::Publisher>>,
+    /// Evicted-payload fetch state: backend + key + bounded frame cache.
+    pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
+}
+
+/// A page provider waiting for its first credential: the coordinator's
+/// provider slot stays empty until `mirage_engine_set_drive_token` installs
+/// the hook, so pre-credential reads fail with the offline/unavailable status
+/// instead of an authentication error.
+enum ManagedProviderKind {
+    /// Drive-backed: the bearer token rotates in place via `replace_token`.
+    Drive {
+        backend: Arc<mirage_backend_drive::RefreshableDriveBackend>,
+        provider: Arc<mirage_engine::PageProvider<mirage_backend_drive::RefreshableDriveBackend>>,
+    },
+    /// Directory-backed (pack mirror): tokens are accepted but unused; kept
+    /// for tests and diagnostics.
+    Local(Arc<mirage_engine::PageProvider<crate::directory_backend::DirectoryObjectBackend>>),
+}
+
+pub struct ManagedProvider {
+    kind: ManagedProviderKind,
+    /// Set once the provider hook has been installed on the coordinator.
+    pub installed: Arc<AtomicBool>,
+    /// Content key the payload publisher encrypts with; Drive uses the
+    /// repository key, the directory seam derives a deterministic test key.
+    pub publication_key: Arc<mirage_crypto::aead::RepositoryKey>,
+}
+
+impl ManagedProvider {
+    pub fn drive(
+        backend: Arc<mirage_backend_drive::RefreshableDriveBackend>,
+        provider: Arc<mirage_engine::PageProvider<mirage_backend_drive::RefreshableDriveBackend>>,
+        publication_key: Arc<mirage_crypto::aead::RepositoryKey>,
+    ) -> Self {
+        Self {
+            kind: ManagedProviderKind::Drive { backend, provider },
+            installed: Arc::new(AtomicBool::new(false)),
+            publication_key,
+        }
+    }
+
+    pub fn local(
+        provider: Arc<
+            mirage_engine::PageProvider<crate::directory_backend::DirectoryObjectBackend>,
+        >,
+    ) -> Self {
+        Self {
+            kind: ManagedProviderKind::Local(provider),
+            installed: Arc::new(AtomicBool::new(false)),
+            // Deterministic test key: payload objects produced by the
+            // directory seam must decrypt across engine restarts.
+            publication_key: Arc::new(mirage_crypto::aead::RepositoryKey::from_bytes(
+                *blake3::hash(b"mirage-local-provider-publication-key/v1").as_bytes(),
+            )),
+        }
+    }
+
+    /// Best-effort readahead entry: no-op until the provider is installed,
+    /// then `P4ReadAhead` fetches on the bounded speculative queue.
+    pub fn prefetch(&self) -> Arc<dyn Fn(PageHash) + Send + Sync> {
+        let installed = Arc::clone(&self.installed);
+        match &self.kind {
+            ManagedProviderKind::Drive { provider, .. } => {
+                let provider = Arc::clone(provider);
+                Arc::new(move |hash| {
+                    if installed.load(Ordering::Acquire) {
+                        provider.prefetch_readahead(hash);
+                    }
+                })
+            }
+            ManagedProviderKind::Local(provider) => {
+                let provider = Arc::clone(provider);
+                Arc::new(move |hash| {
+                    if installed.load(Ordering::Acquire) {
+                        provider.prefetch_readahead(hash);
+                    }
+                })
+            }
+        }
+    }
+
+    /// The object backend as a trait object for publisher/fetch use.
+    pub fn backend(&self) -> Arc<dyn mirage_backend::ObjectBackend> {
+        match &self.kind {
+            ManagedProviderKind::Drive { backend, .. } => {
+                Arc::clone(backend) as Arc<dyn mirage_backend::ObjectBackend>
+            }
+            ManagedProviderKind::Local(provider) => provider.backend_arc(),
+        }
+    }
+
+    /// The coordinator hook for this provider.
+    pub fn hook(&self) -> Arc<PageProviderHook> {
+        match &self.kind {
+            ManagedProviderKind::Drive { provider, .. } => {
+                mirage_engine::get_or_fetch::provider_hook(Arc::clone(provider))
+            }
+            ManagedProviderKind::Local(provider) => {
+                mirage_engine::get_or_fetch::provider_hook(Arc::clone(provider))
+            }
+        }
+    }
+
+    /// Rotates the credential where the backend supports it; the directory
+    /// backend ignores tokens (install is still recorded so behavior matches).
+    pub fn set_token(&self, token: &str) -> Result<(), MirageStatus> {
+        match &self.kind {
+            ManagedProviderKind::Drive { backend, .. } => backend
+                .replace_token(zeroize::Zeroizing::new(token.to_owned()))
+                .map_err(|_| MirageStatus::BackendUnavailable),
+            ManagedProviderKind::Local(_) => Ok(()),
+        }
+    }
 }
 pub struct MirageFileHandle {
     pub entry: Entry,
@@ -265,6 +412,31 @@ pub struct MirageFileHandle {
     pub desired_access: mirage_engine::handles::DesiredAccess,
     /// Share mode this handle granted, for handle-table accounting.
     pub share_access: mirage_engine::handles::ShareAccess,
+    /// Inherited from the engine: the namespace is authoritative for names.
+    pub managed: bool,
+    /// Dirty-payload budget ledger shared with the engine.
+    pub dirty: Option<Arc<DirtyLedger>>,
+    /// Best-effort sequential readahead into the provider's speculative
+    /// queue; `None` on engines without a provider source.
+    pub prefetch: Option<Arc<dyn Fn(PageHash) + Send + Sync>>,
+    /// Flush-time publisher wake: shared engine publisher, managed volumes only.
+    pub publisher: Option<Arc<crate::publisher::Publisher>>,
+    /// Remote fetch for evicted payloads (published dirty extents whose local
+    /// file was reclaimed).
+    pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
+    /// Sequential-miss tracking for `prefetch` (file-relative page hashes and
+    /// the last provider-fetched position).
+    pub prefetch_state: Arc<PrefetchState>,
+}
+
+/// Per-open sequential-read tracking for managed readahead.
+pub struct PrefetchState {
+    /// The file's committed page hashes in logical order; deduplicated so a
+    /// repeated page still maps to one position.
+    pub hashes: std::sync::OnceLock<Vec<PageHash>>,
+    /// Position in `hashes` of the last provider-served miss; -1 until the
+    /// first miss so the first fetch arms readahead.
+    pub last: AtomicI64,
 }
 impl MirageFileHandle {
     pub fn caller_image(&self, pid: u32) -> Arc<str> {
@@ -297,12 +469,17 @@ impl MirageEngineHandle {
             coalesced: Arc::new(CoalescedReads::default()),
             violations: None,
             trace_lookups: false,
+            managed_provider: None,
             coordinator: None,
             provider: None,
             db: None,
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(Mutex::new(HashMap::new())),
             state_root: None,
+            managed: false,
+            dirty: None,
+            publisher: None,
+            remote_payloads: None,
         }
     }
     /// Owner-side origin decodes performed by this engine.

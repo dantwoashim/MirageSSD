@@ -197,11 +197,47 @@ pub fn replay(
                     continue;
                 };
                 let mut buffer = vec![0u8; usize::try_from(length).unwrap_or(0)];
-                match open
-                    .file
-                    .seek(SeekFrom::Start(offset))
-                    .and_then(|_| open.file.read(&mut buffer))
-                {
+                // FILE_FLAG_NO_BUFFERING requires sector-aligned offsets,
+                // lengths, and buffers — an unaligned trace request is a
+                // recorded failure, never silently re-buffered.
+                let unaligned = config.no_buffering
+                    && (!offset.is_multiple_of(512) || !length.is_multiple_of(512));
+                if unaligned {
+                    row["ok"] = json!(false);
+                    row["error"] = json!("unaligned read is not supported under no_buffering");
+                    summary.errors += 1;
+                    write_timed(out, &row, op_start)?;
+                    summary.ops += 1;
+                    summary
+                        .read_latencies_ns
+                        .push(op_start.elapsed().as_nanos() as u64);
+                    continue;
+                }
+                let result = open.file.seek(SeekFrom::Start(offset)).and_then(|_| {
+                    // A short read is data loss in evidence terms: loop until
+                    // the request is filled or the source refuses, and treat
+                    // any remainder as an error rather than a silent success.
+                    let mut filled = 0usize;
+                    while filled < buffer.len() {
+                        match open.file.read(&mut buffer[filled..]) {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    format!(
+                                        "short read: {} of {} bytes returned",
+                                        filled,
+                                        buffer.len()
+                                    ),
+                                ));
+                            }
+                            Ok(got) => filled += got,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(filled)
+                });
+                match result {
                     Ok(read) => {
                         if let Some(hasher) = open.hasher.as_mut() {
                             use sha2::Digest;

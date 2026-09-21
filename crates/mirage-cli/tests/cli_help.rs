@@ -411,3 +411,92 @@ fn local_repository_cli_round_trips_and_refuses_extract_overwrite() {
         "second extract must not overwrite"
     );
 }
+
+#[test]
+#[cfg(windows)]
+fn repo_import_pack_all_packs_every_regular_file() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let source = directory.path().join("source");
+    fs::create_dir(&source).expect("source directory");
+    fs::write(source.join("tiny.txt"), b"0123456789").expect("tiny file");
+    let repository = "42424242424242424242424242424242";
+    let key_id = "42424242424242424242424242424242";
+    let key = "42".repeat(32);
+
+    let import_with = |pack_all: bool, name: &str| {
+        let import = directory.path().join(name);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mirage"));
+        command
+            .args(["repo", "import", "--local-only", "--source"])
+            .arg(&source)
+            .arg("--output")
+            .arg(&import)
+            .args(["--repository-id", repository, "--page-size", "65536"])
+            .arg("--json");
+        if pack_all {
+            command.arg("--pack-all");
+        }
+        (command.output().expect("import command"), import)
+    };
+
+    // Baseline: a 10-byte .txt stays native — zero virtual bytes.
+    let (baseline, _) = import_with(false, "import-baseline");
+    assert!(
+        baseline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let baseline_json: serde_json::Value =
+        serde_json::from_slice(&baseline.stdout).expect("baseline JSON");
+    assert_eq!(baseline_json["data"]["virtual_bytes"], 0);
+
+    // --pack-all packs the same file, and extract reads it byte-exact.
+    let (packed, import) = import_with(true, "import-packed");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let packed_json: serde_json::Value =
+        serde_json::from_slice(&packed.stdout).expect("packed JSON");
+    assert_eq!(packed_json["data"]["virtual_bytes"], 10);
+    assert_eq!(packed_json["data"]["pack_count"], 1);
+
+    let backend = directory.path().join("backend");
+    let committed = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .args(["repo", "commit-local", "--import"])
+        .arg(&import)
+        .arg("--backend-root")
+        .arg(&backend)
+        .args(["--repository-id", repository, "--key-id-hex", key_id])
+        .args(["--test-key-hex", &key])
+        .output()
+        .expect("commit command");
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+
+    let extract = directory.path().join("extract");
+    let extracted = Command::new(env!("CARGO_BIN_EXE_mirage"))
+        .args(["repo", "extract", "--backend-root"])
+        .arg(&backend)
+        .arg("--destination")
+        .arg(&extract)
+        .args(["--repository-id", repository, "--key-id-hex", key_id])
+        .args(["--test-key-hex", &key])
+        .arg("--repository-key")
+        .arg(import.join("repository-key.dpapi"))
+        .output()
+        .expect("extract command");
+    assert!(
+        extracted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    assert_eq!(
+        fs::read(extract.join("tiny.txt")).expect("extracted file"),
+        b"0123456789"
+    );
+}

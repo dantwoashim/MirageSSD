@@ -59,6 +59,16 @@ pub fn prepare_space_lease(
         candidates: source.reclaim_candidates()?,
     };
     let plan = plan_space_lease(&snapshot, request.requested_bytes)?;
+    if std::env::var_os("MIRAGE_DEBUG_LEASE").is_some() {
+        eprintln!(
+            "lease plan: requested={} free={} reserve={} outstanding={} candidates={} plan={plan:?}",
+            request.requested_bytes,
+            snapshot.physical_free_bytes,
+            snapshot.filesystem_reserve_bytes,
+            snapshot.outstanding_space_lease_bytes,
+            snapshot.candidates.len(),
+        );
+    }
     if !plan.grantable() {
         return Err(MirageError::cache_full(format!(
             "Space Lease is short by {} physical bytes",

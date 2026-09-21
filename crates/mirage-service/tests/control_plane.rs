@@ -81,6 +81,7 @@ fn missing_and_not_ready_commands_fail_truthfully() {
                 repository_id,
                 generation: GenerationId::ZERO,
                 drive_letter: None,
+                drive_access_token: None,
             },
         ),
     );
@@ -177,6 +178,7 @@ fn successful_mount_and_unmount_are_ordered_with_durable_state() {
                 repository_id,
                 generation,
                 drive_letter: None,
+                drive_access_token: None,
             },
         ),
     );
@@ -192,6 +194,80 @@ fn successful_mount_and_unmount_are_ordered_with_durable_state() {
         Some(RepositoryState::ReadyUnmounted)
     );
     assert_eq!(*calls.lock().unwrap(), vec!["mount", "unmount"]);
+}
+
+#[test]
+fn volume_mode_persists_unmounted_and_is_refused_while_mounted() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x91; 16]);
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "volume mode fixture".into(),
+            local_root: directory.path().join("repository"),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    let handler = ControlPlaneHandler::new(database.clone());
+
+    assert_eq!(
+        database.load_repository_volume_mode(repository_id).unwrap(),
+        Some(mirage_db::VolumeMode::Legacy)
+    );
+    let managed = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::RepositorySetVolumeMode {
+                repository_id,
+                managed: true,
+            },
+        ),
+    );
+    assert!(matches!(managed, ResponseBody::Json(_)), "{managed:?}");
+    assert_eq!(
+        database.load_repository_volume_mode(repository_id).unwrap(),
+        Some(mirage_db::VolumeMode::Managed)
+    );
+
+    database
+        .set_repository_state(
+            repository_id,
+            RepositoryState::ReadyUnmounted,
+            mirage_types::RepositoryEvent::MountRequested,
+            2,
+        )
+        .expect("mount requested");
+    database
+        .set_repository_state(
+            repository_id,
+            RepositoryState::Mounting,
+            mirage_types::RepositoryEvent::MountSucceeded,
+            3,
+        )
+        .expect("mounted");
+    let refused = handler.handle(
+        &principal(),
+        request(
+            2,
+            Command::RepositorySetVolumeMode {
+                repository_id,
+                managed: false,
+            },
+        ),
+    );
+    assert!(
+        matches!(refused, ResponseBody::Error { ref code, .. } if code == "MIRAGE_REPOSITORY_CONFLICT"),
+        "mounted switch must be refused: {refused:?}"
+    );
+    assert_eq!(
+        database.load_repository_volume_mode(repository_id).unwrap(),
+        Some(mirage_db::VolumeMode::Managed)
+    );
 }
 
 #[test]
@@ -455,8 +531,14 @@ impl MountControl for FakeMountControl {
         _: &str,
         _: Option<&Path>,
         _: (u64, u64),
+        _: bool,
+        _: Option<(&Path, &Path)>,
     ) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("mount");
+        Ok(())
+    }
+    fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
+        self.calls.lock().unwrap().push("send_drive_token");
         Ok(())
     }
     fn unmount(&mut self, _: RepositoryId) -> Result<(), MirageError> {
@@ -483,4 +565,44 @@ fn principal() -> Principal {
         role: PrincipalRole::Service,
         authenticated: true,
     }
+}
+
+#[test]
+fn drive_token_supply_requires_a_mounted_repository() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x62; 16]);
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "token fixture".into(),
+            local_root: directory.path().join("repository"),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let handler = ControlPlaneHandler::with_mount_control(
+        database.clone(),
+        FakeMountControl {
+            calls: Arc::clone(&calls),
+        },
+    );
+    let response = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::DriveTokenSupply {
+                repository_id,
+                drive_access_token: mirage_ipc::SensitiveString::new("bearer".to_owned()).unwrap(),
+            },
+        ),
+    );
+    let ResponseBody::Error { message, .. } = response else {
+        panic!("unmounted token supply must fail: {response:?}")
+    };
+    assert!(message.contains("not mounted"), "{message}");
+    assert!(calls.lock().unwrap().is_empty());
 }

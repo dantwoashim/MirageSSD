@@ -13,6 +13,7 @@ mod migrate;
 pub mod namespace;
 mod open;
 pub mod operation;
+pub mod payload_remote;
 pub mod physical;
 pub mod pin;
 pub mod remote_object;
@@ -43,16 +44,19 @@ pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;
 pub use namespace::{DirEntry, NamespaceNodeKind, NamespaceSeedNode, NamespaceStat};
 pub use open::{APPLICATION_ID, ReadPool};
-pub use operation::{OperationKind, OperationPayloadRecord, OperationRecord, OperationStatus};
+pub use operation::{
+    ExtentMutation, OperationKind, OperationPayloadRecord, OperationRecord, OperationStatus,
+};
 pub use physical::{
-    PhysicalExtentRecord, PhysicalExtentState, PhysicalFileRecord, PhysicalReservationRecord,
+    PhysicalCommit, PhysicalExtentRecord, PhysicalExtentState, PhysicalFileRecord,
+    PhysicalReservationRecord,
 };
 pub use pin::{CachePinRecord, PersistentPinReason};
 pub use remote_object::{
     BackendAccount, RemoteObjectRecord, UploadSession, UpsertRemoteObjectOutcome,
 };
 pub use remote_observation::{Divergence, DivergenceStatus, RemoteChange, RemoteHead};
-pub use repository::{NewRepository, RepositorySummary};
+pub use repository::{NewRepository, RepositorySummary, VolumeMode};
 pub use session::{NewSealedSession, SessionProcess};
 pub use space_lease::{NewSpaceLease, SpaceLeaseEvent, SpaceLeaseRecord, SpaceLeaseState};
 pub use uninstall::{UninstallSafetyReport, check_uninstall_safety};
