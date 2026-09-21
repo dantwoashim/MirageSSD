@@ -57,13 +57,15 @@ readiness path (spec `docs/specs/readiness-v1.md`) is designed to provide.
 | Writable Drive mount via patched rclone | shipping | `device_drive.rs`; installer + lifecycle scripts |
 | Windows attribute sidecar (journal) | integrated native | `cmd/cmount` tests run on Windows/WinFsp |
 | WinFsp native adapter (read path) | integrated native | `native/winfsp-adapter`; mounted-volume test in workspace suite |
-| Native write callbacks | not shipped | `create`/`overwrite` return `STATUS_MEDIA_WRITE_PROTECTED` |
+| Native write callbacks | implemented, mounted-gate-tested, not externally qualified | `service.cpp` writable callbacks; `managed_mount_writes_survive_restart` |
 | `.midx` index, page arena, `PageProvider` | library-only | `crates/mirage-engine`; no shipping consumer |
 | Readiness/space-lease machinery | library-only | `readiness.rs`, `space_lease.rs`; service plan path |
 | Immutable pack publisher | library-only | `repository_writer.rs`; used by local import, not Drive publication |
 | Experimental write overlay | library-only, unsafe for production | `update/overlay.rs`: no mutation serialization; truncate leaks stale extents |
 | Cache policies beyond LRU-K prototype | simulated | `mirage-simulator` trace evaluation only |
 | Predictor/prefetch | simulated | `mirage-predictor`; no offline guarantee |
-| Drive object backend | library-only | `mirage-backend-drive`; not yet driven by the mounted host |
+| Drive object backend | integrated native | `mirage-backend-drive`; `RefreshableDriveBackend` drives on-demand page fetches inside managed mounts |
+| Managed on-demand Drive page fetch | implemented, mounted-gate-tested, not externally qualified | `mirage_engine_create_managed_drive` + host stdin `TOKEN` protocol; non-resident committed pages fetch hash-verified through the bounded scheduler pool |
+| Drive token lifecycle | integrated native | tokens are ~1-hour-lived; push with `mirage backend supply-token <id>` or run `mirage backend token-agent`; an expired token fails non-resident reads (unavailable) until refreshed — resident pages and all writes keep working; `repo import --pack-all` packs every regular file so all bytes are fetchable |
 | rclone VFS dirty-write recovery | externally qualified | upstream `vfscache` behavior; pending-upload checks in lifecycle scripts |
-| Managed mutable namespace, journal, workspace lease | not implemented | tracked in the engineering task list |
+| Managed mutable namespace, journal, workspace lease | implemented, mounted-gate-tested, not externally qualified | durable namespace + extent journal; `managed_mount_writes_survive_restart`; `docs/qualification/2026-09-20-audit-remediation-status.md` |

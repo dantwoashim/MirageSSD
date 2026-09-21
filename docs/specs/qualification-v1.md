@@ -1,8 +1,11 @@
 # Release qualification v1
 
-The release-qualification harness proves the managed-volume durability
-contracts end-to-end. Each scenario maps to a handoff acceptance criterion;
-a release candidate must pass every scenario plus the full workspace gates.
+The release-qualification harness exercises the managed-volume durability
+contracts in-tree: the scenarios below are implemented and mounted-gate
+tested, but they are not external qualification (see
+`docs/qualification/2026-09-20-audit-remediation-status.md`). Each scenario
+maps to a handoff acceptance criterion; a release candidate must pass every
+scenario plus the full workspace gates.
 
 ## Gates
 

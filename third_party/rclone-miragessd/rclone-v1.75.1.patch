@@ -1,9 +1,9 @@
 diff --git a/cmd/cmount/attributes.go b/cmd/cmount/attributes.go
 new file mode 100644
-index 000000000..330319d4d
+index 000000000..ddb95b901
 --- /dev/null
 +++ b/cmd/cmount/attributes.go
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,534 @@
 +//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
 +
 +package cmount
@@ -50,14 +50,14 @@ index 000000000..330319d4d
 +}
 +
 +type attributeStore struct {
-+	mu              sync.RWMutex
-+	path            string
-+	binding         string
-+	entries         map[string]uint32
-+	journalBytes    int64
-+	initialized     bool
-+	unboundJournal  bool
-+	loadErr         error
++	mu             sync.RWMutex
++	path           string
++	binding        string
++	entries        map[string]uint32
++	journalBytes   int64
++	initialized    bool
++	unboundJournal bool
++	loadErr        error
 +}
 +
 +// newAttributeStoreFromEnvironment opens the per-root attribute journal. The
@@ -371,6 +371,11 @@ index 000000000..330319d4d
 +		return err
 +	}
 +	data = append(data, '\n')
++	// A crashed append can leave an unterminated tail that would swallow the
++	// next record into one unparseable line; fence it before writing.
++	if err := store.fenceTailLocked(); err != nil {
++		return err
++	}
 +	file, err := os.OpenFile(store.path, os.O_APPEND|os.O_WRONLY, 0o600)
 +	if err != nil {
 +		return err
@@ -393,6 +398,60 @@ index 000000000..330319d4d
 +			fs.Errorf(nil, "attribute journal compaction failed, retrying on a later update: %v", err)
 +		}
 +	}
++	return nil
++}
++
++// fenceTailLocked truncates any bytes after the last newline so a torn
++// record from a crashed append never merges with the next write. The replay
++// state is unaffected: only complete, newline-terminated lines are loaded.
++func (store *attributeStore) fenceTailLocked() error {
++	file, err := os.OpenFile(store.path, os.O_RDWR, 0o600)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return err
++	}
++	size := info.Size()
++	if size == 0 {
++		return nil
++	}
++	window := min(size, 1<<20)
++	buffer := make([]byte, window)
++	if _, err := file.ReadAt(buffer, size-window); err != nil {
++		return err
++	}
++	if buffer[len(buffer)-1] == '\n' {
++		store.journalBytes = size
++		return nil
++	}
++	cut := int64(-1)
++	if last := bytes.LastIndexByte(buffer, '\n'); last >= 0 {
++		cut = size - window + int64(last) + 1
++	} else if size > window {
++		rest := make([]byte, size-window)
++		if _, err := file.ReadAt(rest, 0); err != nil {
++			return err
++		}
++		if last := bytes.LastIndexByte(rest, '\n'); last >= 0 {
++			cut = int64(last) + 1
++		}
++	}
++	if cut < 0 {
++		return errors.New("attribute journal contains no complete record")
++	}
++	if err := file.Truncate(cut); err != nil {
++		return err
++	}
++	if err := file.Sync(); err != nil {
++		return err
++	}
++	store.journalBytes = cut
 +	return nil
 +}
 +
