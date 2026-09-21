@@ -23,3 +23,11 @@ manifest page before accepting an encrypted import. Materialization, remote
 scheduler reads, update staging, and extraction use the same repository-bound
 decryption context. A missing or inaccessible key fails closed and never falls
 back to treating an encrypted frame as plaintext.
+
+`mirage repo extract` is a standalone verified restore — it needs no running
+service. Pages stream through the resumable `NativeRestore` engine: each file
+lands as a hash-verified staging file, an interrupted run resumes from its
+recovery manifest, pre-existing destination files are never overwritten, and a
+completeness re-check must pass before success is reported. The content key
+comes from `--repository-key` (DPAPI record) or, for machine-loss recovery,
+`--envelope` + `--secret-file` opened by the recovery-envelope path.

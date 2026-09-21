@@ -17,4 +17,5 @@ mirage-pack.workspace=true
 mirage-simulator.workspace=true
 bytes.workspace=true
 serde_json.workspace=true
+sha2.workspace=true
 tempfile.workspace=true

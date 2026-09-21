@@ -10,5 +10,9 @@ pub enum MirageStatus {
     IntegrityFailure = 6,
     BackendUnavailable = 7,
     IoError = 8,
+    /// Another live process owns this volume's state.
+    Conflict = 9,
+    /// The managed dirty-payload budget is exhausted.
+    DiskFull = 10,
     Internal = 255,
 }

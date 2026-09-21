@@ -1,0 +1,11 @@
+MirageSSD preview build 0.1.5
+
+This software is provided as a preview for evaluation purposes, without
+warranty of any kind. By installing you agree to use it only on machines and
+data you control. MirageSSD stores repository state under
+C:\ProgramData\MirageSSD and credentials under %LOCALAPPDATA%\MirageSSD;
+uninstalling the product does not delete that data.
+
+This bundle also installs WinFsp 2.1.25156 (a separate project licensed under
+its own terms, https://github.com/winfsp/winfsp) when it is not already
+installed. WinFsp is never removed by uninstalling MirageSSD.

@@ -10,6 +10,7 @@ mod device_backup;
 mod device_drive;
 mod drive_gate;
 mod drive_live;
+mod recovery;
 mod repo_drive;
 mod repo_import_local;
 mod repo_local;
@@ -107,6 +108,12 @@ pub enum Command {
         /// Mount as an Explorer-visible read-only drive, for example M.
         #[arg(long)]
         drive_letter: Option<String>,
+        /// Desktop OAuth JSON used to mint a Drive access token for a
+        /// managed Drive-backed mount (enables on-demand page fetches).
+        #[arg(long)]
+        client_credentials: Option<std::path::PathBuf>,
+        #[arg(long, requires = "client_credentials")]
+        token_store: Option<std::path::PathBuf>,
     },
     /// Unmount a repository.
     Unmount {
@@ -163,6 +170,27 @@ pub enum BackendCommand {
         client_credentials: std::path::PathBuf,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
+    },
+    /// Push a fresh Drive bearer token to one mounted managed repository.
+    SupplyToken {
+        repository_id: mirage_types::RepositoryId,
+        /// Desktop OAuth JSON used only to refresh a short-lived Drive access token.
+        #[arg(long)]
+        client_credentials: std::path::PathBuf,
+        #[arg(long)]
+        token_store: Option<std::path::PathBuf>,
+    },
+    /// Refresh and push Drive bearer tokens to every mounted managed
+    /// Drive-backed repository until Ctrl-C (access tokens expire ~1h).
+    TokenAgent {
+        /// Desktop OAuth JSON used only to refresh Drive access tokens.
+        #[arg(long)]
+        client_credentials: std::path::PathBuf,
+        #[arg(long)]
+        token_store: Option<std::path::PathBuf>,
+        /// Seconds between pushes; Drive access tokens live about an hour.
+        #[arg(long, default_value_t = 2700)]
+        interval_seconds: u64,
     },
     /// Run authenticated Drive Gates D and F with encrypted signed generations.
     GateDrive {
@@ -489,6 +517,10 @@ pub enum RepoCommand {
         /// Explicit compatibility mode. Normal imports encrypt every virtual page.
         #[arg(long)]
         unencrypted: bool,
+        /// Pack every regular file regardless of size or extension so every
+        /// byte is fetchable on a managed Drive-backed volume.
+        #[arg(long)]
+        pack_all: bool,
     },
     /// Publish a completed local import to a local immutable backend.
     CommitLocal {
@@ -526,6 +558,14 @@ pub enum RepoCommand {
     UseLocal {
         repository_id: mirage_types::RepositoryId,
     },
+    /// Select the writable managed volume mode, or return to legacy read-only mounts.
+    SetVolumeMode {
+        repository_id: mirage_types::RepositoryId,
+        #[arg(long, required_unless_present = "legacy", conflicts_with = "legacy")]
+        managed: bool,
+        #[arg(long)]
+        legacy: bool,
+    },
     /// Verify repository commits and referenced content.
     Verify {
         #[arg(long)]
@@ -554,10 +594,66 @@ pub enum RepoCommand {
         /// DPAPI-protected repository content key created during import.
         #[arg(long)]
         repository_key: Option<std::path::PathBuf>,
+        /// Recovery envelope supplying the content key instead of --repository-key.
+        #[arg(long, requires = "secret_file", conflicts_with = "repository_key")]
+        envelope: Option<std::path::PathBuf>,
+        /// File containing the recovery secret for --envelope.
+        #[arg(long)]
+        secret_file: Option<std::path::PathBuf>,
     },
     /// Repair recoverable local repository state.
     Repair {
         repository_id: mirage_types::RepositoryId,
+    },
+    /// Export, verify, or restore a portable recovery envelope.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Export an encrypted recovery envelope containing the repository content key.
+    Export {
+        /// Import directory holding the DPAPI-protected repository key record.
+        #[arg(long)]
+        import: std::path::PathBuf,
+        /// New file receiving the encrypted envelope. Refuses to overwrite.
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret. It is never logged or persisted elsewhere.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Optional DPAPI-protected signer record to include for authority recovery.
+        #[arg(long)]
+        signer_store: Option<std::path::PathBuf>,
+    },
+    /// Verify a recovery envelope decrypts to this repository's content key.
+    Verify {
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Import directory whose key record the envelope must match. When supplied,
+        /// a durable verification record is written for the reclamation gate.
+        #[arg(long)]
+        import: Option<std::path::PathBuf>,
+        /// Expected repository when --import is not available.
+        #[arg(long)]
+        repository_id: Option<mirage_types::RepositoryId>,
+    },
+    /// Restore envelope secrets into a fresh DPAPI-protected key store on this machine.
+    Import {
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// File containing the recovery secret.
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
+        /// Directory receiving the restored repository key record.
+        #[arg(long)]
+        destination: std::path::PathBuf,
     },
 }
 
@@ -682,6 +778,34 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 client_credentials,
                 token_store,
             } => drive_live::verify(&client_credentials, token_store.as_deref(), json),
+            BackendCommand::SupplyToken {
+                repository_id,
+                client_credentials,
+                token_store,
+            } => {
+                let token = capacity_drive_token(
+                    Some(client_credentials.as_path()),
+                    token_store.as_deref(),
+                )?
+                .ok_or_else(|| MirageError::invalid_argument("--client-credentials is required"))?;
+                service::run(
+                    mirage_ipc::Command::DriveTokenSupply {
+                        repository_id,
+                        drive_access_token: token,
+                    },
+                    json,
+                )
+            }
+            BackendCommand::TokenAgent {
+                client_credentials,
+                token_store,
+                interval_seconds,
+            } => token_agent(
+                &client_credentials,
+                token_store.as_deref(),
+                interval_seconds,
+                json,
+            ),
             BackendCommand::GateDrive {
                 client_credentials,
                 token_store,
@@ -858,6 +982,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 virtual_extensions,
                 minimum_virtual_asset_bytes,
                 unencrypted,
+                pack_all,
             } => repo_import_local::run(
                 local_only,
                 &source,
@@ -869,6 +994,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 &virtual_extensions,
                 minimum_virtual_asset_bytes,
                 unencrypted,
+                pack_all,
                 json,
             ),
             RepoCommand::CommitLocal {
@@ -915,6 +1041,17 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 },
                 json,
             ),
+            RepoCommand::SetVolumeMode {
+                repository_id,
+                managed,
+                ..
+            } => service::run(
+                mirage_ipc::Command::RepositorySetVolumeMode {
+                    repository_id,
+                    managed,
+                },
+                json,
+            ),
             RepoCommand::Verify {
                 backend_root,
                 repository_id,
@@ -936,18 +1073,55 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 key_id_hex,
                 test_key_hex,
                 repository_key,
+                envelope,
+                secret_file,
             } => repo_local::extract(
                 &backend_root,
                 &destination,
                 repository_id,
                 &key_id_hex,
                 &test_key_hex,
-                repository_key.as_deref(),
+                repo_local::ExtractKeySource {
+                    repository_key: repository_key.as_deref(),
+                    envelope: envelope.as_deref(),
+                    secret_file: secret_file.as_deref(),
+                },
                 json,
             ),
             RepoCommand::Repair { repository_id } => {
                 service::run(mirage_ipc::Command::Repair { repository_id }, json)
             }
+            RepoCommand::Recovery { command } => match command {
+                RecoveryCommand::Export {
+                    import,
+                    envelope,
+                    secret_file,
+                    signer_store,
+                } => recovery::export(
+                    &import,
+                    &envelope,
+                    &secret_file,
+                    signer_store.as_deref(),
+                    json,
+                ),
+                RecoveryCommand::Verify {
+                    envelope,
+                    secret_file,
+                    import,
+                    repository_id,
+                } => recovery::verify(
+                    &envelope,
+                    &secret_file,
+                    import.as_deref(),
+                    repository_id,
+                    json,
+                ),
+                RecoveryCommand::Import {
+                    envelope,
+                    secret_file,
+                    destination,
+                } => recovery::import(&envelope, &secret_file, &destination, json),
+            },
         },
         Command::Profile { command } => match command {
             ProfileCommand::Configure {
@@ -1133,11 +1307,17 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             repository_id,
             generation,
             drive_letter,
+            client_credentials,
+            token_store,
         } => service::run(
             mirage_ipc::Command::Mount {
                 repository_id,
                 generation,
                 drive_letter,
+                drive_access_token: capacity_drive_token(
+                    client_credentials.as_deref(),
+                    token_store.as_deref(),
+                )?,
             },
             json,
         ),
@@ -1315,4 +1495,59 @@ fn run_with_capacity(spec: CapacityRun<'_>) -> Result<(), MirageError> {
         }),
         spec.json,
     )
+}
+
+/// Refreshes and pushes a Drive bearer token to every mounted managed
+/// Drive-backed repository, then sleeps `interval_seconds` and repeats until
+/// Ctrl-C. One line is logged per push; the token itself is never printed.
+fn token_agent(
+    client_credentials: &std::path::Path,
+    token_store: Option<&std::path::Path>,
+    interval_seconds: u64,
+    json: bool,
+) -> Result<(), MirageError> {
+    loop {
+        let status = service::request_json(mirage_ipc::Command::Status)?;
+        let repositories = status["repositories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut supplied = 0_u32;
+        for repository in repositories {
+            if repository["state"].as_str() != Some("ready_mounted") {
+                continue;
+            }
+            let Some(id_text) = repository["repository_id"].as_str() else {
+                continue;
+            };
+            let Ok(repository_id) = id_text.parse::<mirage_types::RepositoryId>() else {
+                continue;
+            };
+            let detail =
+                service::request_json(mirage_ipc::Command::RepositoryDetail { repository_id })?;
+            if detail["origin"].as_str() != Some("drive")
+                || detail["volume_mode"].as_str() != Some("managed")
+            {
+                continue;
+            }
+            let Some(token) = capacity_drive_token(Some(client_credentials), token_store)? else {
+                return Err(MirageError::invalid_argument(
+                    "--client-credentials is required",
+                ));
+            };
+            service::request_json(mirage_ipc::Command::DriveTokenSupply {
+                repository_id,
+                drive_access_token: token,
+            })?;
+            eprintln!("token-agent: supplied {repository_id}");
+            supplied += 1;
+        }
+        if json {
+            service::emit(
+                serde_json::json!({"token_agent": true, "supplied": supplied}),
+                true,
+            )?;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval_seconds));
+    }
 }

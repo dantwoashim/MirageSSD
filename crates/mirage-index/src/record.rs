@@ -288,6 +288,7 @@ fn object_kind_code(kind: ObjectKind) -> u8 {
         ObjectKind::Manifest => 2,
         ObjectKind::Commit => 3,
         ObjectKind::Profile => 4,
+        ObjectKind::Payload => 5,
     }
 }
 
@@ -298,6 +299,7 @@ fn decode_object_kind(code: u8) -> Result<ObjectKind, MirageError> {
         2 => Ok(ObjectKind::Manifest),
         3 => Ok(ObjectKind::Commit),
         4 => Ok(ObjectKind::Profile),
+        5 => Ok(ObjectKind::Payload),
         _ => Err(MirageError::manifest_invalid(
             "index object kind is invalid",
         )),

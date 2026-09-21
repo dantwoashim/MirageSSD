@@ -80,6 +80,7 @@ Schema migrations are strictly versioned, contiguous, and checksummed.
 
 ### 4.1 Repositories and Generations
 - **Generation Invariant**: An active generation must reference a verified generation (`verified = 1`) whose commit hash matches the recorded `active_commit_hash`.
+- **Volume Mode**: `repositories.volume_mode` (`legacy` | `managed`, default `legacy`) selects the mount contract. Legacy mounts are read-only immutable-generation views; managed mounts are writable and namespace-authoritative. The mode can change only while the repository is ready and unmounted; the control plane refuses `RepositorySetVolumeMode` otherwise. A managed mount's `total-bytes free-bytes` adapter arguments mean advertised volume size and dirty-payload budget respectively: staged journal payloads are ledgered against the budget, a write beyond it fails with disk full, and the volume's reported free space is the remaining budget.
 - **Optimistic Activation**: `activate_generation` requires `expected_current: Option<(GenerationId, CommitHash)>`. If another process altered the active generation concurrently, the transaction fails with `RepositoryConflict`.
 - **State Machine**: Repository state transitions (`Unmounted`, `Scanning`, `Mounting`, `Mounted`, `UpdateExclusive`, `Error`) are validated by the centralized state machine in `mirage_types`.
 

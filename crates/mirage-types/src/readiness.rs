@@ -64,7 +64,8 @@ state_enum! {
         AuthorizationDenied => "authorization_denied",
         SourceMissing => "source_missing",
         Timeout => "timeout",
-        BudgetExhausted => "budget_exhausted",
+        DeadlineExceeded => "deadline_exceeded",
+        BudgetExceeded => "budget_exceeded",
         CallerCancelled => "caller_cancelled",
         MalformedResponse => "malformed_response",
         Internal => "internal",
@@ -85,10 +86,11 @@ impl FetchFailureCause {
             MirageErrorKind::RemoteObjectMissing | MirageErrorKind::ProviderUnavailable => {
                 Self::SourceMissing
             }
-            MirageErrorKind::BackendUnavailable
-            | MirageErrorKind::BackendRateLimited
-            | MirageErrorKind::DeadlineExceeded => Self::Timeout,
-            MirageErrorKind::CacheFull => Self::BudgetExhausted,
+            MirageErrorKind::BackendUnavailable | MirageErrorKind::BackendRateLimited => {
+                Self::Timeout
+            }
+            MirageErrorKind::DeadlineExceeded => Self::DeadlineExceeded,
+            MirageErrorKind::CacheFull => Self::BudgetExceeded,
             MirageErrorKind::Cancelled => Self::CallerCancelled,
             MirageErrorKind::InvalidArgument => Self::MalformedResponse,
             _ => Self::Internal,

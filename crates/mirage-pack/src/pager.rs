@@ -60,7 +60,97 @@ impl<R: Read + Seek> Iterator for PageIter<R> {
 }
 
 pub fn page_path(path: &Path, page_size: u32) -> Result<Vec<PlainPage>, MirageError> {
-    page_path_with_validation_hook(path, page_size, || Ok(()))
+    page_path_streaming(path, page_size)?.collect()
+}
+
+/// Streams a source file one page at a time so import memory stays
+/// proportional to the page size rather than the file size. When the last
+/// page is read, the file's identity and fingerprint are re-verified before
+/// the page is yielded, so a mid-read change is reported instead of imported.
+pub struct SourcePager {
+    file: File,
+    path: std::path::PathBuf,
+    remaining: u64,
+    page_size: usize,
+    fingerprint: SourceFingerprint,
+    opened_identity: Handle,
+    finished: bool,
+}
+
+pub fn page_path_streaming(path: &Path, page_size: u32) -> Result<SourcePager, MirageError> {
+    validate_page_size(page_size)?;
+    let file = File::open(path).map_err(MirageError::from)?;
+    let opened_identity = Handle::from_file(file.try_clone().map_err(MirageError::from)?)
+        .map_err(MirageError::from)?;
+    let before = file.metadata().map_err(MirageError::from)?;
+    reject_non_regular(&before)?;
+    Ok(SourcePager {
+        file,
+        path: path.to_path_buf(),
+        remaining: before.len(),
+        page_size: usize::try_from(page_size)
+            .map_err(|_| MirageError::invalid_argument("page size does not fit this platform"))?,
+        fingerprint: SourceFingerprint::from_metadata(&before),
+        opened_identity,
+        finished: false,
+    })
+}
+
+impl Iterator for SourcePager {
+    type Item = Result<PlainPage, MirageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if self.remaining == 0 {
+            // An empty source still re-validates on the EOF transition —
+            // "no pages" must not mask a file that changed after open.
+            self.finished = true;
+            if let Err(error) = self.validate_unchanged() {
+                return Some(Err(error));
+            }
+            return None;
+        }
+        let wanted = usize::try_from(self.remaining.min(self.page_size as u64))
+            .expect("bounded page length fits usize");
+        let mut bytes = vec![0_u8; wanted];
+        if let Err(error) = self.file.read_exact(&mut bytes) {
+            self.finished = true;
+            return Some(Err(MirageError::from(error)));
+        }
+        self.remaining -= wanted as u64;
+        if self.remaining == 0 {
+            self.finished = true;
+            if let Err(error) = self.validate_unchanged() {
+                return Some(Err(error));
+            }
+        }
+        Some(Ok(PlainPage::from_bytes(Bytes::from(bytes))))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let pages = self.remaining.div_ceil(self.page_size as u64);
+        let pages = usize::try_from(pages).unwrap_or(usize::MAX);
+        (pages, Some(pages))
+    }
+}
+
+impl SourcePager {
+    fn validate_unchanged(&self) -> Result<(), MirageError> {
+        let after_handle = self.file.metadata().map_err(MirageError::from)?;
+        let after_path = std::fs::metadata(&self.path).map_err(MirageError::from)?;
+        let current_identity = Handle::from_path(&self.path).map_err(MirageError::from)?;
+        if self.fingerprint != SourceFingerprint::from_metadata(&after_handle)
+            || self.fingerprint != SourceFingerprint::from_metadata(&after_path)
+            || self.opened_identity != current_identity
+        {
+            return Err(MirageError::integrity_mismatch(
+                "source file changed while it was being paged",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[doc(hidden)]

@@ -288,13 +288,29 @@ pub fn register(
                 "repository already has a different active generation",
             ));
         }
-        None => database.activate_generation(
-            spec.repository_id,
-            generation.generation_id,
-            generation.commit_hash,
-            None,
-            now_ns(),
-        )?,
+        None => {
+            database.activate_generation(
+                spec.repository_id,
+                generation.generation_id,
+                generation.commit_hash,
+                None,
+                now_ns(),
+            )?;
+            // Seed the durable namespace so inode lookups survive restarts;
+            // idempotent when the volume was already seeded.
+            let nodes = mirage_manifest::builder::namespace_seed(&manifest)
+                .into_iter()
+                .map(|entry| mirage_db::NamespaceSeedNode {
+                    path: entry.path,
+                    is_directory: entry.is_directory,
+                    size: entry.size,
+                    version_root: None,
+                })
+                .collect();
+            database
+                .writer()
+                .namespace_seed(spec.repository_id, nodes, now_ns())?;
+        }
     }
 
     let config = RuntimeConfig {
@@ -393,6 +409,34 @@ pub fn set_drive_origin(
         "repository_id": repository_id.to_string(),
         "origin": config.origin.as_str(),
         "cloud_reads_in_filesystem_callbacks": false
+    }))
+}
+
+/// Persists the repository's volume mode. Switching is refused while the
+/// repository is mounted so a live host never changes contract underneath
+/// the kernel client.
+pub fn set_volume_mode(
+    database: &Database,
+    repository_id: RepositoryId,
+    managed: bool,
+) -> Result<Value, MirageError> {
+    let state = database
+        .load_repository_state(repository_id)?
+        .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
+    if state != RepositoryState::ReadyUnmounted {
+        return Err(MirageError::repository_conflict(
+            "repository volume mode can change only while ready and unmounted",
+        ));
+    }
+    let mode = if managed {
+        mirage_db::VolumeMode::Managed
+    } else {
+        mirage_db::VolumeMode::Legacy
+    };
+    database.set_repository_volume_mode(repository_id, mode)?;
+    Ok(json!({
+        "repository_id": repository_id.to_string(),
+        "volume_mode": mode.as_str()
     }))
 }
 
@@ -2271,16 +2315,26 @@ pub fn validate_explorer_mount_ready(
             .map_err(|_| MirageError::unsupported_layout("mount index exceeds u32 pages"))?;
         hashes.insert(index.page_by_ordinal(ordinal)?.plaintext_hash());
     }
-    for hash in &hashes {
-        if verify_page(&resident, database, *hash, IntegrityClass::Clean)?
-            != VerifyOutcome::Verified
-        {
-            return Err(MirageError::repository_conflict(
-                "Explorer volume requires every repository page to be materialized and verified",
-            ));
+    let config = load_config(database, repository_id)?;
+    // A managed Drive volume fetches non-resident pages on demand, so the
+    // Explorer gate only needs the provider inputs (manifest + key), not
+    // upfront residency. Legacy mounts still require full verification.
+    let on_demand = database.load_repository_volume_mode(repository_id)?
+        == Some(mirage_db::VolumeMode::Managed)
+        && config.origin == RuntimeOrigin::Drive
+        && config.import_root.join(DRIVE_MANIFEST).is_file()
+        && config.import_root.join("repository-key.dpapi").is_file();
+    if !on_demand {
+        for hash in &hashes {
+            if verify_page(&resident, database, *hash, IntegrityClass::Clean)?
+                != VerifyOutcome::Verified
+            {
+                return Err(MirageError::repository_conflict(
+                    "Explorer volume requires every repository page to be materialized and verified",
+                ));
+            }
         }
     }
-    let config = load_config(database, repository_id)?;
     if config.origin == RuntimeOrigin::Drive && !config.import_root.join(DRIVE_MANIFEST).is_file() {
         return Err(MirageError::integrity_mismatch(
             "Drive publication metadata is unavailable",
@@ -2432,6 +2486,9 @@ pub(crate) fn evict_verified_native_backup(
             "native backup eviction requires a verified Drive origin",
         ));
     }
+    if database.load_repository_content_encrypted(repository_id)? == Some(true) {
+        require_verified_recovery_envelope(&config, repository_id)?;
+    }
     let record = config
         .conversion
         .as_mut()
@@ -2543,6 +2600,56 @@ pub(crate) fn reconcile_native_backup_eviction(
         },
     }
     remove_native_backup_intent(database, repository_id)
+}
+
+/// Reclaiming the last original bytes of an encrypted repository is only safe
+/// after a portable recovery envelope was verified against the exact content
+/// key this installation still holds. The record binds the key hash so a
+/// rotated or replaced key cannot ride on a stale verification.
+fn require_verified_recovery_envelope(
+    config: &RuntimeConfig,
+    repository_id: RepositoryId,
+) -> Result<(), MirageError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VerifiedRecovery {
+        format_version: u32,
+        repository_id: RepositoryId,
+        content_key_blake3: String,
+        has_signer_authority: bool,
+        envelope_sha256: String,
+        verified_at_ns: i64,
+    }
+    let record_path = config.import_root.join("recovery-verified.json");
+    if !record_path.exists() {
+        return Err(MirageError::repository_conflict(
+            "encrypted originals cannot be reclaimed until a complete recovery \
+             envelope is verified: run 'mirage repo recovery verify --import <dir>'",
+        ));
+    }
+    let record: VerifiedRecovery =
+        read_json_bounded(&record_path, 64 * 1024, "recovery verification record")?;
+    let _ = record.has_signer_authority;
+    if record.format_version != 1
+        || record.repository_id != repository_id
+        || record.envelope_sha256.len() != 64
+        || record.content_key_blake3.len() != 64
+        || record.verified_at_ns <= 0
+    {
+        return Err(MirageError::integrity_mismatch(
+            "recovery verification record is invalid",
+        ));
+    }
+    let key = load_repository_key(
+        &config.import_root.join("repository-key.dpapi"),
+        repository_id,
+    )?;
+    if blake3::hash(key.secret_bytes().as_ref()).to_hex().as_str() != record.content_key_blake3 {
+        return Err(MirageError::integrity_mismatch(
+            "the verified recovery envelope covers a different content key",
+        ));
+    }
+    Ok(())
 }
 
 fn native_backup_tombstone(

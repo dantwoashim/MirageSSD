@@ -404,6 +404,7 @@ fn encode_kind(kind: ObjectKind) -> i64 {
         ObjectKind::Manifest => 2,
         ObjectKind::Commit => 3,
         ObjectKind::Profile => 4,
+        ObjectKind::Payload => 5,
     }
 }
 
@@ -414,6 +415,7 @@ fn decode_kind(kind: i64) -> Result<ObjectKind, MirageError> {
         2 => Ok(ObjectKind::Manifest),
         3 => Ok(ObjectKind::Commit),
         4 => Ok(ObjectKind::Profile),
+        5 => Ok(ObjectKind::Payload),
         _ => Err(MirageError::integrity_mismatch(
             "database object kind is unknown",
         )),

@@ -58,6 +58,20 @@ pub fn save_repository_key(
     fs::rename(temporary, path).map_err(io)
 }
 
+/// Reads the repository identity from a key record without unprotecting the
+/// secret, so callers can learn which repository a record belongs to.
+pub fn inspect_repository_key(path: &Path) -> Result<RepositoryId, MirageError> {
+    let bytes = fs::read(path).map_err(io)?;
+    if bytes.len() < HEADER_LENGTH || &bytes[..8] != MAGIC {
+        return Err(MirageError::integrity_mismatch(
+            "repository key record header is invalid",
+        ));
+    }
+    Ok(RepositoryId::from_bytes(bytes[8..24].try_into().map_err(
+        |_| MirageError::integrity_mismatch("repository key identity is truncated"),
+    )?))
+}
+
 pub fn load_repository_key(
     path: &Path,
     expected_repository_id: RepositoryId,

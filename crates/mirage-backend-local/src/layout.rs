@@ -43,5 +43,6 @@ pub(crate) const fn kind_directory(kind: ObjectKind) -> &'static str {
         ObjectKind::Manifest => "manifests",
         ObjectKind::Commit => "commits",
         ObjectKind::Profile => "profiles",
+        ObjectKind::Payload => "payloads",
     }
 }

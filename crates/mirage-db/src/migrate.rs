@@ -63,6 +63,76 @@ const MIGRATIONS: &[Migration] = &[
         name: "0010_space_leases.sql",
         sql: include_str!("../../../migrations/0010_space_leases.sql"),
     },
+    Migration {
+        version: 11,
+        name: "0011_namespace.sql",
+        sql: include_str!("../../../migrations/0011_namespace.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "0012_namespace_history.sql",
+        sql: include_str!("../../../migrations/0012_namespace_history.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "0013_allocation.sql",
+        sql: include_str!("../../../migrations/0013_allocation.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "0014_local_mutations.sql",
+        sql: include_str!("../../../migrations/0014_local_mutations.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "0015_byte_extents.sql",
+        sql: include_str!("../../../migrations/0015_byte_extents.sql"),
+    },
+    Migration {
+        version: 16,
+        name: "0016_remote_publication.sql",
+        sql: include_str!("../../../migrations/0016_remote_publication.sql"),
+    },
+    Migration {
+        version: 17,
+        name: "0017_remote_observation.sql",
+        sql: include_str!("../../../migrations/0017_remote_observation.sql"),
+    },
+    Migration {
+        version: 18,
+        name: "0018_workspace_lease.sql",
+        sql: include_str!("../../../migrations/0018_workspace_lease.sql"),
+    },
+    Migration {
+        version: 19,
+        name: "0019_gc.sql",
+        sql: include_str!("../../../migrations/0019_gc.sql"),
+    },
+    Migration {
+        version: 20,
+        name: "0020_extent_heads.sql",
+        sql: include_str!("../../../migrations/0020_extent_heads.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "0021_repository_volume_mode.sql",
+        sql: include_str!("../../../migrations/0021_repository_volume_mode.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "0022_journal_physical_file.sql",
+        sql: include_str!("../../../migrations/0022_journal_physical_file.sql"),
+    },
+    Migration {
+        version: 23,
+        name: "0023_managed_namespace_seeds.sql",
+        sql: include_str!("../../../migrations/0023_managed_namespace_seeds.sql"),
+    },
+    Migration {
+        version: 24,
+        name: "0024_payload_remote_objects.sql",
+        sql: include_str!("../../../migrations/0024_payload_remote_objects.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

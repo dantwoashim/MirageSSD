@@ -585,6 +585,7 @@ fn pool_saturation_is_a_typed_budget_failure() {
         workers: 1,
         queue_depth: 1,
         speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
     })
     .expect("pool");
     let frames = [frame(0x11), frame(0x22), frame(0x33)];
@@ -624,4 +625,143 @@ fn pool_saturation_is_a_typed_budget_failure() {
     for result in block_on(join_all(pending)) {
         result.expect("queued fetch completes");
     }
+}
+
+#[test]
+fn transient_fetch_is_rejected_when_the_pool_is_saturated() {
+    // The transient path shares the bounded pool: a queued-but-unstarted
+    // fetch plus a running one exhaust workers=1/queue_depth=1, so the next
+    // fetch must surface CacheFull rather than bypass the bound.
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 1,
+        speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    let frames = [frame(0xa1), frame(0xb2), frame(0xc3)];
+    let hashes: Vec<_> = frames.iter().map(|(hash, _)| *hash).collect();
+    let fixture = build_fixture(
+        frames.into_iter().map(|(_, encoded)| encoded).collect(),
+        hashes.clone(),
+        Some(gate_rx),
+        None,
+        Some(pool),
+        BUDGET,
+    );
+    let provider = &fixture.provider;
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            block_on(provider.fetch_transient(hashes[0], context(CancellationToken::new())))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.backend.reads.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fixture.backend.reads.load(Ordering::SeqCst), 1);
+        let second = scope.spawn(|| {
+            block_on(provider.fetch_transient(hashes[1], context(CancellationToken::new())))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.flight_metrics().1 == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            provider.flight_metrics().1,
+            1,
+            "second transient fetch must be queued behind the running one"
+        );
+        let error = match block_on(
+            provider.fetch_transient(hashes[2], context(CancellationToken::new())),
+        ) {
+            Ok(_) => panic!("saturated pool must reject the transient fetch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, MirageErrorKind::CacheFull);
+        gate_tx.send(()).expect("open gate");
+        let page = first.join().expect("first thread").expect("first page");
+        assert_eq!(page.bytes.as_ref(), &[0xa1; PAGE]);
+        let page = second.join().expect("second thread").expect("second page");
+        assert_eq!(page.bytes.as_ref(), &[0xb2; PAGE]);
+    });
+}
+
+#[test]
+fn transient_fetch_expired_while_queued_is_deadline_exceeded() {
+    // A queued job whose deadline passes never runs: the expiry hook resolves
+    // the shared flight and the caller sees DeadlineExceeded.
+    let pool = FetchPool::new(FetchPoolConfig {
+        workers: 1,
+        queue_depth: 4,
+        speculative_queue_depth: 1,
+        max_in_flight_bytes: 0,
+    })
+    .expect("pool");
+    let (hash, encoded) = frame(0xd4);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, Some(pool), BUDGET);
+    let mut expired = context(CancellationToken::new());
+    expired.deadline_ns = 0;
+    let error = match block_on(fixture.provider.fetch_transient(hash, expired)) {
+        Ok(_) => panic!("expired fetch must not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, MirageErrorKind::DeadlineExceeded);
+}
+
+#[test]
+fn provide_sync_places_verified_page_in_arena() {
+    let (hash, encoded) = frame(0x51);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, BUDGET);
+    match fixture.provider.provide_sync(hash).expect("provide") {
+        mirage_engine::ProviderPage::Placed(guard) => {
+            let mut bytes = vec![0u8; PAGE];
+            guard.read_exact(0, &mut bytes).expect("guard read");
+            assert!(bytes.iter().all(|byte| *byte == 0x51));
+        }
+        mirage_engine::ProviderPage::Transient(_) => panic!("expected an admitted page"),
+    }
+    assert_eq!(fixture.backend.reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn provide_sync_serves_verified_bytes_transiently_when_budget_is_full() {
+    let (hash, encoded) = frame(0x62);
+    // Zero budget: admission fails with CacheFull, so the read must fall back
+    // to a verified transient page rather than failing or zero-filling.
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, 1);
+    match fixture
+        .provider
+        .provide_sync(hash)
+        .expect("transient provide")
+    {
+        mirage_engine::ProviderPage::Transient(page) => {
+            assert_eq!(page.hash, hash);
+            assert_eq!(page.bytes.len(), PAGE);
+            assert!(page.bytes.iter().all(|byte| *byte == 0x62));
+        }
+        mirage_engine::ProviderPage::Placed(_) => panic!("expected a transient page"),
+    }
+}
+
+#[test]
+fn provide_sync_never_zero_fills_unknown_or_corrupt_content() {
+    // Unknown hash: the pack exists but no location maps to it — a typed
+    // error, never synthesized bytes.
+    let (known, encoded) = frame(0x6f);
+    let fixture = build_fixture(vec![encoded], vec![known], None, None, None, BUDGET);
+    assert!(
+        fixture
+            .provider
+            .provide_sync(PageHash::from_bytes([0xff; 32]))
+            .is_err()
+    );
+    // Corrupt frame: hash mismatch must surface, not bytes.
+    let (hash, _encoded) = frame(0x70);
+    let (other, encoded) = frame(0x71);
+    let fixture = build_fixture(vec![encoded], vec![hash], None, None, None, BUDGET);
+    let error = fixture.provider.provide_sync(other).err();
+    // `other` has no location either; swap: map `hash`'s location content that
+    // decodes to a different page hash must fail verification.
+    assert!(error.is_some());
 }

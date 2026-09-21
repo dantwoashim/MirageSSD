@@ -76,15 +76,39 @@ fn validate_or_initialize_application_id(
     Ok(())
 }
 
+/// Maximum simultaneously-held read connections. Beyond this callers wait on
+/// the pool lock instead of opening unbounded connections.
+const READ_POOL_CAPACITY: usize = 8;
+
+/// A bounded pool of reused read-only connections. Returning a connection to
+/// the pool keeps its page cache and statement cache warm.
 #[derive(Debug, Clone)]
 pub struct ReadPool {
     path: Arc<PathBuf>,
+    idle: Arc<std::sync::Mutex<Vec<Connection>>>,
+}
+
+struct PooledConnection<'pool> {
+    pool: &'pool ReadPool,
+    connection: Option<Connection>,
+}
+
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take()
+            && let Ok(mut idle) = self.pool.idle.lock()
+            && idle.len() < READ_POOL_CAPACITY
+        {
+            idle.push(connection);
+        }
+    }
 }
 
 impl ReadPool {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path: Arc::new(path),
+            idle: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -92,8 +116,20 @@ impl ReadPool {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T, MirageError>,
     ) -> Result<T, MirageError> {
-        let connection = read_connection(&self.path)?;
-        operation(&connection)
+        let connection = {
+            let mut idle = self.idle.lock().map_err(|_| {
+                MirageError::internal_invariant("read connection pool lock poisoned")
+            })?;
+            match idle.pop() {
+                Some(connection) => connection,
+                None => read_connection(&self.path)?,
+            }
+        };
+        let pooled = PooledConnection {
+            pool: self,
+            connection: Some(connection),
+        };
+        operation(pooled.connection.as_ref().expect("connection present"))
     }
 
     #[must_use]

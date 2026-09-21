@@ -110,11 +110,24 @@ pub enum Command {
         repository_id: RepositoryId,
         drive: bool,
     },
+    RepositorySetVolumeMode {
+        repository_id: RepositoryId,
+        managed: bool,
+    },
     Mount {
         repository_id: RepositoryId,
         generation: GenerationId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         drive_letter: Option<String>,
+        /// Bearer token pushed to the managed host's Drive provider after
+        /// readiness; never persisted by the service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drive_access_token: Option<SensitiveString>,
+    },
+    /// Push a fresh Drive bearer token to a mounted managed host.
+    DriveTokenSupply {
+        repository_id: RepositoryId,
+        drive_access_token: SensitiveString,
     },
     Unmount {
         repository_id: RepositoryId,
@@ -222,7 +235,9 @@ impl Command {
                 | Self::RepositoryConvert { .. }
                 | Self::RepositoryRestoreNative { .. }
                 | Self::RepositorySetDriveOrigin { .. }
+                | Self::RepositorySetVolumeMode { .. }
                 | Self::Mount { .. }
+                | Self::DriveTokenSupply { .. }
                 | Self::Unmount { .. }
                 | Self::Profile { .. }
                 | Self::ProfileConfigure { .. }

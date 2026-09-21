@@ -3,7 +3,7 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.0',
+  [string]$Version = '0.1.5',
   [long]$SourceDateEpoch = 946684800,
   [string]$Output = "$PSScriptRoot\out"
 )
@@ -27,7 +27,8 @@ function New-DeterministicGuid([string]$Seed) {
   [Array]::Copy($digest, $bytes, $bytes.Length)
   $bytes[6] = ($bytes[6] -band 0x0f) -bor 0x80
   $bytes[8] = ($bytes[8] -band 0x3f) -bor 0x80
-  $hex = [Convert]::ToHexString($bytes)
+  # Windows PowerShell 5.1 lacks [Convert]::ToHexString; produce the same uppercase hex.
+  $hex = ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
   "{$($hex.Substring(0, 8))-$($hex.Substring(8, 4))-$($hex.Substring(12, 4))-$($hex.Substring(16, 4))-$($hex.Substring(20, 12))}"
 }
 
@@ -37,7 +38,8 @@ function Set-CompoundFileRootModifiedTime([string]$Path, [DateTime]$Timestamp) {
   $writer = [IO.BinaryWriter]::new($stream, [Text.Encoding]::UTF8, $true)
   try {
     $magic = $reader.ReadBytes(8)
-    if ([Convert]::ToHexString($magic) -ne 'D0CF11E0A1B11AE1') {
+    $magicHex = ($magic | ForEach-Object { $_.ToString('X2') }) -join ''
+    if ($magicHex -ne 'D0CF11E0A1B11AE1') {
       throw 'Built MSI is not a Compound File Binary container.'
     }
     $stream.Position = 30

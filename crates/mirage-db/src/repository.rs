@@ -30,6 +30,37 @@ pub struct RepositorySummary {
     pub active: Option<(GenerationId, CommitHash)>,
 }
 
+/// Writable mount contract selected per repository. `Legacy` mounts are
+/// read-only immutable-generation views; `Managed` mounts are writable and
+/// namespace-authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeMode {
+    Legacy,
+    Managed,
+}
+
+impl VolumeMode {
+    pub const ALL: [Self; 2] = [Self::Legacy, Self::Managed];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Managed => "managed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MirageError> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|mode| mode.as_str() == value)
+            .ok_or_else(|| {
+                MirageError::integrity_mismatch("database repository volume mode is unknown")
+            })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RepositoryStateChange {
     pub repository_id: RepositoryId,
@@ -77,6 +108,23 @@ impl Database {
                     )),
                 })
                 .transpose()
+        })
+    }
+
+    pub fn load_repository_volume_mode(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Option<VolumeMode>, MirageError> {
+        self.reads.with_connection(|connection| {
+            let value: Option<String> = connection
+                .query_row(
+                    "SELECT volume_mode FROM repositories WHERE repository_id = ?1",
+                    [repository_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| sqlite(error, "failed to load repository volume mode"))?;
+            value.map(|value| VolumeMode::parse(&value)).transpose()
         })
     }
 
@@ -160,6 +208,14 @@ impl Database {
             expected_owner_sid.to_owned(),
             new_owner_sid.to_owned(),
         )
+    }
+
+    pub fn set_repository_volume_mode(
+        &self,
+        repository_id: RepositoryId,
+        mode: VolumeMode,
+    ) -> Result<(), MirageError> {
+        self.writer.set_repository_volume_mode(repository_id, mode)
     }
 
     pub fn set_repository_state(
@@ -261,6 +317,23 @@ fn validate_owner_sid(value: &str) -> Result<(), MirageError> {
         return Err(MirageError::invalid_argument(
             "repository owner SID is malformed",
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn set_volume_mode(
+    connection: &mut Connection,
+    repository_id: RepositoryId,
+    mode: VolumeMode,
+) -> Result<(), MirageError> {
+    let changed = connection
+        .execute(
+            "UPDATE repositories SET volume_mode = ?1 WHERE repository_id = ?2",
+            params![mode.as_str(), repository_id.as_bytes().as_slice()],
+        )
+        .map_err(|error| sqlite(error, "failed to persist repository volume mode"))?;
+    if changed != 1 {
+        return Err(MirageError::invalid_argument("repository does not exist"));
     }
     Ok(())
 }

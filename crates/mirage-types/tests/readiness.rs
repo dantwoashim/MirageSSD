@@ -186,11 +186,11 @@ fn fetch_failure_cause_maps_every_listed_kind() {
         ),
         (
             MirageError::deadline_exceeded("x"),
-            FetchFailureCause::Timeout,
+            FetchFailureCause::DeadlineExceeded,
         ),
         (
             MirageError::cache_full("x"),
-            FetchFailureCause::BudgetExhausted,
+            FetchFailureCause::BudgetExceeded,
         ),
         (
             MirageError::cancelled("x"),

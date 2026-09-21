@@ -1438,6 +1438,25 @@ mod tests {
             })
             .expect("native backup candidate");
 
+        // Reclaim of encrypted originals requires a verified recovery
+        // envelope; record a verification bound to this fixture's key.
+        let record = serde_json::json!({
+            "format_version": 1,
+            "repository_id": repository_id.to_string(),
+            "content_key_blake3": blake3::hash(key.secret_bytes().as_ref()).to_hex().to_string(),
+            "has_signer_authority": false,
+            "envelope_sha256": format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(b"fixture-envelope")
+            ),
+            "verified_at_ns": 1,
+        });
+        std::fs::write(
+            import_root.join("recovery-verified.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .expect("write recovery verification record");
+
         source
             .reclaim_verified_clean(pack_candidate)
             .expect("reclaim shadow pack");

@@ -22,7 +22,46 @@ pub struct PublishedGeneration {
 
 /// Refuses to start a publishing transaction against an origin that does not
 /// advertise archive mutation, before any object is uploaded.
-pub fn require_publish_capability(backend: &dyn ObjectBackend) -> Result<(), MirageError> {
+pub fn now_utc_ns() -> Result<i128, MirageError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            MirageError::internal_invariant("system clock predates Unix epoch").with_source(error)
+        })?;
+    i128::try_from(duration.as_nanos())
+        .map_err(|_| MirageError::internal_invariant("current timestamp overflows commit field"))
+}
+
+/// Finds an already-published commit covering `manifest_hash` at `sequence`
+/// under `parent`, so a retried publish returns the identical commit object
+/// rather than minting a divergent one with a fresh timestamp.
+async fn find_committed(
+    backend: &dyn ObjectBackend,
+    repository_id: mirage_types::RepositoryId,
+    sequence: u64,
+    parent: Option<CommitHash>,
+    manifest_hash: [u8; 32],
+    update_journal_id: Option<UpdateId>,
+) -> Result<Option<(RemoteObjectRef, CommitHash, RepositoryCommit)>, MirageError> {
+    for candidate in backend.enumerate_commits(repository_id).await? {
+        let bytes = read_complete(backend, &candidate, 1024 * 1024).await?;
+        let Ok(decoded) = decode_commit_bounded(&bytes) else {
+            continue;
+        };
+        if decoded.body.repository_id == repository_id
+            && decoded.body.sequence == sequence
+            && decoded.body.parent_commit == parent
+            && *decoded.body.manifest_hash.as_bytes() == manifest_hash
+            && decoded.body.update_journal_id == update_journal_id
+        {
+            let hash = commit_hash(&decoded)?;
+            return Ok(Some((candidate, hash, decoded)));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn require_publish_capability(backend: &dyn ObjectBackend) -> Result<(), MirageError> {
     if backend.capabilities().can_publish() {
         Ok(())
     } else {
@@ -89,6 +128,28 @@ pub async fn publish_base_generation(
         ));
     }
 
+    // Idempotent publication: a commit already covering this manifest at
+    // sequence 0 is reused, so a retried publish converges to one object.
+    if let Some(existing) = find_committed(
+        backend,
+        manifest.repository_id,
+        0,
+        None,
+        *manifest_hash.as_bytes(),
+        None,
+    )
+    .await?
+    {
+        return Ok(PublishedGeneration {
+            packs: remote_packs,
+            published_manifest,
+            manifest: manifest_object,
+            commit: existing.0,
+            commit_hash: existing.1,
+            commit_body: existing.2,
+        });
+    }
+
     let body = UnsignedCommitBody {
         format_version: COMMIT_FORMAT_VERSION,
         repository_id: manifest.repository_id,
@@ -102,8 +163,8 @@ pub async fn publish_base_generation(
                 .map(|object| object.content_hash)
                 .collect(),
         ),
-        created_utc_ns: 0,
-        writer_device_id: DeviceId::from_bytes([0; 16]),
+        created_utc_ns: now_utc_ns()?,
+        writer_device_id: DeviceId::from_bytes(signer.key_id()),
         update_journal_id: None,
     };
     let commit_body = sign_commit(body, signer)?;
@@ -186,6 +247,26 @@ pub async fn publish_successor_generation(
         .sequence
         .checked_add(1)
         .ok_or_else(|| MirageError::invalid_argument("commit sequence overflows"))?;
+    let parent_hash = commit_hash(parent)?;
+    if let Some(existing) = find_committed(
+        backend,
+        manifest.repository_id,
+        sequence,
+        Some(parent_hash),
+        *manifest_hash.as_bytes(),
+        Some(update_id),
+    )
+    .await?
+    {
+        return Ok(PublishedGeneration {
+            packs: remote_packs,
+            published_manifest: manifest.clone(),
+            manifest: manifest_object,
+            commit: existing.0,
+            commit_hash: existing.1,
+            commit_body: existing.2,
+        });
+    }
     let body = UnsignedCommitBody {
         format_version: COMMIT_FORMAT_VERSION,
         repository_id: manifest.repository_id,
@@ -199,8 +280,8 @@ pub async fn publish_successor_generation(
                 .map(|object| object.content_hash)
                 .collect(),
         ),
-        created_utc_ns: 0,
-        writer_device_id: DeviceId::from_bytes([0; 16]),
+        created_utc_ns: now_utc_ns()?,
+        writer_device_id: DeviceId::from_bytes(signer.key_id()),
         update_journal_id: Some(update_id),
     };
     let commit_body = sign_commit(body, signer)?;

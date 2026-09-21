@@ -4,20 +4,29 @@
 
 pub mod cache;
 mod error;
+pub mod extent;
+pub mod gc_bounds;
 pub mod generation;
 pub mod integrity;
 pub mod lease;
 mod migrate;
+pub mod namespace;
 mod open;
+pub mod operation;
+pub mod payload_remote;
+pub mod physical;
 pub mod pin;
 pub mod remote_object;
+pub mod remote_observation;
 pub mod repository;
 pub mod session;
 pub mod space_lease;
 mod state_codec;
 pub mod uninstall;
 pub mod update;
+pub mod upload_session;
 mod value;
+pub mod workspace_lease;
 mod writer;
 
 use std::path::Path;
@@ -28,19 +37,32 @@ pub use cache::{
     CacheShardSpec, CacheSlotRecord, CacheSlotState, CacheSnapshot, CommitCacheSlotOutcome,
     ReserveCacheSlotOutcome, load_cache_snapshot,
 };
+pub use extent::{ByteExtent, ExtentKind};
+pub use gc_bounds::{GcBound, GcKind, UnreachableCandidate};
 pub use generation::{ActiveGeneration, VerifiedGeneration};
 pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;
+pub use namespace::{DirEntry, NamespaceNodeKind, NamespaceSeedNode, NamespaceStat};
 pub use open::{APPLICATION_ID, ReadPool};
+pub use operation::{
+    ExtentMutation, OperationKind, OperationPayloadRecord, OperationRecord, OperationStatus,
+};
+pub use physical::{
+    PhysicalCommit, PhysicalExtentRecord, PhysicalExtentState, PhysicalFileRecord,
+    PhysicalReservationRecord,
+};
 pub use pin::{CachePinRecord, PersistentPinReason};
 pub use remote_object::{
     BackendAccount, RemoteObjectRecord, UploadSession, UpsertRemoteObjectOutcome,
 };
-pub use repository::{NewRepository, RepositorySummary};
+pub use remote_observation::{Divergence, DivergenceStatus, RemoteChange, RemoteHead};
+pub use repository::{NewRepository, RepositorySummary, VolumeMode};
 pub use session::{NewSealedSession, SessionProcess};
 pub use space_lease::{NewSpaceLease, SpaceLeaseEvent, SpaceLeaseRecord, SpaceLeaseState};
 pub use uninstall::{UninstallSafetyReport, check_uninstall_safety};
 pub use update::{ActiveUpdate, NativeSnapshot, NewUpdateJournal, OverlayPage};
+pub use upload_session::{SessionKind, SessionPhase, UploadSession as PublicationSession};
+pub use workspace_lease::{LeaseStatus, WorkspaceLease};
 pub use writer::DbWriter;
 
 #[derive(Debug, Clone)]

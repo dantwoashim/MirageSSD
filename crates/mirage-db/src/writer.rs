@@ -11,6 +11,9 @@ use crate::cache::{
 };
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
+use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
+use crate::operation::{self, OperationPayloadRecord, OperationRecord};
+use crate::physical::{self, PhysicalExtentRecord, PhysicalFileRecord, PhysicalReservationRecord};
 use crate::pin::{self, PersistentPinReason};
 use crate::remote_object::{
     self, BackendAccount, RemoteObjectRecord, UploadAdvance, UploadSession,
@@ -22,6 +25,7 @@ use crate::session::{
 };
 use crate::space_lease::{self, NewSpaceLease, SpaceLeaseState, SpaceLeaseTransition};
 use crate::update::{self, NativeSnapshot, NewUpdateJournal, OverlayPage, UpdateTransition};
+use mirage_types::{DeviceId, InodeId, RepositoryId};
 
 const COMMAND_CAPACITY: usize = 64;
 type Reply<T> = SyncSender<Result<T, MirageError>>;
@@ -44,6 +48,11 @@ enum Command {
     CreateRepository(NewRepository, Reply<()>),
     SetRepositoryOwnerSid(mirage_types::RepositoryId, String, String, Reply<()>),
     SetRepositoryState(RepositoryStateChange, Reply<RepositoryState>),
+    SetRepositoryVolumeMode(
+        mirage_types::RepositoryId,
+        crate::repository::VolumeMode,
+        Reply<()>,
+    ),
     InsertVerifiedGeneration(VerifiedGeneration, Reply<()>),
     ActivateGeneration(Activation, Reply<()>),
     RegisterBackendAccount(BackendAccount, Reply<()>),
@@ -57,6 +66,120 @@ enum Command {
     FinishSession(FinishSession, Reply<()>),
     CreateSpaceLease(NewSpaceLease, Reply<()>),
     TransitionSpaceLease(SpaceLeaseTransition, Reply<SpaceLeaseState>),
+    CreateNamespaceVolume(RepositoryId, i64, Reply<InodeId>),
+    NamespaceCreate(
+        RepositoryId,
+        InodeId,
+        String,
+        NamespaceNodeKind,
+        i64,
+        Reply<DirEntry>,
+    ),
+    NamespaceRename(
+        RepositoryId,
+        InodeId,
+        String,
+        InodeId,
+        String,
+        i64,
+        Reply<()>,
+    ),
+    NamespaceDelete(RepositoryId, InodeId, String, i64, Reply<()>),
+    NamespaceSetFileRoots(
+        RepositoryId,
+        InodeId,
+        u64,
+        Option<[u8; 32]>,
+        Option<[u8; 32]>,
+        i64,
+        Reply<()>,
+    ),
+    NamespaceRecordLegacy(RepositoryId, String, InodeId, Reply<()>),
+    NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
+    NamespaceSeedManaged(
+        RepositoryId,
+        Vec<NamespaceSeedNode>,
+        [u8; 32],
+        i64,
+        Reply<Option<[u8; 32]>>,
+    ),
+    NamespaceCheckpoint(RepositoryId, i64, Reply<(u64, [u8; 32])>),
+    EnsureDeviceIdentity(i64, Reply<DeviceId>),
+    PhysicalRegisterFile(PhysicalFileRecord, Reply<()>),
+    PhysicalReserveExtent(PhysicalExtentRecord, PhysicalReservationRecord, Reply<()>),
+    PhysicalCommitExtent([u8; 16], mirage_types::PageHash, [u8; 32], i64, Reply<()>),
+    PhysicalReleaseExtent([u8; 16], i64, Reply<()>),
+    PhysicalMarkExtentDead([u8; 16], i64, Reply<()>),
+    PhysicalAdjustExtentPin([u8; 16], i64, Reply<()>),
+    PhysicalReapReservations(i64, Reply<u64>),
+    OperationBegin(OperationRecord, Vec<OperationPayloadRecord>, Reply<()>),
+    OperationAllocSeq(RepositoryId, Reply<i64>),
+    MutationCommit(
+        Option<crate::operation::ExtentMutation>,
+        OperationRecord,
+        Vec<OperationPayloadRecord>,
+        Option<crate::physical::PhysicalCommit>,
+        i64,
+        Reply<()>,
+    ),
+    OperationCommit([u8; 16], Reply<()>),
+    OperationPayloadFlushed([u8; 16], [u8; 32], i64, Reply<()>),
+    FlushGroupOpen(RepositoryId, i64, Reply<i64>),
+    FlushGroupMark(i64, i64, Reply<u64>),
+    OperationPublish(Vec<[u8; 16]>, Reply<u64>),
+    OperationReclaimPending(RepositoryId, i64, Reply<u64>),
+    /// Quiesce-time compaction: drop superseded extent versions and mark
+    /// unreferenced journal payload extents dead; returns `(payload_id,
+    /// length_bytes)` for each extent that transitioned.
+    ExtentCompactVolume(RepositoryId, [u8; 16], i64, Reply<Vec<([u8; 16], i64)>>),
+    /// Records one payload's remote publication; fails when the payload is
+    /// no longer referenced by any byte extent.
+    PayloadPublished(crate::payload_remote::PayloadRemoteObject, Reply<()>),
+    ExtentReplace(
+        RepositoryId,
+        mirage_types::InodeId,
+        i64,
+        Vec<crate::extent::ByteExtent>,
+        i64,
+        Reply<()>,
+    ),
+    ExtentReplaceEof(
+        RepositoryId,
+        mirage_types::InodeId,
+        i64,
+        u64,
+        Vec<crate::extent::ByteExtent>,
+        i64,
+        Reply<()>,
+    ),
+    RemoteHeadObserve(crate::remote_observation::RemoteHead, Reply<()>),
+    RemoteChangeRecord(crate::remote_observation::RemoteChange, Reply<()>),
+    DivergenceRecord(crate::remote_observation::Divergence, Reply<()>),
+    DivergenceResolve(
+        RepositoryId,
+        crate::remote_observation::DivergenceStatus,
+        i64,
+        Reply<()>,
+    ),
+    LeaseDeclare(crate::workspace_lease::WorkspaceLease, Reply<[u8; 16]>),
+    LeaseVerify([u8; 16], u64, u64, Vec<u8>, i64, Reply<()>),
+    LeaseRevoke([u8; 16], i64, Reply<()>),
+    GcBoundSet(crate::gc_bounds::GcBound, Reply<()>),
+    GcUnreachableMark(RepositoryId, String, [u8; 32], i64, i64, Reply<()>),
+    GcUnreachableClear(RepositoryId, String, Reply<()>),
+    UploadSessionCreate(crate::upload_session::UploadSession, Reply<()>),
+    UploadSessionAdvance(
+        [u8; 16],
+        crate::upload_session::SessionPhase,
+        crate::upload_session::SessionPhase,
+        Option<String>,
+        Option<String>,
+        u64,
+        u64,
+        Option<String>,
+        i64,
+        Reply<()>,
+    ),
     CreateUpdateJournal(NewUpdateJournal, Reply<()>),
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
@@ -150,6 +273,12 @@ impl DbWriter {
                         Command::SetRepositoryState(value, reply) => {
                             respond(reply, repository::set_state(&mut connection, value));
                         }
+                        Command::SetRepositoryVolumeMode(id, mode, reply) => {
+                            respond(
+                                reply,
+                                repository::set_volume_mode(&mut connection, id, mode),
+                            );
+                        }
                         Command::InsertVerifiedGeneration(value, reply) => {
                             respond(reply, generation::insert_verified(&mut connection, value));
                         }
@@ -191,6 +320,391 @@ impl DbWriter {
                         }
                         Command::TransitionSpaceLease(value, reply) => {
                             respond(reply, space_lease::transition(&mut connection, value));
+                        }
+                        Command::CreateNamespaceVolume(volume_id, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_volume(&mut connection, volume_id, now_ns),
+                            );
+                        }
+                        Command::NamespaceCreate(volume_id, parent, name, kind, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_node(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    kind,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceRename(
+                            volume_id,
+                            from_parent,
+                            from_name,
+                            to_parent,
+                            to_name,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::rename(
+                                    &mut connection,
+                                    volume_id,
+                                    from_parent,
+                                    &from_name,
+                                    to_parent,
+                                    &to_name,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceDelete(volume_id, parent, name, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::delete_node(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceSetFileRoots(
+                            volume_id,
+                            inode,
+                            size,
+                            version_root,
+                            extent_root,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::set_file_roots(
+                                    &mut connection,
+                                    volume_id,
+                                    inode,
+                                    size,
+                                    version_root,
+                                    extent_root,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceRecordLegacy(volume_id, path, inode, reply) => {
+                            respond(
+                                reply,
+                                namespace::record_legacy(&mut connection, volume_id, &path, inode),
+                            );
+                        }
+                        Command::NamespaceCheckpoint(volume_id, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::create_checkpoint(&mut connection, volume_id, now_ns),
+                            );
+                        }
+                        Command::EnsureDeviceIdentity(now_ns, reply) => {
+                            respond(reply, namespace::ensure_device_id(&mut connection, now_ns));
+                        }
+                        Command::NamespaceSeed(volume_id, nodes, now_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::seed_volume(&mut connection, volume_id, nodes, now_ns),
+                            );
+                        }
+                        Command::NamespaceSeedManaged(
+                            volume_id,
+                            nodes,
+                            commit_hash,
+                            now_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::seed_managed_volume(
+                                    &mut connection,
+                                    volume_id,
+                                    nodes,
+                                    &commit_hash,
+                                    now_ns,
+                                ),
+                            );
+                        }
+                        Command::PhysicalRegisterFile(record, reply) => {
+                            respond(reply, physical::register_file(&mut connection, &record));
+                        }
+                        Command::PhysicalReserveExtent(extent, reservation, reply) => {
+                            respond(
+                                reply,
+                                physical::reserve_extent(&mut connection, &extent, &reservation),
+                            );
+                        }
+                        Command::PhysicalCommitExtent(id, hash, checksum, now, reply) => {
+                            respond(
+                                reply,
+                                physical::commit_extent(&mut connection, &id, hash, checksum, now),
+                            );
+                        }
+                        Command::PhysicalReleaseExtent(id, now, reply) => {
+                            respond(reply, physical::release_extent(&mut connection, &id, now));
+                        }
+                        Command::PhysicalMarkExtentDead(id, now, reply) => {
+                            respond(reply, physical::mark_extent_dead(&mut connection, &id, now));
+                        }
+                        Command::PhysicalAdjustExtentPin(id, delta, reply) => {
+                            respond(
+                                reply,
+                                physical::adjust_extent_pin(&mut connection, &id, delta),
+                            );
+                        }
+                        Command::PhysicalReapReservations(now, reply) => {
+                            respond(
+                                reply,
+                                physical::reap_expired_reservations(&mut connection, now),
+                            );
+                        }
+                        Command::OperationBegin(operation, payloads, reply) => {
+                            respond(
+                                reply,
+                                operation::begin_operation(&mut connection, &operation, &payloads),
+                            );
+                        }
+                        Command::OperationAllocSeq(volume_id, reply) => {
+                            respond(
+                                reply,
+                                operation::allocate_device_seq(&mut connection, volume_id),
+                            );
+                        }
+                        Command::MutationCommit(
+                            extents,
+                            operation,
+                            payloads,
+                            physical,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                operation::commit_mutation(
+                                    &mut connection,
+                                    extents.as_ref(),
+                                    &operation,
+                                    &payloads,
+                                    physical.as_ref(),
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::OperationCommit(operation_id, reply) => {
+                            respond(
+                                reply,
+                                operation::commit_operation(&mut connection, &operation_id),
+                            );
+                        }
+                        Command::OperationPayloadFlushed(payload_id, checksum, now, reply) => {
+                            respond(
+                                reply,
+                                operation::mark_payload_flushed(
+                                    &mut connection,
+                                    &payload_id,
+                                    &checksum,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::FlushGroupOpen(volume_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::open_flush_group(&mut connection, volume_id, now),
+                            );
+                        }
+                        Command::FlushGroupMark(group_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::mark_group_flushed(&mut connection, group_id, now),
+                            );
+                        }
+                        Command::OperationPublish(ids, reply) => {
+                            respond(reply, operation::mark_published(&mut connection, &ids));
+                        }
+                        Command::OperationReclaimPending(volume_id, now, reply) => {
+                            respond(
+                                reply,
+                                operation::reclaim_pending(&mut connection, volume_id, now),
+                            );
+                        }
+                        Command::PayloadPublished(record, reply) => {
+                            respond(
+                                reply,
+                                crate::payload_remote::record_payload_publication(
+                                    &mut connection,
+                                    &record,
+                                ),
+                            );
+                        }
+                        Command::ExtentCompactVolume(volume_id, file_id, now, reply) => {
+                            respond(
+                                reply,
+                                crate::extent::compact_volume(
+                                    &mut connection,
+                                    volume_id,
+                                    file_id,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::ExtentReplace(volume, inode, version, extents, now, reply) => {
+                            respond(
+                                reply,
+                                crate::extent::replace_extents(
+                                    &mut connection,
+                                    volume,
+                                    inode,
+                                    version,
+                                    &extents,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::ExtentReplaceEof(
+                            volume,
+                            inode,
+                            version,
+                            eof,
+                            extents,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                crate::extent::replace_extents_with_eof(
+                                    &mut connection,
+                                    volume,
+                                    inode,
+                                    version,
+                                    eof,
+                                    &extents,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::RemoteHeadObserve(head, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::observe_head(&mut connection, &head),
+                            );
+                        }
+                        Command::RemoteChangeRecord(change, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::record_change(&mut connection, &change),
+                            );
+                        }
+                        Command::DivergenceRecord(divergence, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::record_divergence(
+                                    &mut connection,
+                                    &divergence,
+                                ),
+                            );
+                        }
+                        Command::DivergenceResolve(volume_id, status, now, reply) => {
+                            respond(
+                                reply,
+                                crate::remote_observation::resolve_divergence(
+                                    &mut connection,
+                                    volume_id,
+                                    status,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::LeaseDeclare(lease, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::declare(&mut connection, &lease),
+                            );
+                        }
+                        Command::LeaseVerify(lease_id, bytes, pages, evidence, now, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::mark_verified(
+                                    &mut connection,
+                                    &lease_id,
+                                    bytes,
+                                    pages,
+                                    evidence,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::LeaseRevoke(lease_id, now, reply) => {
+                            respond(
+                                reply,
+                                crate::workspace_lease::revoke(&mut connection, &lease_id, now),
+                            );
+                        }
+                        Command::GcBoundSet(bound, reply) => {
+                            respond(reply, crate::gc_bounds::set_bound(&mut connection, &bound));
+                        }
+                        Command::GcUnreachableMark(volume, key, at_commit, after, now, reply) => {
+                            respond(
+                                reply,
+                                crate::gc_bounds::mark_unreachable(
+                                    &mut connection,
+                                    volume,
+                                    &key,
+                                    at_commit,
+                                    after,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::GcUnreachableClear(volume, key, reply) => {
+                            respond(
+                                reply,
+                                crate::gc_bounds::clear_unreachable(&mut connection, volume, &key),
+                            );
+                        }
+                        Command::UploadSessionCreate(session, reply) => {
+                            respond(
+                                reply,
+                                crate::upload_session::create_session(&mut connection, &session),
+                            );
+                        }
+                        Command::UploadSessionAdvance(
+                            session_id,
+                            expected_phase,
+                            phase,
+                            upload_id,
+                            uri,
+                            chunk_offset,
+                            committed,
+                            error_class,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                crate::upload_session::advance_phase(
+                                    &mut connection,
+                                    &session_id,
+                                    expected_phase,
+                                    phase,
+                                    upload_id.as_deref(),
+                                    uri.as_deref(),
+                                    chunk_offset,
+                                    committed,
+                                    error_class.as_deref(),
+                                    now,
+                                ),
+                            );
                         }
                         Command::CreateUpdateJournal(value, reply) => {
                             respond(reply, update::create_journal(&mut connection, value));
@@ -302,6 +816,14 @@ impl DbWriter {
         })
     }
 
+    pub(crate) fn set_repository_volume_mode(
+        &self,
+        repository_id: mirage_types::RepositoryId,
+        mode: crate::repository::VolumeMode,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::SetRepositoryVolumeMode(repository_id, mode, reply))
+    }
+
     pub(crate) fn set_repository_state(
         &self,
         value: RepositoryStateChange,
@@ -371,6 +893,471 @@ impl DbWriter {
         value: SpaceLeaseTransition,
     ) -> Result<SpaceLeaseState, MirageError> {
         self.request(|reply| Command::TransitionSpaceLease(value, reply))
+    }
+
+    pub fn create_namespace_volume(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<InodeId, MirageError> {
+        self.request(|reply| Command::CreateNamespaceVolume(volume_id, now_ns, reply))
+    }
+
+    pub fn namespace_create(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        kind: NamespaceNodeKind,
+        now_ns: i64,
+    ) -> Result<DirEntry, MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| Command::NamespaceCreate(volume_id, parent, name, kind, now_ns, reply))
+    }
+
+    pub fn namespace_rename(
+        &self,
+        volume_id: RepositoryId,
+        from_parent: InodeId,
+        from_name: &str,
+        to_parent: InodeId,
+        to_name: &str,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        let from_name = from_name.to_owned();
+        let to_name = to_name.to_owned();
+        self.request(|reply| {
+            Command::NamespaceRename(
+                volume_id,
+                from_parent,
+                from_name,
+                to_parent,
+                to_name,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    pub fn namespace_delete(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, now_ns, reply))
+    }
+
+    pub fn namespace_set_file_roots(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        size: u64,
+        version_root: Option<[u8; 32]>,
+        extent_root: Option<[u8; 32]>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::NamespaceSetFileRoots(
+                volume_id,
+                inode,
+                size,
+                version_root,
+                extent_root,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    pub fn namespace_record_legacy(
+        &self,
+        volume_id: RepositoryId,
+        legacy_path: &str,
+        inode: InodeId,
+    ) -> Result<(), MirageError> {
+        let legacy_path = legacy_path.to_owned();
+        self.request(|reply| Command::NamespaceRecordLegacy(volume_id, legacy_path, inode, reply))
+    }
+
+    /// Bulk-seeds a volume's namespace from a verified manifest tree in one
+    /// transaction; idempotent once a volume exists.
+    pub fn namespace_seed(
+        &self,
+        volume_id: RepositoryId,
+        nodes: Vec<NamespaceSeedNode>,
+        now_ns: i64,
+    ) -> Result<usize, MirageError> {
+        self.request(|reply| Command::NamespaceSeed(volume_id, nodes, now_ns, reply))
+    }
+
+    /// Managed-volume variant of [`namespace_seed`](Self::namespace_seed):
+    /// seed + durable marker in one transaction; returns the existing
+    /// marker's index hash when the volume was already seeded.
+    pub fn namespace_seed_managed(
+        &self,
+        volume_id: RepositoryId,
+        nodes: Vec<NamespaceSeedNode>,
+        commit_hash: [u8; 32],
+        now_ns: i64,
+    ) -> Result<Option<[u8; 32]>, MirageError> {
+        self.request(|reply| {
+            Command::NamespaceSeedManaged(volume_id, nodes, commit_hash, now_ns, reply)
+        })
+    }
+
+    /// Records a payload's remote publication; fails when the payload is no
+    /// longer referenced by extents (the upload is then orphaned).
+    pub fn payload_published(
+        &self,
+        record: crate::payload_remote::PayloadRemoteObject,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PayloadPublished(record, reply))
+    }
+
+    /// Snapshots the live namespace into an immutable checkpoint document;
+    /// returns the new checkpoint sequence and its content hash.
+    pub fn namespace_checkpoint(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<(u64, [u8; 32]), MirageError> {
+        self.request(|reply| Command::NamespaceCheckpoint(volume_id, now_ns, reply))
+    }
+
+    /// Returns this installation's durable device identity, minting it on
+    /// first use.
+    pub fn ensure_device_id(&self, now_ns: i64) -> Result<DeviceId, MirageError> {
+        self.request(|reply| Command::EnsureDeviceIdentity(now_ns, reply))
+    }
+
+    pub fn physical_register_file(&self, record: PhysicalFileRecord) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalRegisterFile(record, reply))
+    }
+
+    /// Durably reserves an extent; the reservation must exist before any
+    /// bytes are written to the covered arena range.
+    pub fn physical_reserve_extent(
+        &self,
+        extent: PhysicalExtentRecord,
+        reservation: PhysicalReservationRecord,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalReserveExtent(extent, reservation, reply))
+    }
+
+    /// Commits a written extent alive once its checksum is verified.
+    pub fn physical_commit_extent(
+        &self,
+        extent_id: [u8; 16],
+        page_hash: mirage_types::PageHash,
+        checksum: [u8; 32],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::PhysicalCommitExtent(extent_id, page_hash, checksum, now_ns, reply)
+        })
+    }
+
+    pub fn physical_release_extent(
+        &self,
+        extent_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalReleaseExtent(extent_id, now_ns, reply))
+    }
+
+    /// Transitions an alive extent to dead; pinned extents are fenced off.
+    pub fn physical_mark_extent_dead(
+        &self,
+        extent_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalMarkExtentDead(extent_id, now_ns, reply))
+    }
+
+    /// Pins (+1) or unpins (-1) an alive extent against eviction.
+    pub fn physical_adjust_extent_pin(
+        &self,
+        extent_id: [u8; 16],
+        delta: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PhysicalAdjustExtentPin(extent_id, delta, reply))
+    }
+
+    /// Reaps expired reservations, returning their extents to dead.
+    pub fn physical_reap_reservations(&self, now_ns: i64) -> Result<u64, MirageError> {
+        self.request(|reply| Command::PhysicalReapReservations(now_ns, reply))
+    }
+
+    /// Journals a pending operation with its payload references.
+    pub fn operation_begin(
+        &self,
+        operation: OperationRecord,
+        payloads: Vec<OperationPayloadRecord>,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationBegin(operation, payloads, reply))
+    }
+
+    /// Allocates the next durable device-local sequence for the volume.
+    /// Serialized through the single writer so interleaved callers always
+    /// receive distinct values; the reserved sequence stays allocated even
+    /// when the operation is never journaled.
+    pub fn operation_alloc_seq(&self, volume_id: RepositoryId) -> Result<i64, MirageError> {
+        self.request(|reply| Command::OperationAllocSeq(volume_id, reply))
+    }
+
+    /// One atomic mutation commit: extent replacement + pending operation +
+    /// already-flushed payload records + optional physical-extent commit +
+    /// commit transition in a single transaction. Callers must fsync the
+    /// payload file before this runs.
+    pub fn mutation_commit(
+        &self,
+        extents: Option<crate::operation::ExtentMutation>,
+        operation: OperationRecord,
+        payloads: Vec<OperationPayloadRecord>,
+        physical: Option<crate::physical::PhysicalCommit>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::MutationCommit(extents, operation, payloads, physical, now_ns, reply)
+        })
+    }
+
+    /// Quiesce-time compaction: drops superseded extent versions and marks
+    /// unreferenced journal payload extents dead. Returns the transitioned
+    /// `(payload_id, length_bytes)` pairs for file/budget cleanup.
+    pub fn extent_compact_volume(
+        &self,
+        volume_id: RepositoryId,
+        journal_file_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<Vec<([u8; 16], i64)>, MirageError> {
+        self.request(|reply| {
+            Command::ExtentCompactVolume(volume_id, journal_file_id, now_ns, reply)
+        })
+    }
+
+    /// Marks a payload durable after its bytes are flushed to disk.
+    pub fn operation_payload_flushed(
+        &self,
+        payload_id: [u8; 16],
+        checksum: [u8; 32],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationPayloadFlushed(payload_id, checksum, now_ns, reply))
+    }
+
+    /// Commits a pending operation; fails closed when any payload is
+    /// unflushed.
+    pub fn operation_commit(&self, operation_id: [u8; 16]) -> Result<(), MirageError> {
+        self.request(|reply| Command::OperationCommit(operation_id, reply))
+    }
+
+    /// Opens a flush group capturing the volume's committed operations.
+    pub fn flush_group_open(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<i64, MirageError> {
+        self.request(|reply| Command::FlushGroupOpen(volume_id, now_ns, reply))
+    }
+
+    /// Acknowledges local durability for every operation in the group.
+    pub fn flush_group_mark(&self, group_id: i64, now_ns: i64) -> Result<u64, MirageError> {
+        self.request(|reply| Command::FlushGroupMark(group_id, now_ns, reply))
+    }
+
+    /// Advances flushed operations to published after the remote commit.
+    pub fn operation_publish(&self, operation_ids: Vec<[u8; 16]>) -> Result<u64, MirageError> {
+        self.request(|reply| Command::OperationPublish(operation_ids, reply))
+    }
+
+    /// Reclaims pending operations after their payloads are deleted.
+    pub fn operation_reclaim_pending(
+        &self,
+        volume_id: RepositoryId,
+        now_ns: i64,
+    ) -> Result<u64, MirageError> {
+        self.request(|reply| Command::OperationReclaimPending(volume_id, now_ns, reply))
+    }
+
+    /// Records an observed remote head; a backwards cursor is rejected.
+    pub fn remote_head_observe(
+        &self,
+        head: crate::remote_observation::RemoteHead,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::RemoteHeadObserve(head, reply))
+    }
+
+    /// Records one remote change under its cursor (idempotent on cursor).
+    pub fn remote_change_record(
+        &self,
+        change: crate::remote_observation::RemoteChange,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::RemoteChangeRecord(change, reply))
+    }
+
+    /// Records a divergence; both histories stay visible.
+    pub fn divergence_record(
+        &self,
+        divergence: crate::remote_observation::Divergence,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::DivergenceRecord(divergence, reply))
+    }
+
+    /// Marks a live divergence resolved; the record is kept for audit.
+    pub fn divergence_resolve(
+        &self,
+        volume_id: RepositoryId,
+        status: crate::remote_observation::DivergenceStatus,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::DivergenceResolve(volume_id, status, now_ns, reply))
+    }
+
+    /// Declares a workspace lease (idempotent on prefix).
+    pub fn lease_declare(
+        &self,
+        lease: crate::workspace_lease::WorkspaceLease,
+    ) -> Result<[u8; 16], MirageError> {
+        self.request(|reply| Command::LeaseDeclare(lease, reply))
+    }
+
+    /// Marks a lease verified with measured coverage and evidence.
+    pub fn lease_verify(
+        &self,
+        lease_id: [u8; 16],
+        bytes_verified: u64,
+        pages_pinned: u64,
+        evidence: Vec<u8>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::LeaseVerify(
+                lease_id,
+                bytes_verified,
+                pages_pinned,
+                evidence,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    /// Revokes a lease; covered pages become eviction candidates.
+    pub fn lease_revoke(&self, lease_id: [u8; 16], now_ns: i64) -> Result<(), MirageError> {
+        self.request(|reply| Command::LeaseRevoke(lease_id, now_ns, reply))
+    }
+
+    /// Sets the retention bound for a history stream (idempotent upsert).
+    pub fn gc_bound_set(&self, bound: crate::gc_bounds::GcBound) -> Result<(), MirageError> {
+        self.request(|reply| Command::GcBoundSet(bound, reply))
+    }
+
+    /// Marks an object unreachable at a verified commit; removal is gated on
+    /// a later verified commit plus the reclamation window.
+    pub fn gc_unreachable_mark(
+        &self,
+        volume_id: RepositoryId,
+        object_key: &str,
+        at_commit: [u8; 32],
+        reclaim_after_ns: i64,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::GcUnreachableMark(
+                volume_id,
+                object_key.to_string(),
+                at_commit,
+                reclaim_after_ns,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    /// Clears a reclaimed candidate after the remote delete lands.
+    pub fn gc_unreachable_clear(
+        &self,
+        volume_id: RepositoryId,
+        object_key: &str,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::GcUnreachableClear(volume_id, object_key.to_string(), reply))
+    }
+
+    /// Creates a durable upload session before the first remote call.
+    pub fn upload_session_create(
+        &self,
+        session: crate::upload_session::UploadSession,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::UploadSessionCreate(session, reply))
+    }
+
+    /// Advances a session's phase, upload cursor, and error class.
+    #[allow(clippy::too_many_arguments)]
+    /// Phase transitions compare-and-swap on `expected_phase` — a stale
+    /// driver cannot move a session that recovery already advanced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_session_advance(
+        &self,
+        session_id: [u8; 16],
+        expected_phase: crate::upload_session::SessionPhase,
+        phase: crate::upload_session::SessionPhase,
+        remote_upload_id: Option<String>,
+        session_uri: Option<String>,
+        chunk_offset: u64,
+        committed_bytes: u64,
+        error_class: Option<String>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::UploadSessionAdvance(
+                session_id,
+                expected_phase,
+                phase,
+                remote_upload_id,
+                session_uri,
+                chunk_offset,
+                committed_bytes,
+                error_class,
+                now_ns,
+                reply,
+            )
+        })
+    }
+
+    /// Atomically replaces an inode's extent set at `version`; the durable
+    /// head EOF is derived from the extent set (0 for an empty set).
+    pub fn extent_replace(
+        &self,
+        volume_id: RepositoryId,
+        inode: mirage_types::InodeId,
+        version: i64,
+        extents: Vec<crate::extent::ByteExtent>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::ExtentReplace(volume_id, inode, version, extents, now_ns, reply)
+        })
+    }
+
+    /// Atomically replaces an inode's extent set with an explicit logical
+    /// EOF — required when the file extends past the last extent (a
+    /// truncate-grow leaves a zero-filled hole).
+    pub fn extent_replace_eof(
+        &self,
+        volume_id: RepositoryId,
+        inode: mirage_types::InodeId,
+        version: i64,
+        eof: u64,
+        extents: Vec<crate::extent::ByteExtent>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::ExtentReplaceEof(volume_id, inode, version, eof, extents, now_ns, reply)
+        })
     }
 
     pub fn create_update_journal(&self, value: NewUpdateJournal) -> Result<(), MirageError> {

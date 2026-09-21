@@ -23,6 +23,7 @@ pub fn run(
     virtual_extensions: &[String],
     minimum_virtual_asset_bytes: u64,
     unencrypted: bool,
+    pack_all: bool,
     json: bool,
 ) -> Result<(), MirageError> {
     if !local_only {
@@ -37,10 +38,17 @@ pub fn run(
         .iter()
         .filter(|entry| entry.kind == InventoryEntryKind::File)
         .map(|entry| {
-            let verdict = rules.classify(entry);
+            // --pack-all packs every regular file so a managed Drive-backed
+            // mount can fetch any byte on demand; the scanner's refusal of
+            // reparse points and links is unchanged.
+            let class = if pack_all {
+                mirage_manifest::FileClass::VirtualContainer
+            } else {
+                rules.classify(entry).class
+            };
             PlannedFile {
                 relative_path: entry.relative_path.clone(),
-                class: verdict.class,
+                class,
             }
         })
         .collect();

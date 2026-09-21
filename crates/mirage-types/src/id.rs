@@ -4,7 +4,7 @@ use core::fmt;
 use core::str::FromStr;
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::error::MirageError;
 
@@ -64,6 +64,7 @@ pub fn encode_canonical_hex_16(bytes: &[u8; 16]) -> String {
     out
 }
 
+#[macro_export]
 macro_rules! define_id128_type {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]
@@ -93,15 +94,15 @@ macro_rules! define_id128_type {
             }
 
             /// Parses a 32-character lowercase canonical hex string.
-            pub fn from_canonical_hex(s: &str) -> Result<Self, MirageError> {
-                parse_canonical_hex_16(s).map(Self)
+            pub fn from_canonical_hex(s: &str) -> Result<Self, $crate::error::MirageError> {
+                $crate::id::parse_canonical_hex_16(s).map(Self)
             }
 
             /// Performs constant-time comparison with another identifier.
             #[inline]
             #[must_use]
             pub fn constant_time_eq(&self, other: &Self) -> bool {
-                constant_time_eq_16(&self.0, &other.0)
+                $crate::id::constant_time_eq_16(&self.0, &other.0)
             }
         }
 
@@ -135,26 +136,26 @@ macro_rules! define_id128_type {
             }
         }
 
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 write!(
                     f,
                     "{}({})",
                     stringify!($name),
-                    encode_canonical_hex_16(&self.0)
+                    $crate::id::encode_canonical_hex_16(&self.0)
                 )
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", encode_canonical_hex_16(&self.0))
+        impl core::fmt::Display for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "{}", $crate::id::encode_canonical_hex_16(&self.0))
             }
         }
 
-        impl fmt::LowerHex for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", encode_canonical_hex_16(&self.0))
+        impl core::fmt::LowerHex for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "{}", $crate::id::encode_canonical_hex_16(&self.0))
             }
         }
 
@@ -172,7 +173,7 @@ macro_rules! define_id128_type {
             }
         }
 
-        impl FromStr for $name {
+        impl core::str::FromStr for $name {
             type Err = MirageError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -181,22 +182,25 @@ macro_rules! define_id128_type {
         }
 
         #[cfg(feature = "serde")]
-        impl Serialize for $name {
+        impl serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
-                S: Serializer,
+                S: serde::Serializer,
             {
-                serializer.serialize_str(&encode_canonical_hex_16(&self.0))
+                serde::Serializer::serialize_str(
+                    serializer,
+                    &$crate::id::encode_canonical_hex_16(&self.0),
+                )
             }
         }
 
         #[cfg(feature = "serde")]
-        impl<'de> Deserialize<'de> for $name {
+        impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: Deserializer<'de>,
+                D: serde::Deserializer<'de>,
             {
-                let s = String::deserialize(deserializer)?;
+                let s = <String as serde::Deserialize>::deserialize(deserializer)?;
                 Self::from_canonical_hex(&s).map_err(serde::de::Error::custom)
             }
         }

@@ -51,6 +51,7 @@ impl<B: ObjectBackend> PageProvider<B> {
                 workers: DEFAULT_FETCH_WORKERS,
                 queue_depth: 256,
                 speculative_queue_depth: 64,
+                max_in_flight_bytes: 0,
             })
             .expect("fixed fetch pool configuration is valid"),
             budget,
@@ -69,6 +70,16 @@ impl<B: ObjectBackend> PageProvider<B> {
     pub fn with_fetch_pool(mut self, pool: Arc<FetchPool>) -> Self {
         self.pool = pool;
         self
+    }
+
+    /// The backend as a trait object for non-provider consumers (payload
+    /// publication, evicted-payload fetch).
+    #[must_use]
+    pub fn backend_arc(&self) -> Arc<dyn ObjectBackend>
+    where
+        B: 'static,
+    {
+        Arc::clone(&self.backend) as Arc<dyn ObjectBackend>
     }
 
     /// In-flight flights, queued pool jobs, and running pool jobs.

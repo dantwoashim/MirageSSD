@@ -1,14 +1,40 @@
 [CmdletBinding()]
 param(
-  [string]$SourceDirectory = (Join-Path $PSScriptRoot '..\target\rclone-miragessd-source-v1.75.0'),
-  [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\target\rclone-miragessd')
+  # miragessd3 is the current provider: rclone v1.75.1 with the bound,
+  # roll-back-safe attribute journal. miragessd2 is the preserved shipping
+  # baseline on rclone v1.75.0; keep it reproducible for comparison runs.
+  [ValidateSet('miragessd2', 'miragessd3')]
+  [string]$Variant = 'miragessd3',
+  [string]$SourceDirectory = '',
+  [string]$OutputDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$variants = @{
+  miragessd2 = @{
+    Tag    = 'v1.75.0'
+    Commit = '9ee9d0a0cafd5e5fe3b271d2280b090ab6e64048'
+    Patch  = 'rclone-v1.75.0.patch'
+    Suffix = 'miragessd2'
+  }
+  miragessd3 = @{
+    Tag    = 'v1.75.1'
+    Commit = '687d264b689b8c49a67e2e52a8a5e0caa01c04ce'
+    Patch  = 'rclone-v1.75.1.patch'
+    Suffix = 'miragessd3'
+  }
+}
+$selected = $variants[$Variant]
 $upstream = 'https://github.com/rclone/rclone.git'
-$tag = 'v1.75.0'
-$commit = '9ee9d0a0cafd5e5fe3b271d2280b090ab6e64048'
-$patch = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\third_party\rclone-miragessd\rclone-v1.75.0.patch')).Path
+$tag = $selected.Tag
+$commit = $selected.Commit
+$patch = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot ('..\third_party\rclone-miragessd\' + $selected.Patch))).Path
+if (-not $SourceDirectory) {
+  $SourceDirectory = Join-Path $PSScriptRoot ('..\target\rclone-miragessd-source-' + $tag)
+}
+if (-not $OutputDirectory) {
+  $OutputDirectory = Join-Path $PSScriptRoot '..\target\rclone-miragessd'
+}
 $source = [IO.Path]::GetFullPath($SourceDirectory)
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 
@@ -58,7 +84,7 @@ try {
   }
   go -C $source build `
     -trimpath `
-    -ldflags '-s -w -X github.com/rclone/rclone/fs.VersionSuffix=miragessd2' `
+    -ldflags ('-s -w -X github.com/rclone/rclone/fs.VersionSuffix=' + $selected.Suffix) `
     -tags cmount `
     -o $binary `
     .
@@ -71,11 +97,14 @@ try {
 
 [pscustomobject]@{
   Built = $true
+  Variant = $Variant
   UpstreamTag = $tag
   UpstreamCommit = $commit
+  PatchSha256 = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
   Binary = $binary
   Sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
   Version = (& $binary version)[0]
   Linkage = 'static'
   BuildTag = 'cmount'
+  BuildFlags = '-trimpath -tags cmount CGO_ENABLED=0'
 } | ConvertTo-Json -Compress
