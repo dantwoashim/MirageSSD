@@ -174,3 +174,4 @@ class FakeMirage {
   Microsoft.PowerShell.Management\Remove-Item Env:MIRAGE_TEST_AUTH_FAIL -ErrorAction SilentlyContinue
   # Keep the isolated fixture for diagnosis; it contains no real account data.
 }
+exit 0
