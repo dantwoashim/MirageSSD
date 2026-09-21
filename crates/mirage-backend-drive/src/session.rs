@@ -92,7 +92,7 @@ async fn refresh_with_stored_secret(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::http::{HttpRequest, HttpResponse};

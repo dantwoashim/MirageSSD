@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -173,7 +173,7 @@ fn caller_image_name(pid: u32) -> String {
         return "?".into();
     }
     let name = std::ffi::OsString::from_wide(&buffer[..length as usize]);
-    Path::new(&name)
+    std::path::Path::new(&name)
         .file_name()
         .map(|base| base.to_string_lossy().into_owned())
         .unwrap_or_else(|| "?".into())
