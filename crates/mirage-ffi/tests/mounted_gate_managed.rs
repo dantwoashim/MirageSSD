@@ -15,6 +15,10 @@ use mirage_manifest::FileClass;
 use mirage_pack::{ImportPlan, PlannedFile, import_local};
 use mirage_types::{GenerationId, RepositoryId};
 
+/// Only one real mount may exist at a time: `free_letter` races under the
+/// default parallel test harness.
+static MOUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn free_letter() -> char {
     ('R'..='Z')
         .rev()
@@ -108,13 +112,59 @@ fn wait_ready(host: &mut std::process::Child, file: &std::path::Path) {
     assert!(file.exists(), "managed mount did not become ready");
 }
 
-fn stop(host: &mut std::process::Child) {
-    host.kill().expect("stop host");
-    let _ = host.wait();
+/// RAII host: Drop sends STOP on stdin (graceful quiesce+compaction), waits
+/// briefly, then kills — a panicking test can never orphan a mirage-fs.exe
+/// holding an inherited stdout pipe open for cargo to hang on.
+struct TestHost(std::process::Child);
+
+impl TestHost {
+    fn spawn(command: &mut Command) -> Self {
+        // stdout must not be inherited: an orphan holding it open makes the
+        // test harness wait on the pipe forever. null() or piped-and-drained.
+        Self(command.spawn().expect("start managed host"))
+    }
+    fn stop(&mut self) {
+        if let Some(stdin) = &mut self.0.stdin {
+            let _ = stdin.write_all(b"STOP
+");
+            let _ = stdin.flush();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for TestHost {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TestHost {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for TestHost {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn stop(host: &mut TestHost) {
+    host.stop();
 }
 
 #[test]
 fn managed_mount_writes_survive_restart() {
+    let _mount_guard = MOUNT_LOCK.lock().unwrap();
     // A committed base file exercises index-backed reads; local mutations
     // exercise the durable namespace + extent journal.
     let source = tempfile::tempdir().expect("source");
@@ -170,21 +220,21 @@ fn managed_mount_writes_survive_restart() {
     let host_log =
         std::fs::File::create(state_root.path().join("host-stderr.log")).expect("host log");
 
-    let mut host = Command::new(&executable)
-        .arg(&mount_arg)
-        .arg(&index)
-        .arg(state_root.path())
-        .arg("S-1-1-0")
-        .arg("--managed")
-        .arg("536870912")
-        .arg("65536")
-        .arg("--origin")
-        .arg(objects.path())
-        .env("PATH", &search_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(host_log.try_clone().unwrap()))
-        .spawn()
-        .expect("start managed host");
+    let mut host = TestHost::spawn(
+        Command::new(&executable)
+            .arg(&mount_arg)
+            .arg(&index)
+            .arg(state_root.path())
+            .arg("S-1-1-0")
+            .arg("--managed")
+            .arg("536870912")
+            .arg("65536")
+            .arg("--origin")
+            .arg(objects.path())
+            .env("PATH", &search_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(host_log.try_clone().unwrap())),
+    );
     wait_ready(&mut host, &mount.join("base.dat"));
 
     // Committed base content reads through the object mirror.
@@ -354,21 +404,21 @@ fn managed_mount_writes_survive_restart() {
     stop(&mut host);
 
     // Remount: the durable namespace + extent journal replay the state.
-    let mut second = Command::new(&executable)
-        .arg(&mount_arg)
-        .arg(&index)
-        .arg(state_root.path())
-        .arg("S-1-1-0")
-        .arg("--managed")
-        .arg("536870912")
-        .arg("65536")
-        .arg("--origin")
-        .arg(objects.path())
-        .env("PATH", &search_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(host_log.try_clone().unwrap()))
-        .spawn()
-        .expect("remount managed host");
+    let mut second = TestHost::spawn(
+        Command::new(&executable)
+            .arg(&mount_arg)
+            .arg(&index)
+            .arg(state_root.path())
+            .arg("S-1-1-0")
+            .arg("--managed")
+            .arg("536870912")
+            .arg("65536")
+            .arg("--origin")
+            .arg(objects.path())
+            .env("PATH", &search_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(host_log.try_clone().unwrap())),
+    );
     wait_ready(&mut second, &mount.join("renamed.txt"));
 
     let mut after = Vec::new();
@@ -432,4 +482,94 @@ fn managed_mount_writes_survive_restart() {
         .collect();
     expected_names.sort();
     assert_eq!(on_disk, expected_names, "journal payloads != live extents");
+}
+
+/// The service's floor-enforcement channel: `EVICT <bytes>` on the host's
+/// stdin must produce a `MIRAGE_EVICTED <freed>` reply on stdout.
+#[test]
+fn managed_host_evict_round_trip() {
+    let _mount_guard = MOUNT_LOCK.lock().unwrap();
+    use std::io::BufRead;
+    use std::sync::mpsc;
+
+    let source = tempfile::tempdir().expect("source");
+    std::fs::write(source.path().join("base.dat"), vec![0x5Au8; 4 * 1024]).expect("seed");
+    let objects = tempfile::tempdir().expect("objects");
+    let imported = import_local(&ImportPlan {
+        repository_id: RepositoryId::from_bytes([9; 16]),
+        generation_id: GenerationId::ZERO,
+        source_root: source.path().to_path_buf(),
+        files: vec![PlannedFile {
+            relative_path: "base.dat".into(),
+            class: FileClass::VirtualContainer,
+        }],
+        page_size: 64 * 1024,
+        pack_target: 2 * 1024 * 1024,
+        output_staging_directory: objects.path().to_path_buf(),
+        encryption: None,
+    })
+    .expect("import");
+    let index = objects.path().join("mount.idx");
+    mirage_index::compile_to_path(&imported.manifest, &index).expect("index");
+    let state_root = tempfile::tempdir().expect("state root");
+    let mount_letter = free_letter();
+    let mount = std::path::PathBuf::from(format!("{mount_letter}:\\"));
+    let executable = adapter();
+
+    let mut host = TestHost::spawn(
+        Command::new(&executable)
+            .arg(format!("{mount_letter}:"))
+            .arg(&index)
+            .arg(state_root.path())
+            .arg("S-1-1-0")
+            .arg("--managed")
+            .arg("536870912")
+            .arg("65536")
+            .arg("--origin")
+            .arg(objects.path())
+            .env("PATH", runtime_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    );
+    wait_ready(&mut host, &mount.join("base.dat"));
+
+    let stdout = host.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    use std::io::Write;
+    host.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"EVICT 1048576\n")
+        .expect("send EVICT");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut replied = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(line) if line.starts_with("MIRAGE_EVICTED ") => {
+                line["MIRAGE_EVICTED ".len()..]
+                    .trim()
+                    .parse::<u64>()
+                    .expect("MIRAGE_EVICTED carries a byte count");
+                replied = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    stop(&mut host);
+    assert!(replied, "host never replied MIRAGE_EVICTED to EVICT");
 }

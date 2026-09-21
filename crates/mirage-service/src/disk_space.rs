@@ -120,6 +120,47 @@ pub(crate) fn allocated_file_bytes(_path: &Path) -> Result<u64, MirageError> {
     ))
 }
 
+/// The volume mount root (e.g. `D:\`) containing `path`, upper-cased.
+#[cfg(windows)]
+pub(crate) fn volume_root_of(path: &Path) -> Result<String, MirageError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let path_wide: Vec<u16> = path
+        .canonicalize()
+        .map_err(MirageError::from)?
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut volume_path = vec![0_u16; 32_768];
+    // SAFETY: input is NUL-terminated; the output buffer is live and sized.
+    let ok = unsafe {
+        GetVolumePathNameW(
+            path_wide.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(MirageError::from(std::io::Error::last_os_error()));
+    }
+    let len = volume_path
+        .iter()
+        .position(|v| *v == 0)
+        .ok_or_else(|| MirageError::integrity_mismatch("volume path is not NUL-terminated"))?;
+    String::from_utf16(&volume_path[..len])
+        .map(|root| root.to_ascii_uppercase())
+        .map_err(|_| MirageError::integrity_mismatch("volume path is not valid UTF-16"))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn volume_root_of(_path: &Path) -> Result<String, MirageError> {
+    Err(MirageError::provider_unavailable(
+        "volume root resolution is currently available only on Windows",
+    ))
+}
+
 #[cfg(windows)]
 pub(crate) fn query(path: &Path) -> Result<VolumeSpace, MirageError> {
     use std::os::windows::ffi::OsStrExt;

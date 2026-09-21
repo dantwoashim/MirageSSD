@@ -50,6 +50,8 @@ pub struct HostSpec {
     pub drive_manifest: Option<PathBuf>,
     /// `repository-key.dpapi` for the managed host's Drive provider.
     pub repository_key: Option<PathBuf>,
+    /// Write-admission free-space floor for the journal volume (`--floor`).
+    pub disk_floor: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExit {
@@ -72,6 +74,13 @@ pub trait ManagedChild: Send {
     fn stderr_tail(&self) -> String {
         String::new()
     }
+    /// One post-readiness stdout line (e.g. `MIRAGE_EVICTED <bytes>`).
+    fn read_stdout_line(&mut self, _timeout: Duration) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "host stdout replies are not supported",
+        ))
+    }
     fn stop(&mut self) -> io::Result<HostExit>;
 }
 pub trait Launcher: Send + Sync {
@@ -83,6 +92,7 @@ pub struct StdChild {
     child: Child,
     stdin: Option<ChildStdin>,
     ready: Receiver<io::Result<()>>,
+    lines: Receiver<io::Result<String>>,
     stderr_tail: Arc<Mutex<String>>,
 }
 impl ManagedChild for StdChild {
@@ -120,6 +130,19 @@ impl ManagedChild for StdChild {
             .lock()
             .map(|tail| tail.clone())
             .unwrap_or_default()
+    }
+    fn read_stdout_line(&mut self, timeout: Duration) -> io::Result<String> {
+        match self.lines.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "filesystem host did not answer the control command",
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "filesystem host stdout closed",
+            )),
+        }
     }
     fn stop(&mut self) -> io::Result<HostExit> {
         if let Some(status) = self.child.try_wait()? {
@@ -206,26 +229,48 @@ impl Launcher for StdLauncher {
             });
         }
         let (sender, ready) = mpsc::sync_channel(1);
+        let (line_sender, lines) = mpsc::sync_channel::<io::Result<String>>(16);
         thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
             let mut line = String::new();
-            let result = BufReader::new(stdout)
-                .read_line(&mut line)
-                .and_then(|read| {
-                    if read != 0 && line.trim() == "MIRAGE_READY" {
-                        Ok(())
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "filesystem host did not emit the readiness marker",
-                        ))
-                    }
-                });
+            let result = reader.read_line(&mut line).and_then(|read| {
+                if read != 0 && line.trim() == "MIRAGE_READY" {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "filesystem host did not emit the readiness marker",
+                    ))
+                }
+            });
+            let ready_ok = result.is_ok();
             let _ = sender.send(result);
+            if !ready_ok {
+                return;
+            }
+            // Post-readiness replies (MIRAGE_EVICTED, …) keep flowing to
+            // whoever requested them; EOF ends the pump.
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        if line_sender.send(Ok(line.trim().to_owned())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = line_sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
         });
         Ok(StdChild {
             child,
             stdin: Some(stdin),
             ready,
+            lines,
             stderr_tail,
         })
     }
@@ -244,6 +289,10 @@ fn host_args(spec: &HostSpec) -> Vec<std::ffi::OsString> {
     if let Some(origin_root) = &spec.origin_root {
         args.push("--origin".into());
         args.push(origin_root.clone().into_os_string());
+    }
+    if let Some(floor) = spec.disk_floor {
+        args.push("--floor".into());
+        args.push(floor.to_string().into());
     }
     if let (Some(manifest), Some(key)) = (&spec.drive_manifest, &spec.repository_key) {
         args.push("--drive-manifest".into());
@@ -361,6 +410,34 @@ impl<L: Launcher> Supervisor<L> {
             .unwrap_or_default()
     }
 
+    /// Sends `EVICT <bytes>` and waits for `MIRAGE_EVICTED <freed>` on the
+    /// host's stdout; other lines are skipped until the reply or timeout.
+    pub fn request_eviction(
+        &mut self,
+        id: &HostId,
+        bytes: u64,
+        timeout: Duration,
+    ) -> io::Result<u64> {
+        self.send_line(id, &format!("EVICT {bytes}"))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "EVICT reply timed out"))?;
+            let line = self
+                .hosts
+                .get_mut(id)
+                .and_then(|host| host.child.as_mut())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown host"))?
+                .read_stdout_line(remaining)?;
+            if let Some(rest) = line.strip_prefix("MIRAGE_EVICTED ") {
+                return rest.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed MIRAGE_EVICTED reply")
+                });
+            }
+        }
+    }
+
     pub fn send_line(&mut self, id: &HostId, line: &str) -> io::Result<()> {
         let host = self
             .hosts
@@ -424,6 +501,7 @@ mod tests {
             volume_free_bytes: 512,
             origin_root: Some(PathBuf::from("objects")),
             managed,
+            disk_floor: None,
             drive_manifest: None,
             repository_key: None,
         }

@@ -4,6 +4,7 @@
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod authorization;
+pub mod disk_floor;
 #[allow(unsafe_code)]
 mod disk_space;
 #[cfg(windows)]

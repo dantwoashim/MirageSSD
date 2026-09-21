@@ -20,10 +20,11 @@ public:
     FileSystemHost() = default;
     FileSystemHost(const FileSystemHost&) = delete;
     FileSystemHost& operator=(const FileSystemHost&) = delete;
-    NTSTATUS mount(const std::wstring&, const std::wstring&, const std::wstring&, const std::wstring&, bool, bool, std::uint64_t, std::uint64_t, const std::wstring& = {}, const std::wstring& = {}, const std::wstring& = {});
+    NTSTATUS mount(const std::wstring&, const std::wstring&, const std::wstring&, const std::wstring&, bool, bool, std::uint64_t, std::uint64_t, const std::wstring& = {}, const std::wstring& = {}, const std::wstring& = {}, std::uint64_t = 0);
     // Delivers a Drive bearer token to a managed engine; a no-op for
     // engines without a provider.
     void set_drive_token(const std::string& token);
+    void request_eviction(const std::string& bytes);
     NTSTATUS run();
     void stop() noexcept;
     bool writable() const noexcept { return writable_; }

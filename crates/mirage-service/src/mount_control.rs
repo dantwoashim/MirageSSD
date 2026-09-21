@@ -20,6 +20,7 @@ pub trait MountControl: Send {
         volume_capacity: (u64, u64),
         managed: bool,
         drive_provider: Option<(&Path, &Path)>,
+        disk_floor: Option<u64>,
     ) -> Result<(), MirageError>;
     /// Pushes a bearer token to the live host of a mounted repository.
     fn send_drive_token(
@@ -27,6 +28,13 @@ pub trait MountControl: Send {
         repository_id: RepositoryId,
         token: &str,
     ) -> Result<(), MirageError>;
+    /// Asks a mounted managed host to evict published payloads, returning the
+    /// freed journal bytes reported by `MIRAGE_EVICTED` within 30 s.
+    fn request_eviction(
+        &mut self,
+        repository_id: RepositoryId,
+        bytes: u64,
+    ) -> Result<u64, MirageError>;
     fn unmount(&mut self, repository_id: RepositoryId) -> Result<(), MirageError>;
     fn is_running(&mut self, repository_id: RepositoryId) -> Result<bool, MirageError>;
 }
@@ -65,6 +73,7 @@ impl MountControl for NativeMountControl {
         volume_capacity: (u64, u64),
         managed: bool,
         drive_provider: Option<(&Path, &Path)>,
+        disk_floor: Option<u64>,
     ) -> Result<(), MirageError> {
         let (volume_total_bytes, volume_free_bytes) = volume_capacity;
         if !self.executable.is_file() {
@@ -101,6 +110,7 @@ impl MountControl for NativeMountControl {
                     managed,
                     drive_manifest: drive_provider.map(|(manifest, _)| manifest.to_path_buf()),
                     repository_key: drive_provider.map(|(_, key)| key.to_path_buf()),
+                    disk_floor,
                 },
             )
             .map_err(io_error)?;
@@ -156,6 +166,16 @@ impl MountControl for NativeMountControl {
     ) -> Result<(), MirageError> {
         self.supervisor
             .send_line(&host_id(repository_id)?, &format!("TOKEN {token}"))
+            .map_err(io_error)
+    }
+
+    fn request_eviction(
+        &mut self,
+        repository_id: RepositoryId,
+        bytes: u64,
+    ) -> Result<u64, MirageError> {
+        self.supervisor
+            .request_eviction(&host_id(repository_id)?, bytes, Duration::from_secs(30))
             .map_err(io_error)
     }
 
@@ -261,12 +281,18 @@ impl MountControl for UnavailableMountControl {
         _: (u64, u64),
         _: bool,
         _: Option<(&Path, &Path)>,
+        _: Option<u64>,
     ) -> Result<(), MirageError> {
         Err(MirageError::provider_unavailable(
             "filesystem host is not configured",
         ))
     }
     fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
+        Err(MirageError::provider_unavailable(
+            "filesystem host is not configured",
+        ))
+    }
+    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<u64, MirageError> {
         Err(MirageError::provider_unavailable(
             "filesystem host is not configured",
         ))

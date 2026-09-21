@@ -6,6 +6,7 @@ use mirage_types::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use crate::runtime::{self, RegisterSpec};
 use crate::{
     MountControl, RequestHandler, capacity, mount_control::UnavailableMountControl, native_session,
 };
+use crate::{disk_floor, disk_space};
 
 pub struct ControlPlaneHandler {
     database: Database,
@@ -122,6 +124,11 @@ impl ControlPlaneHandler {
                     drive_provider
                         .as_ref()
                         .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
+                    if managed {
+                        state_root_disk_floor(&self.database)
+                    } else {
+                        None
+                    },
                 )?;
             restored += 1;
         }
@@ -630,6 +637,13 @@ impl RequestHandler for ControlPlaneHandler {
                 drive_access_token,
             } => self.supply_drive_token(repository_id, drive_access_token.expose()),
             Command::Unmount { repository_id } => self.unmount(repository_id),
+            Command::DiskFloorSet {
+                volume_root,
+                floor_bytes,
+                hysteresis_bytes,
+            } => self.disk_floor_set(&volume_root, floor_bytes, hysteresis_bytes),
+            Command::DiskFloorClear { volume_root } => self.disk_floor_clear(&volume_root),
+            Command::DiskStatus => self.disk_status(),
             Command::ProfileConfigure {
                 repository_id,
                 launcher_relative,
@@ -859,6 +873,11 @@ impl ControlPlaneHandler {
                 drive_provider
                     .as_ref()
                     .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
+                if managed {
+                    state_root_disk_floor(&self.database)
+                } else {
+                    None
+                },
             );
         if let Err(error) = mounted {
             let _ = runtime::clear_mount_record(&self.database, repository_id);
@@ -946,6 +965,203 @@ impl ControlPlaneHandler {
         mounts
             .send_drive_token(repository_id, token)
             .map(|()| ResponseBody::Json(json!({"supplied": true})))
+    }
+
+    fn disk_floor_set(
+        &self,
+        volume_root: &str,
+        floor_bytes: u64,
+        hysteresis_bytes: Option<u64>,
+    ) -> Result<ResponseBody, MirageError> {
+        let root = disk_floor::normalize_volume_root(volume_root)?;
+        let space = disk_space::query(Path::new(&root))?;
+        if floor_bytes >= space.total_bytes {
+            return Err(MirageError::invalid_argument(
+                "disk floor must be below the volume's total size",
+            ));
+        }
+        let hysteresis =
+            hysteresis_bytes.unwrap_or_else(|| disk_floor::default_hysteresis(floor_bytes));
+        self.database.set_disk_floor(mirage_db::DiskFloor {
+            volume_root: root.clone(),
+            floor_bytes,
+            hysteresis_bytes: hysteresis,
+            updated_ns: now_ns(),
+        })?;
+        Ok(ResponseBody::Json(json!({
+            "volume_root": root,
+            "floor_bytes": floor_bytes,
+            "hysteresis_bytes": hysteresis,
+        })))
+    }
+
+    fn disk_floor_clear(&self, volume_root: &str) -> Result<ResponseBody, MirageError> {
+        let root = disk_floor::normalize_volume_root(volume_root)?;
+        if !self.database.clear_disk_floor(&root)? {
+            return Err(MirageError::invalid_argument(
+                "no disk floor is configured for that volume",
+            ));
+        }
+        Ok(ResponseBody::Json(json!({
+            "volume_root": root,
+            "cleared": true,
+        })))
+    }
+
+    fn disk_status(&self) -> Result<ResponseBody, MirageError> {
+        let floors = self.database.disk_floors()?;
+        let mut entries = Vec::new();
+        for floor in &floors {
+            let space = disk_space::query(Path::new(&floor.volume_root))?;
+            let free = space.available_bytes;
+            let breached = free < floor.floor_bytes;
+            let deficit = floor.floor_bytes.saturating_sub(free);
+            let mut cache_pages = 0_u64;
+            let mut shadow_packs = 0_u64;
+            let mut published_payloads = 0_u64;
+            for repository in self.repositories()? {
+                let Some(native_root) = self
+                    .database
+                    .load_repository_root(repository.repository_id)?
+                else {
+                    continue;
+                };
+                if disk_space::volume_root_of(&native_root).ok().as_deref()
+                    != Some(floor.volume_root.as_str())
+                {
+                    continue;
+                }
+                if let Ok(source) = capacity::RepositoryCapacitySource::open(
+                    &self.database,
+                    repository.repository_id,
+                    None,
+                ) && let Ok((pages, shadow)) = source.evictable_breakdown()
+                {
+                    cache_pages += pages;
+                    shadow_packs += shadow;
+                }
+                if let Ok(evictable) = self
+                    .database
+                    .published_payloads_evictable(repository.repository_id)
+                {
+                    published_payloads += evictable
+                        .iter()
+                        .map(|(_, length, _)| u64::try_from(*length).unwrap_or(0))
+                        .sum::<u64>();
+                }
+            }
+            let last = self.database.latest_disk_floor_run(&floor.volume_root)?;
+            entries.push(json!({
+                "volume_root": floor.volume_root,
+                "total_bytes": space.total_bytes,
+                "free_bytes": free,
+                "floor_bytes": floor.floor_bytes,
+                "hysteresis_bytes": floor.hysteresis_bytes,
+                "breached": breached,
+                "deficit_bytes": deficit,
+                "evictable_bytes": {
+                    "cache_pages": cache_pages,
+                    "drive_shadow_packs": shadow_packs,
+                    "published_payloads": published_payloads,
+                },
+                "last_reclaim": last.map(|run| json!({
+                    "at_ns": run.at_ns,
+                    "freed_bytes": run.freed_bytes,
+                    "outcome": run.outcome,
+                })),
+            }));
+        }
+        Ok(ResponseBody::Json(json!({ "floors": entries })))
+    }
+
+    /// One disk-floor reclaim pass over every configured volume: reclaim
+    /// verified-clean cache/shadow data of unmounted repositories and ask
+    /// mounted managed hosts to evict published payloads. Never removes data
+    /// that is not safely recoverable.
+    pub fn enforce_disk_floors(&self) -> Result<(), MirageError> {
+        self.enforce_disk_floors_with(|path| disk_space::query(path).map(|s| s.available_bytes))
+    }
+
+    /// The probe reports available bytes on the volume; injectable for tests.
+    #[doc(hidden)]
+    pub fn enforce_disk_floors_with(
+        &self,
+        probe: impl Fn(&Path) -> Result<u64, MirageError>,
+    ) -> Result<(), MirageError> {
+        for floor in self.database.disk_floors()? {
+            let Ok(free_bytes) = probe(Path::new(&floor.volume_root)) else {
+                continue;
+            };
+            let Some(mut target) =
+                disk_floor::reclaim_target(free_bytes, floor.floor_bytes, floor.hysteresis_bytes)
+            else {
+                continue;
+            };
+            let mut freed = 0_u64;
+            for repository in self.repositories()? {
+                if freed >= target {
+                    break;
+                }
+                if repository.state == RepositoryState::ReadyMounted {
+                    // The managed journal lives under the service state root;
+                    // only hosts whose journal volume matches may evict.
+                    let state_root = runtime::service_state_root(&self.database)?;
+                    if disk_space::volume_root_of(&state_root).ok().as_deref()
+                        != Some(floor.volume_root.as_str())
+                    {
+                        continue;
+                    }
+                    if let Ok(bytes) = self
+                        .mounts
+                        .lock()
+                        .map_err(|_| {
+                            MirageError::internal_invariant("mount coordinator lock poisoned")
+                        })?
+                        .request_eviction(repository.repository_id, target - freed)
+                    {
+                        freed += bytes;
+                    }
+                    continue;
+                }
+                let Some(native_root) = self
+                    .database
+                    .load_repository_root(repository.repository_id)?
+                else {
+                    continue;
+                };
+                if disk_space::volume_root_of(&native_root).ok().as_deref()
+                    != Some(floor.volume_root.as_str())
+                {
+                    continue;
+                }
+                if let Ok(source) = capacity::RepositoryCapacitySource::open(
+                    &self.database,
+                    repository.repository_id,
+                    None,
+                ) {
+                    freed += source.reclaim_up_to(target - freed).unwrap_or(0);
+                }
+            }
+            let outcome = if freed >= target {
+                "ok"
+            } else {
+                "insufficient_evictable"
+            };
+            eprintln!(
+                "disk floor breached on {}: free={} floor={} freed={} outcome={outcome}",
+                floor.volume_root, free_bytes, floor.floor_bytes, freed,
+            );
+            self.database
+                .record_disk_floor_run(mirage_db::DiskFloorRun {
+                    volume_root: floor.volume_root.clone(),
+                    at_ns: now_ns(),
+                    target_bytes: target,
+                    freed_bytes: freed,
+                    outcome: outcome.to_owned(),
+                })?;
+            let _ = &mut target;
+        }
+        Ok(())
     }
 
     fn unmount(&self, repository_id: RepositoryId) -> Result<ResponseBody, MirageError> {
@@ -1309,6 +1525,9 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::Cancel { repository_id, .. } => Some(*repository_id),
         Command::Status
         | Command::RepositoryList
+        | Command::DiskFloorSet { .. }
+        | Command::DiskFloorClear { .. }
+        | Command::DiskStatus
         | Command::RepositoryRegister { .. }
         | Command::RepositoryAdopt { .. } => None,
     }
@@ -1321,6 +1540,17 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
 /// root. Only meaningful for a managed volume on the Drive origin; both files
 /// must exist or the mount proceeds without a provider (non-resident reads
 /// fail unavailable until a token-bearing remount).
+/// The configured disk floor for the volume holding the service state root
+/// (where managed journals live), if any.
+fn state_root_disk_floor(database: &Database) -> Option<u64> {
+    let state_root = runtime::service_state_root(database).ok()?;
+    let root = disk_space::volume_root_of(&state_root).ok()?;
+    database
+        .disk_floor(&root)
+        .ok()?
+        .map(|floor| floor.floor_bytes)
+}
+
 fn drive_provider_paths(
     database: &Database,
     repository_id: RepositoryId,

@@ -53,6 +53,7 @@ fn spec() -> HostSpec {
         managed: false,
         drive_manifest: None,
         repository_key: None,
+        disk_floor: None,
     }
 }
 
@@ -118,4 +119,75 @@ fn send_line_writes_to_the_live_hosts_stdin() {
     // A stopped host rejects further control writes.
     assert_eq!(supervisor.stop(&id).unwrap(), HostState::Stopped);
     assert!(supervisor.send_line(&id, "TOKEN later").is_err());
+}
+
+#[test]
+fn request_eviction_parses_mirage_evicted_and_times_out() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct EvictChild {
+        replies: mpsc::Receiver<String>,
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+    impl ManagedChild for EvictChild {
+        fn wait_ready(&mut self, _: Duration) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn try_exit(&mut self) -> io::Result<Option<HostExit>> {
+            Ok(None)
+        }
+        fn send_line(&mut self, line: &str) -> io::Result<()> {
+            self.lines.lock().unwrap().push(line.to_owned());
+            Ok(())
+        }
+        fn read_stdout_line(&mut self, timeout: Duration) -> io::Result<String> {
+            self.replies
+                .recv_timeout(timeout)
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no reply"))
+        }
+        fn stop(&mut self) -> io::Result<HostExit> {
+            Ok(HostExit {
+                success: true,
+                code: Some(0),
+            })
+        }
+    }
+    struct EvictLauncher {
+        lines: Arc<Mutex<Vec<String>>>,
+        reply_tx: Arc<Mutex<mpsc::Sender<String>>>,
+    }
+    impl Launcher for EvictLauncher {
+        type Child = EvictChild;
+        fn launch(&self, _: &HostSpec) -> io::Result<EvictChild> {
+            let (tx, rx) = mpsc::channel();
+            *self.reply_tx.lock().unwrap() = tx;
+            Ok(EvictChild {
+                replies: rx,
+                lines: Arc::clone(&self.lines),
+            })
+        }
+    }
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let reply_tx = Arc::new(Mutex::new(mpsc::channel().0));
+    let mut supervisor = Supervisor::new(EvictLauncher {
+        lines: Arc::clone(&lines),
+        reply_tx: Arc::clone(&reply_tx),
+    });
+    let id = HostId::new("evict").unwrap();
+    supervisor.start(id.clone(), &spec()).unwrap();
+
+    let responder = reply_tx.lock().unwrap().clone();
+    responder.send("unrelated".to_owned()).unwrap();
+    responder.send("MIRAGE_EVICTED 4096".to_owned()).unwrap();
+    let freed = supervisor
+        .request_eviction(&id, 8192, Duration::from_secs(5))
+        .expect("eviction reply");
+    assert_eq!(freed, 4096);
+    assert_eq!(*lines.lock().unwrap(), vec!["EVICT 8192"]);
+
+    // No reply queued → timeout error.
+    let timeout = supervisor.request_eviction(&id, 1, Duration::from_millis(150));
+    assert_eq!(timeout.unwrap_err().kind(), io::ErrorKind::TimedOut);
 }

@@ -320,6 +320,44 @@ impl RepositoryCapacitySource {
         })
     }
 
+    /// Reclaimable bytes split into cache-page and Drive-shadow/native-backup
+    /// buckets; used by disk-floor status and reclaim ticks.
+    pub(crate) fn evictable_breakdown(&self) -> Result<(u64, u64), MirageError> {
+        let mut cache_pages = 0_u64;
+        let mut shadow_packs = 0_u64;
+        for candidate in self.reclaim_candidates()? {
+            if !candidate.reclaimable() {
+                continue;
+            }
+            match self.reclaim_units.get(&candidate.reclaim_id) {
+                Some(ReclaimUnit::CachePage(_)) => cache_pages += candidate.physical_bytes,
+                Some(ReclaimUnit::DriveShadowPack { .. } | ReclaimUnit::NativeBackup { .. }) => {
+                    shadow_packs += candidate.physical_bytes
+                }
+                None => {}
+            }
+        }
+        Ok((cache_pages, shadow_packs))
+    }
+
+    /// Reclaims verified-clean candidates LRU-first until `target` bytes are
+    /// freed or candidates are exhausted; returns bytes actually freed.
+    pub(crate) fn reclaim_up_to(&self, target: u64) -> Result<u64, MirageError> {
+        let mut candidates = self.reclaim_candidates()?;
+        candidates.retain(|candidate| candidate.reclaimable());
+        candidates.sort_by_key(|candidate| candidate.last_access_sequence);
+        let mut freed = 0_u64;
+        for candidate in candidates {
+            if freed >= target {
+                break;
+            }
+            if self.reclaim_verified_clean(candidate).is_ok() {
+                freed += candidate.physical_bytes;
+            }
+        }
+        Ok(freed)
+    }
+
     pub(crate) fn plan(&self, requested_bytes: u64) -> Result<SpaceLeasePlan, MirageError> {
         plan_space_lease(&self.capacity_snapshot()?, requested_bytes)
     }

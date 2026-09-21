@@ -533,9 +533,14 @@ impl MountControl for FakeMountControl {
         _: (u64, u64),
         _: bool,
         _: Option<(&Path, &Path)>,
+        _: Option<u64>,
     ) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("mount");
         Ok(())
+    }
+    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<u64, MirageError> {
+        self.calls.lock().unwrap().push("request_eviction");
+        Ok(0)
     }
     fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("send_drive_token");

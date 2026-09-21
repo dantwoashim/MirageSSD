@@ -8,6 +8,7 @@ mod config;
 mod db_check;
 mod device_backup;
 mod device_drive;
+mod disk;
 mod drive_gate;
 mod drive_live;
 mod recovery;
@@ -34,6 +35,11 @@ pub enum Command {
     Db {
         #[command(subcommand)]
         command: DbCommand,
+    },
+    /// Per-disk free-space floors enforced by evicting cloud-backed data.
+    Disk {
+        #[command(subcommand)]
+        command: DiskCommand,
     },
     /// Inspect or reconcile the local sparse cache.
     Cache {
@@ -613,6 +619,27 @@ pub enum RepoCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum DiskCommand {
+    /// Keep at least this many bytes free on the volume (e.g. `D: 150GiB`).
+    SetFloor {
+        /// Drive root such as `D:` or `D:\`.
+        volume_root: String,
+        /// Free-space floor, e.g. `150GiB` or plain bytes.
+        floor: String,
+        /// Extra headroom to restore past the floor (default: max(1 GiB, 5% of floor)).
+        #[arg(long)]
+        hysteresis: Option<String>,
+    },
+    /// Remove the free-space floor from a volume.
+    ClearFloor {
+        /// Drive root such as `D:` or `D:\`.
+        volume_root: String,
+    },
+    /// Show free space, floor state, and the last reclaim run per volume.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum RecoveryCommand {
     /// Export an encrypted recovery envelope containing the repository content key.
     Export {
@@ -1122,6 +1149,26 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                     destination,
                 } => recovery::import(&envelope, &secret_file, &destination, json),
             },
+        },
+        Command::Disk { command } => match command {
+            DiskCommand::SetFloor {
+                volume_root,
+                floor,
+                hysteresis,
+            } => service::run(
+                mirage_ipc::Command::DiskFloorSet {
+                    volume_root,
+                    floor_bytes: disk::parse_byte_size(&floor)?,
+                    hysteresis_bytes: hysteresis
+                        .map(|value| disk::parse_byte_size(&value))
+                        .transpose()?,
+                },
+                json,
+            ),
+            DiskCommand::ClearFloor { volume_root } => {
+                service::run(mirage_ipc::Command::DiskFloorClear { volume_root }, json)
+            }
+            DiskCommand::Status => service::run(mirage_ipc::Command::DiskStatus, json),
         },
         Command::Profile { command } => match command {
             ProfileCommand::Configure {

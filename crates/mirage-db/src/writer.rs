@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use crate::cache::{
     self, CacheShardSpec, CacheSlotRecord, CommitCacheSlotOutcome, ReserveCacheSlotOutcome,
 };
+use crate::disk_floor::{self, DiskFloor, DiskFloorRun};
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
 use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
@@ -65,6 +66,9 @@ enum Command {
     MarkSealViolation(SealViolation, Reply<u64>),
     FinishSession(FinishSession, Reply<()>),
     CreateSpaceLease(NewSpaceLease, Reply<()>),
+    DiskFloorSet(DiskFloor, Reply<()>),
+    DiskFloorClear(String, Reply<bool>),
+    DiskFloorRecordRun(DiskFloorRun, Reply<()>),
     TransitionSpaceLease(SpaceLeaseTransition, Reply<SpaceLeaseState>),
     CreateNamespaceVolume(RepositoryId, i64, Reply<InodeId>),
     NamespaceCreate(
@@ -314,6 +318,15 @@ impl DbWriter {
                         }
                         Command::FinishSession(value, reply) => {
                             respond(reply, session::finish(&mut connection, value));
+                        }
+                        Command::DiskFloorSet(value, reply) => {
+                            respond(reply, disk_floor::set_floor(&mut connection, value));
+                        }
+                        Command::DiskFloorClear(root, reply) => {
+                            respond(reply, disk_floor::clear_floor(&mut connection, &root));
+                        }
+                        Command::DiskFloorRecordRun(value, reply) => {
+                            respond(reply, disk_floor::record_run(&mut connection, value));
                         }
                         Command::CreateSpaceLease(value, reply) => {
                             respond(reply, space_lease::create(&mut connection, value));
@@ -882,6 +895,18 @@ impl DbWriter {
 
     pub(crate) fn finish_session(&self, value: FinishSession) -> Result<(), MirageError> {
         self.request(|reply| Command::FinishSession(value, reply))
+    }
+
+    pub(crate) fn disk_floor_set(&self, floor: DiskFloor) -> Result<(), MirageError> {
+        self.request(|reply| Command::DiskFloorSet(floor, reply))
+    }
+
+    pub(crate) fn disk_floor_clear(&self, volume_root: String) -> Result<bool, MirageError> {
+        self.request(|reply| Command::DiskFloorClear(volume_root, reply))
+    }
+
+    pub(crate) fn disk_floor_record_run(&self, run: DiskFloorRun) -> Result<(), MirageError> {
+        self.request(|reply| Command::DiskFloorRecordRun(run, reply))
     }
 
     pub fn create_space_lease(&self, value: NewSpaceLease) -> Result<(), MirageError> {

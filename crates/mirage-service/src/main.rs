@@ -103,10 +103,26 @@ mod windows_service_host {
                 }
             }
         });
+        let floor_handler = Arc::clone(&handler);
+        let floor_stopping = Arc::clone(&stopping);
+        let floor_watchdog = thread::spawn(move || {
+            while !floor_stopping.load(Ordering::Acquire) {
+                if let Err(error) = floor_handler.enforce_disk_floors() {
+                    eprintln!("MirageSSD disk floor enforcement failed: {error}");
+                }
+                for _ in 0..300 {
+                    if floor_stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
         while !stopping.load(Ordering::Acquire) {
             let _ = serve_one(handler.as_ref());
         }
         let _ = mount_watchdog.join();
+        let _ = floor_watchdog.join();
         drop(handler);
 
         status.set_service_status(ServiceStatus {

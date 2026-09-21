@@ -132,6 +132,18 @@ pub enum Command {
     Unmount {
         repository_id: RepositoryId,
     },
+    /// Set or replace a per-volume free-space floor (normalized root, e.g. `D:\`).
+    DiskFloorSet {
+        volume_root: String,
+        floor_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hysteresis_bytes: Option<u64>,
+    },
+    DiskFloorClear {
+        volume_root: String,
+    },
+    /// Free space, floor state, and last reclaim outcome per configured volume.
+    DiskStatus,
     Profile {
         repository_id: RepositoryId,
         maximum_duration_seconds: u32,

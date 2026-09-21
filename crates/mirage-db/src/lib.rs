@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod disk_floor;
 mod error;
 pub mod extent;
 pub mod gc_bounds;
@@ -37,6 +38,7 @@ pub use cache::{
     CacheShardSpec, CacheSlotRecord, CacheSlotState, CacheSnapshot, CommitCacheSlotOutcome,
     ReserveCacheSlotOutcome, load_cache_snapshot,
 };
+pub use disk_floor::{DiskFloor, DiskFloorRun};
 pub use extent::{ByteExtent, ExtentKind};
 pub use gc_bounds::{GcBound, GcKind, UnreachableCandidate};
 pub use generation::{ActiveGeneration, VerifiedGeneration};

@@ -134,6 +134,11 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                0,
+            ))),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -217,6 +222,11 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                0,
+            ))),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -414,6 +424,11 @@ unsafe fn create_cache_impl(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                0,
+            ))),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -971,6 +986,11 @@ fn create_managed_impl(
             managed_provider,
             publisher,
             remote_payloads,
+            disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                0,
+            ))),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -1645,6 +1665,24 @@ pub unsafe extern "C" fn mirage_lookup(
             {
                 log.lookup(u64::from(ordinal), &path);
             }
+            // Register the open before the handle exists so share accounting,
+            // delete-pending, and published-payload eviction protection see it.
+            if let Some(inode) = namespace_inode
+                && engine
+                    .handles
+                    .open(
+                        inode,
+                        mirage_engine::handles::DesiredAccess {
+                            read: true,
+                            write: true,
+                            delete: true,
+                        },
+                        mirage_engine::handles::ShareAccess::ALL,
+                    )
+                    .is_err()
+            {
+                return MirageStatus::Conflict;
+            }
             // Index ordinals identify committed content; inode-derived ids
             // keep identity stable for namespace-only files across renames.
             let stable_index = node
@@ -1712,6 +1750,8 @@ pub unsafe extern "C" fn mirage_lookup(
                             .map(|provider| provider.prefetch()),
                         publisher: engine.publisher.clone(),
                         remote_payloads: engine.remote_payloads.clone(),
+                        disk_floor: engine.disk_floor.clone(),
+                        floor_free_cache: engine.floor_free_cache.clone(),
                         prefetch_state: Arc::new(handles::PrefetchState {
                             hashes: std::sync::OnceLock::new(),
                             last: AtomicI64::new(-1),
@@ -1725,8 +1765,8 @@ pub unsafe extern "C" fn mirage_lookup(
                         state_root: engine.state_root.clone(),
                         desired_access: mirage_engine::handles::DesiredAccess {
                             read: true,
-                            write: false,
-                            delete: false,
+                            write: true,
+                            delete: true,
                         },
                         share_access: mirage_engine::handles::ShareAccess::ALL,
                         managed: engine.managed,
@@ -1764,6 +1804,8 @@ pub unsafe extern "C" fn mirage_lookup(
                         .map(|provider| provider.prefetch()),
                     publisher: engine.publisher.clone(),
                     remote_payloads: engine.remote_payloads.clone(),
+                    disk_floor: engine.disk_floor.clone(),
+                    floor_free_cache: engine.floor_free_cache.clone(),
                     prefetch_state: Arc::new(handles::PrefetchState {
                         hashes: std::sync::OnceLock::new(),
                         last: AtomicI64::new(-1),
@@ -1777,8 +1819,8 @@ pub unsafe extern "C" fn mirage_lookup(
                     state_root: engine.state_root.clone(),
                     desired_access: mirage_engine::handles::DesiredAccess {
                         read: true,
-                        write: false,
-                        delete: false,
+                        write: true,
+                        delete: true,
                     },
                     share_access: mirage_engine::handles::ShareAccess::ALL,
                     managed: engine.managed,
@@ -2980,13 +3022,12 @@ pub unsafe extern "C" fn mirage_namespace_delete(
             Ok(None) => return MirageStatus::NotFound,
             Err(_) => return MirageStatus::IoError,
         };
-        // Open handles hold the entry as a delete-pending tombstone; the row
-        // survives until the last close re-issues the delete.
+        // Delete-pending semantics: the name unlinks now (the open-handle
+        // tombstone keeps identity for existing readers), and the last close
+        // finalizes — re-issuing the delete is then a harmless no-op.
         match engine.handles.request_delete(inode) {
-            Ok(mirage_engine::handles::DeleteDisposition::Pending) => {
-                return MirageStatus::Ok;
-            }
-            Ok(mirage_engine::handles::DeleteDisposition::Removed) => {}
+            Ok(mirage_engine::handles::DeleteDisposition::Pending)
+            | Ok(mirage_engine::handles::DeleteDisposition::Removed) => {}
             Err(_) => return MirageStatus::AccessDenied,
         }
         let parent = match resolve_parent(db, volume, &parent_path) {
@@ -3233,6 +3274,30 @@ pub unsafe extern "C" fn mirage_write(
             );
             if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
                 return MirageStatus::DiskFull;
+            }
+        }
+        // Real-disk floor: refuse to push the journal volume's actual free
+        // space below the configured floor; published payloads are evicted to
+        // Drive first, unpublished data is never touched.
+        let floor = handle.disk_floor.load(Ordering::Acquire);
+        if floor > 0 {
+            let free = floor_free_space(&handle.floor_free_cache, &journal_dir, false);
+            if free.is_some_and(|free| free < length.saturating_add(floor)) {
+                let deficit = floor
+                    .saturating_add(length)
+                    .saturating_sub(free.unwrap_or(0));
+                let _ = publisher::evict_published(
+                    db,
+                    dirty,
+                    &journal_dir,
+                    volume,
+                    &handle.handles,
+                    length.max(deficit),
+                );
+                let free = floor_free_space(&handle.floor_free_cache, &journal_dir, true);
+                if free.is_some_and(|free| free < length.saturating_add(floor)) {
+                    return MirageStatus::DiskFull;
+                }
             }
         }
         let mut payload_id = [0_u8; 16];
@@ -3535,4 +3600,104 @@ unsafe fn read_via_extents(
     }
     unsafe { *transferred = (covered_end - offset) as usize };
     MirageStatus::Ok
+}
+
+/// Free bytes on the volume holding `path`, read through a 1-second cache
+/// unless `force` refreshes it after an eviction pass.
+fn floor_free_space(
+    cache_cell: &std::sync::Mutex<(std::time::Instant, u64)>,
+    journal_dir: &Path,
+    force: bool,
+) -> Option<u64> {
+    if let Ok(cache) = cache_cell.lock()
+        && !force
+        && cache.0.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return Some(cache.1);
+    }
+    let free = volume_free_bytes(journal_dir)?;
+    if let Ok(mut cache) = cache_cell.lock() {
+        *cache = (std::time::Instant::now(), free);
+    }
+    Some(free)
+}
+
+#[cfg(windows)]
+fn volume_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0_u64;
+    let mut total = 0_u64;
+    let mut total_free = 0_u64;
+    // SAFETY: NUL-terminated input; all output pointers are valid and unique.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(windows))]
+fn volume_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Configures the write-admission free-space floor for a managed engine
+/// (the `--floor` host argument; 0 disables).
+/// # Safety
+/// `engine` must be a live handle from `mirage_engine_create_*` or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_set_disk_floor(
+    engine: *mut MirageEngineHandle,
+    floor_bytes: u64,
+) -> MirageStatus {
+    let Some(handle) = (unsafe { engine.as_ref() }) else {
+        return MirageStatus::InvalidArgument;
+    };
+    handle
+        .disk_floor
+        .store(floor_bytes, std::sync::atomic::Ordering::Release);
+    MirageStatus::Ok
+}
+
+/// `EVICT <bytes>` control command on the host's stdin: evicts published
+/// payloads oldest-first and reports the freed journal bytes. Only payloads
+/// already published remotely are candidates; dirty data is never removed.
+/// # Safety
+/// `engine` must be a live handle from `mirage_engine_create_*` or null;
+/// `freed_bytes` must be a valid writable `u64` or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_evict_published(
+    engine: *mut MirageEngineHandle,
+    target_bytes: u64,
+    freed_bytes: *mut u64,
+) -> MirageStatus {
+    let Some(handle) = (unsafe { engine.as_ref() }) else {
+        return MirageStatus::InvalidArgument;
+    };
+    let (Some(db), Some(dirty), Some(state_root), Some(volume)) = (
+        handle.db.as_ref(),
+        handle.dirty.as_ref(),
+        handle.state_root.as_ref(),
+        handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id),
+    ) else {
+        return MirageStatus::InvalidArgument;
+    };
+    match publisher::evict_published(
+        db,
+        dirty,
+        &state_root.join("journal"),
+        volume,
+        &handle.handles,
+        target_bytes,
+    ) {
+        Ok(freed) => {
+            if let Some(out) = unsafe { freed_bytes.as_mut() } {
+                *out = freed;
+            }
+            MirageStatus::Ok
+        }
+        Err(_) => MirageStatus::IoError,
+    }
 }

@@ -20,6 +20,10 @@ MirageStatus mirage_engine_create_managed(const uint16_t *index_path,size_t inde
 MirageStatus mirage_engine_create_managed_drive(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,const uint16_t *object_root,size_t object_root_len,uint64_t dirty_budget_bytes,const uint16_t *drive_manifest_path,size_t drive_manifest_len,const uint16_t *repository_key_path,size_t repository_key_len,MirageEngineHandle **output);
 /* Supplies or rotates the Drive bearer token for a managed engine; the first call installs the page provider. Token bytes are never logged. */
 MirageStatus mirage_engine_set_drive_token(MirageEngineHandle *engine,const uint8_t *token,size_t token_len);
+/* Write-admission free-space floor for the journal volume (--floor; 0 disables). */
+MirageStatus mirage_engine_set_disk_floor(MirageEngineHandle *engine,uint64_t floor_bytes);
+/* EVICT <bytes> stdin command: evicts published payloads oldest-first. */
+MirageStatus mirage_engine_evict_published(MirageEngineHandle *engine,uint64_t target_bytes,uint64_t *freed_bytes);
 /* Remaining dirty-payload budget for a managed volume; legacy engines report their configured free space is unavailable. */
 MirageStatus mirage_engine_dirty_free(const MirageEngineHandle *engine,uint64_t *output);
 /* Payload publication counters for a managed volume. */

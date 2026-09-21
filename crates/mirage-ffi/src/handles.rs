@@ -265,6 +265,12 @@ pub struct MirageEngineHandle {
     pub publisher: Option<Arc<crate::publisher::Publisher>>,
     /// Evicted-payload fetch state: backend + key + bounded frame cache.
     pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
+    /// Write-admission free-space floor for the journal volume (`--floor`;
+    /// 0 disables). Writes fail DiskFull rather than breach it when nothing
+    /// published remains evictable.
+    pub disk_floor: Arc<AtomicU64>,
+    /// 1-second cached free-space reading of the journal volume.
+    pub floor_free_cache: Arc<Mutex<(std::time::Instant, u64)>>,
 }
 
 /// A page provider waiting for its first credential: the coordinator's
@@ -421,6 +427,10 @@ pub struct MirageFileHandle {
     pub prefetch: Option<Arc<dyn Fn(PageHash) + Send + Sync>>,
     /// Flush-time publisher wake: shared engine publisher, managed volumes only.
     pub publisher: Option<Arc<crate::publisher::Publisher>>,
+    /// Write-admission free-space floor shared with the engine (`--floor`).
+    pub disk_floor: Arc<AtomicU64>,
+    /// 1-second cached free-space reading of the journal volume.
+    pub floor_free_cache: Arc<Mutex<(std::time::Instant, u64)>>,
     /// Remote fetch for evicted payloads (published dirty extents whose local
     /// file was reclaimed).
     pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
@@ -480,6 +490,11 @@ impl MirageEngineHandle {
             dirty: None,
             publisher: None,
             remote_payloads: None,
+            disk_floor: Arc::new(AtomicU64::new(0)),
+            floor_free_cache: Arc::new(Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                0,
+            ))),
         }
     }
     /// Owner-side origin decodes performed by this engine.
