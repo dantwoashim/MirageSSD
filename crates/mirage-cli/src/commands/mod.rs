@@ -41,6 +41,25 @@ pub enum Command {
         #[command(subcommand)]
         command: DiskCommand,
     },
+    /// Pin a namespace path so its data is never evicted by reclaim.
+    Pin {
+        /// Repository id (hex) of the managed volume.
+        repository_id: mirage_types::RepositoryId,
+        /// Mount-relative path, e.g. `games/saves` or `/games/saves`.
+        path: String,
+    },
+    /// Remove a pin previously set with `mirage pin`.
+    Unpin {
+        /// Repository id (hex) of the managed volume.
+        repository_id: mirage_types::RepositoryId,
+        /// Mount-relative path.
+        path: String,
+    },
+    /// List pinned paths of a repository.
+    Pins {
+        /// Repository id (hex) of the managed volume.
+        repository_id: mirage_types::RepositoryId,
+    },
     /// Inspect or reconcile the local sparse cache.
     Cache {
         #[command(subcommand)]
@@ -1170,6 +1189,29 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             }
             DiskCommand::Status => service::run(mirage_ipc::Command::DiskStatus, json),
         },
+        Command::Pin {
+            repository_id,
+            path,
+        } => service::run(
+            mirage_ipc::Command::NamespacePin {
+                repository_id,
+                path,
+            },
+            json,
+        ),
+        Command::Unpin {
+            repository_id,
+            path,
+        } => service::run(
+            mirage_ipc::Command::NamespaceUnpin {
+                repository_id,
+                path,
+            },
+            json,
+        ),
+        Command::Pins { repository_id } => {
+            service::run(mirage_ipc::Command::NamespacePins { repository_id }, json)
+        }
         Command::Profile { command } => match command {
             ProfileCommand::Configure {
                 repository_id,

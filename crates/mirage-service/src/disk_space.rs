@@ -149,9 +149,15 @@ pub(crate) fn volume_root_of(path: &Path) -> Result<String, MirageError> {
         .iter()
         .position(|v| *v == 0)
         .ok_or_else(|| MirageError::integrity_mismatch("volume path is not NUL-terminated"))?;
-    String::from_utf16(&volume_path[..len])
-        .map(|root| root.to_ascii_uppercase())
-        .map_err(|_| MirageError::integrity_mismatch("volume path is not valid UTF-16"))
+    let root = String::from_utf16(&volume_path[..len])
+        .map_err(|_| MirageError::integrity_mismatch("volume path is not valid UTF-16"))?;
+    // GetVolumePathNameW preserves the verbatim `\\?\` prefix that
+    // canonicalize() introduces; disk-floor rows store the plain `C:\` form.
+    let root = root
+        .strip_prefix("\\\\?\\")
+        .map(str::to_owned)
+        .unwrap_or(root);
+    Ok(root.to_ascii_uppercase())
 }
 
 #[cfg(not(windows))]

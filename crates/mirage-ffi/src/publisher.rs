@@ -410,9 +410,33 @@ fn now_ns_i64_pub() -> i64 {
         .unwrap_or(0)
 }
 
+/// True when `inode` is pinned itself or sits under a pinned directory;
+/// ancestors resolve live through `dirents` so a pin on a directory covers
+/// children created after the pin.
+pub fn pin_held(
+    db: &Database,
+    volume: RepositoryId,
+    inode: mirage_types::InodeId,
+    pins: &std::collections::HashSet<mirage_types::InodeId>,
+) -> bool {
+    let mut current = inode;
+    for _ in 0..128 {
+        if pins.contains(&current) {
+            return true;
+        }
+        match db.namespace_entry(volume, current) {
+            Ok(Some((parent, _))) => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Evicts published payload files until `target` plaintext bytes are freed.
-/// Each payload is skipped when any inode referencing it has an open handle.
-/// The extent is marked dead inside the writer transaction and the file is
+/// Returns `(freed, pinned_blocked)`: payloads skipped solely because a pin
+/// covers one of their inodes accumulate into `pinned_blocked`. Each payload
+/// is also skipped when an inode referencing it has an open handle. The
+/// extent is marked dead inside the writer transaction and the file is
 /// deleted only after the ledger commit — a crash leaves either a live file
 /// or a dead extent with a fetchable remote object.
 pub fn evict_published(
@@ -421,15 +445,24 @@ pub fn evict_published(
     journal_dir: &std::path::Path,
     volume: RepositoryId,
     handles: &mirage_engine::handles::HandleTable,
+    pins: &std::collections::HashSet<mirage_types::InodeId>,
     target: u64,
-) -> Result<u64, MirageError> {
+) -> Result<(u64, u64), MirageError> {
     let evictable = db.published_payloads_evictable(volume)?;
     let mut freed = 0_u64;
+    let mut pinned_blocked = 0_u64;
     for (payload_id, plaintext_length, _published_ns) in evictable {
         if freed >= target {
             break;
         }
         let inodes = db.payload_inodes(volume, &payload_id)?;
+        if inodes
+            .iter()
+            .any(|inode| pin_held(db, volume, *inode, pins))
+        {
+            pinned_blocked += u64::try_from(plaintext_length).unwrap_or(0);
+            continue;
+        }
         if inodes.iter().any(|inode| handles.is_open(*inode)) {
             continue;
         }
@@ -456,7 +489,7 @@ pub fn evict_published(
             });
         freed += length;
     }
-    Ok(freed)
+    Ok((freed, pinned_blocked))
 }
 
 /// Remote fetch support for evicted payloads: a bounded in-memory cache of
@@ -475,6 +508,9 @@ pub struct RemotePayloadStore {
     flights: FrameFlights,
     /// Bounded publication-record cache: payload_id → Option<record>.
     publications: PublicationCache,
+    /// Payloads currently being re-staged to disk; dedupes concurrent reads
+    /// so one cold open does one fetch+write.
+    restaging: Mutex<std::collections::BTreeSet<[u8; 16]>>,
 }
 
 type FrameCache = Mutex<(std::collections::HashMap<([u8; 16], u64), Vec<u8>>, u64)>;
@@ -516,6 +552,7 @@ impl RemotePayloadStore {
             frames: Mutex::new((std::collections::HashMap::new(), 0)),
             flights: Mutex::new(std::collections::BTreeMap::new()),
             publications: Mutex::new(std::collections::HashMap::new()),
+            restaging: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -716,6 +753,68 @@ impl RemotePayloadStore {
             out.extend_from_slice(&plaintext[take_start..take_end]);
         }
         Ok(Some(out))
+    }
+
+    /// Full verified plaintext of an evicted payload plus its record, for
+    /// re-staging the local file. `None` when no publication row exists.
+    pub fn fetch_whole(
+        &self,
+        db: &Database,
+        volume: RepositoryId,
+        payload_id: &[u8; 16],
+    ) -> Result<Option<WholePayload>, MirageError> {
+        let Some(record) = self.publication(db, volume, payload_id)? else {
+            return Ok(None);
+        };
+        let length = usize::try_from(record.plaintext_length)
+            .map_err(|_| MirageError::integrity_mismatch("published payload length overflows"))?;
+        let bytes = self
+            .read(db, volume, payload_id, 0, length)?
+            .ok_or_else(|| MirageError::integrity_mismatch("publication vanished mid-read"))?;
+        if bytes.len() != length {
+            return Err(MirageError::integrity_mismatch(
+                "published payload fetched short",
+            ));
+        }
+        if blake3::hash(&bytes).as_bytes() != &record.plaintext_hash {
+            return Err(MirageError::integrity_mismatch(
+                "restaged payload failed whole-object verification",
+            ));
+        }
+        Ok(Some(WholePayload { bytes, record }))
+    }
+
+    /// Claims the re-stage slot for a payload; `None` while another reader
+    /// is already re-staging it.
+    pub fn begin_restage(&self, payload_id: &[u8; 16]) -> Option<RestageGuard<'_>> {
+        let mut guard = self.restaging.lock().ok()?;
+        if !guard.insert(*payload_id) {
+            return None;
+        }
+        Some(RestageGuard {
+            store: self,
+            payload_id: *payload_id,
+        })
+    }
+}
+
+/// Decrypted, hash-verified bytes of an evicted payload plus its
+/// publication record, for atomic re-staging into the journal.
+pub struct WholePayload {
+    pub bytes: Vec<u8>,
+    pub record: Arc<mirage_db::payload_remote::PayloadRemoteObject>,
+}
+
+/// RAII release for a claimed re-stage slot.
+pub struct RestageGuard<'a> {
+    store: &'a RemotePayloadStore,
+    payload_id: [u8; 16],
+}
+impl Drop for RestageGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.store.restaging.lock() {
+            set.remove(&self.payload_id);
+        }
     }
 }
 

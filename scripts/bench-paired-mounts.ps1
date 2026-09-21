@@ -1,7 +1,14 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$ManagedRoot,
-  [Parameter(Mandatory)][string]$RcloneRoot,
+  [string]$RcloneRoot,   # mandatory for the hot paired mode
+  [switch]$ColdManaged,
+  # Journal directory of the managed host; its *.payload files are deleted
+  # before every cold run so each measurement starts remote-only.
+  [string]$JournalDir,
+  # Mount-relative paths of the three cold files (100 KiB / 5 MiB / 50 MiB).
+  [string[]]$ColdFiles = @(),
+  [int]$ColdRuns = 5,
   [int]$Iterations = 10,
   [int]$SmallFiles = 200,
   [int]$SmallBytes = 4096,
@@ -19,6 +26,70 @@ param(
 # accuracy column is measured, not assumed. Results are medians with IQR;
 # a single host with N=10 is indicative evidence only, not qualification.
 $ErrorActionPreference = 'Stop'
+
+# Cold-managed mode: measures first-open-to-first-byte and full sequential
+# read for files whose journal payloads are remote-only (evicted to the
+# backend). Each run deletes the journal payload files first so the host
+# must fetch — and re-stage, per the Phase-2 restage — from the backend.
+if ($ColdManaged) {
+  if (-not $JournalDir -or -not $ColdFiles.Count) { throw '-ColdManaged needs -JournalDir and -ColdFiles' }
+  $ColdFiles = @($ColdFiles | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+  $coldRows = @()
+  foreach ($rel in $ColdFiles) {
+    $path = Join-Path $ManagedRoot $rel
+    $size = (Get-Item -LiteralPath $path).Length
+    for ($run = 1; $run -le $ColdRuns; $run++) {
+      Remove-Item -LiteralPath (Join-Path $JournalDir '*.payload') -Force -ErrorAction SilentlyContinue
+      $firstByteMs = 0.0; $readMs = 0.0; $bytesRead = 0L
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+      try {
+        $one = $stream.ReadByte()
+        $firstByteMs = $sw.Elapsed.TotalMilliseconds
+        if ($one -ge 0) { $bytesRead = 1 }
+        $buf = [byte[]]::new(1MB)
+        while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) { $bytesRead += $n }
+      } finally { $stream.Dispose() }
+      $readMs = $sw.Elapsed.TotalMilliseconds
+      $coldRows += [pscustomobject]@{
+        file = $rel; size_bytes = $size; run = $run
+        first_byte_ms = $firstByteMs; full_read_ms = $readMs
+        bytes_read = $bytesRead; read_MBps = [math]::Round($bytesRead / 1MB / ($readMs / 1000), 1)
+      }
+      Write-Host ("cold {0} run {1}: first-byte {2:N1} ms, read {3:N1} ms" -f $rel, $run, $firstByteMs, $readMs)
+    }
+  }
+  function Median([double[]]$Values) {
+    $s = @($Values | Sort-Object)
+    if (-not $s.Count) { return $null }
+    return $s[[math]::Floor(($s.Count - 1) / 2)]
+  }
+  $coldSummary = @()
+  foreach ($rel in $ColdFiles) {
+    $rows = @($coldRows | Where-Object file -eq $rel)
+    $coldSummary += [ordered]@{
+      file = $rel; size_bytes = $rows[0].size_bytes
+      first_byte_ms_median = Median ($rows | ForEach-Object { $_.first_byte_ms })
+      full_read_ms_median = Median ($rows | ForEach-Object { $_.full_read_ms })
+      read_MBps_median = Median ($rows | ForEach-Object { $_.read_MBps })
+      runs = $rows.Count
+    }
+  }
+  $coldReport = [ordered]@{
+    report_version = 1; mode = 'cold-managed'; host = $env:COMPUTERNAME
+    completed_utc = [DateTime]::UtcNow.ToString('o')
+    caveats = @('Cold = journal payload files deleted before each run; host fetches+restages from the backend.',
+                'First-byte includes open + backend fetch of the covering frames; full read includes restage.')
+    summary = $coldSummary
+    runs = $coldRows
+  }
+  New-Item -ItemType Directory -Force -Path (Split-Path $Output) | Out-Null
+  $coldReport | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Output -Encoding UTF8
+  $coldReport.summary | ConvertTo-Json -Depth 4
+  exit 0
+}
+
+if (-not $RcloneRoot) { throw '-RcloneRoot is required for the paired hot benchmark' }
 $rng = [Random]::new($Seed)
 $sha = [Security.Cryptography.SHA256]::Create()
 

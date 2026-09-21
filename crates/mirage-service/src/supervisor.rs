@@ -410,14 +410,15 @@ impl<L: Launcher> Supervisor<L> {
             .unwrap_or_default()
     }
 
-    /// Sends `EVICT <bytes>` and waits for `MIRAGE_EVICTED <freed>` on the
-    /// host's stdout; other lines are skipped until the reply or timeout.
+    /// Sends `EVICT <bytes>` and waits for `MIRAGE_EVICTED <freed>
+    /// [<blocked>]` on the host's stdout; other lines are skipped until the
+    /// reply or timeout. `blocked` counts bytes skipped solely for pins.
     pub fn request_eviction(
         &mut self,
         id: &HostId,
         bytes: u64,
         timeout: Duration,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, u64)> {
         self.send_line(id, &format!("EVICT {bytes}"))?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -431,11 +432,22 @@ impl<L: Launcher> Supervisor<L> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown host"))?
                 .read_stdout_line(remaining)?;
             if let Some(rest) = line.strip_prefix("MIRAGE_EVICTED ") {
-                return rest.trim().parse::<u64>().map_err(|_| {
+                let mut parts = rest.split_whitespace();
+                let freed = parts.next().and_then(|v| v.parse::<u64>().ok());
+                let blocked = parts
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                return freed.map(|freed| (freed, blocked)).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed MIRAGE_EVICTED reply")
                 });
             }
         }
+    }
+
+    /// Asks a running host to reload its pinned-inode set after a pin change.
+    pub fn reload_pins(&mut self, id: &HostId) -> io::Result<()> {
+        self.send_line(id, "PINS-RELOAD")
     }
 
     pub fn send_line(&mut self, id: &HostId, line: &str) -> io::Result<()> {

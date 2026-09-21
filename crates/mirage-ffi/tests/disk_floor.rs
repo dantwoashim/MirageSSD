@@ -183,7 +183,8 @@ fn payload_names(journal_dir: &Path) -> Vec<String> {
 
 fn evict(engine: *mut MirageEngineHandle, target: u64) -> (MirageStatus, u64) {
     let mut freed = 0u64;
-    let status = unsafe { mirage_engine_evict_published(engine, target, &mut freed) };
+    let mut blocked = 0u64;
+    let status = unsafe { mirage_engine_evict_published(engine, target, &mut freed, &mut blocked) };
     (status, freed)
 }
 
@@ -356,5 +357,159 @@ fn breached_floor_evicts_published_then_admits() {
     let (status, bytes) = read_path(engine, "published.bin", 2 * 1024 * 1024);
     assert_eq!(status, MirageStatus::Ok);
     assert!(bytes.iter().all(|b| *b == 0x55));
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+fn control_db(state_root: &Path) -> mirage_db::Database {
+    mirage_db::Database::open(&state_root.join("control.db")).expect("control db")
+}
+
+fn volume_id() -> RepositoryId {
+    RepositoryId::from_bytes([9; 16])
+}
+
+#[test]
+fn pinned_directory_protects_its_payloads_until_unpinned() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    // keep/ directory gets a pinned payload; free.bin does not.
+    let dir16 = utf16("keep");
+    assert_eq!(
+        unsafe { mirage_namespace_create(engine, dir16.as_ptr(), dir16.len(), 1) },
+        MirageStatus::Ok
+    );
+    create_write(engine, "keep/a.bin", &vec![0x77; 256 * 1024]);
+    create_write(engine, "free.bin", &vec![0x88; 256 * 1024]);
+    wait_for(engine, |s| s.published_payloads >= 2);
+
+    // Pin the directory through the durable pin table, then refresh the
+    // host-side set the way PINS-RELOAD does.
+    let db = control_db(state.path());
+    let keep_inode = db
+        .namespace_resolve_components(volume_id(), &["keep".to_owned()])
+        .unwrap()
+        .expect("keep inode");
+    db.namespace_pin(volume_id(), keep_inode, 1).unwrap();
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_reload_pins(engine) },
+        MirageStatus::Ok
+    );
+
+    let mut freed = 0u64;
+    let mut blocked = 0u64;
+    assert_eq!(
+        unsafe { mirage_engine_evict_published(engine, u64::MAX, &mut freed, &mut blocked) },
+        MirageStatus::Ok
+    );
+    assert!(freed >= 256 * 1024, "freed={freed}");
+    assert!(blocked >= 256 * 1024, "blocked={blocked}");
+    // Exactly the pinned payload survives on disk.
+    assert_eq!(payload_names(&journal).len(), 1);
+    let (status, bytes) = read_path(engine, "keep/a.bin", 256 * 1024);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(bytes.iter().all(|b| *b == 0x77));
+
+    // Unpin → the payload becomes evictable again.
+    assert!(db.namespace_unpin(volume_id(), keep_inode).unwrap());
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_reload_pins(engine) },
+        MirageStatus::Ok
+    );
+    let (status, freed) = evict(engine, u64::MAX);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(freed >= 256 * 1024);
+    assert!(payload_names(&journal).is_empty());
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn evicted_payload_restages_on_read_within_budget() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    create_write(engine, "restage.bin", &vec![0x99; 256 * 1024]);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    let (status, freed) = evict(engine, u64::MAX);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(freed >= 256 * 1024);
+    assert!(payload_names(&journal).is_empty());
+
+    // First read re-stages the whole payload; bytes stay exact.
+    let (status, bytes) = read_path(engine, "restage.bin", 256 * 1024);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(bytes.iter().all(|b| *b == 0x99));
+    assert_eq!(
+        payload_names(&journal).len(),
+        1,
+        "evicted payload was not re-staged to the journal"
+    );
+    // The re-staged bytes count against the dirty ledger again.
+    let mut dirty_free = u64::MAX;
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_dirty_free(engine, &mut dirty_free) },
+        MirageStatus::Ok
+    );
+    assert_eq!(BUDGET - dirty_free, 256 * 1024);
+    // Second read still exact (served from the re-staged file).
+    let (status, bytes) = read_path(engine, "restage.bin", 256 * 1024);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(bytes.iter().all(|b| *b == 0x99));
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn restage_stays_transient_when_budget_cannot_admit() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    // A = 40 MiB published; B = 40 MiB unpublished pushes the 64 MiB budget
+    // into admission-eviction so A is remote-only with the budget nearly full.
+    create_write(engine, "a.bin", &vec![0xAB; 40 * 1024 * 1024]);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    create_write(engine, "b.bin", &vec![0xCD; 40 * 1024 * 1024]);
+    assert!(stats(engine).evicted_payloads >= 1);
+    assert_eq!(payload_names(&journal).len(), 1);
+
+    // Reading A must not re-stage: the ledger cannot admit another 40 MiB.
+    let (status, bytes) = read_path(engine, "a.bin", 4096);
+    assert_eq!(status, MirageStatus::Ok);
+    assert!(bytes.iter().all(|b| *b == 0xAB));
+    assert_eq!(
+        payload_names(&journal).len(),
+        1,
+        "budget-full restage must stay transient"
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn dead_extents_leave_the_unpublished_scan() {
+    // Ghost pending payloads: a file whose journal payload was released
+    // (extent dead, file deleted) can never publish — it must not keep the
+    // publisher's candidate list non-empty.
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    create_write(engine, "ghost.bin", &vec![0x44; 128 * 1024]);
+    let db = control_db(state.path());
+    let pending = db.unpublished_payloads(volume_id()).expect("pending");
+    assert_eq!(pending.len(), 1);
+    let payload_id = pending[0].payload_id;
+    db.writer()
+        .physical_mark_extent_dead(payload_id, 1)
+        .expect("mark dead");
+    assert!(
+        db.unpublished_payloads(volume_id())
+            .expect("pending after dead")
+            .is_empty(),
+        "dead-extent payload must leave the unpublished scan"
+    );
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }

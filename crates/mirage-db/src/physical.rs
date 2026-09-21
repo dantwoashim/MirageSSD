@@ -342,6 +342,82 @@ pub fn mark_extent_dead(
     Ok(())
 }
 
+/// Transitions a dead extent back to alive after its bytes were re-staged
+/// (e.g. an evicted published payload fetched from the backend and rewritten
+/// to disk). When the row is gone — compaction may have reaped it — a new
+/// alive extent is inserted under `file_id`/`slot_index`. An already-alive
+/// row is a no-op so concurrent re-stage attempts stay idempotent.
+#[allow(clippy::too_many_arguments)]
+pub fn revive_extent(
+    connection: &mut Connection,
+    extent_id: &[u8; 16],
+    file_id: &[u8; 16],
+    slot_index: i64,
+    length_bytes: i64,
+    page_hash: PageHash,
+    checksum: [u8; 32],
+    now_ns: i64,
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin physical revive"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE physical_extents
+             SET state = 'alive', page_hash = ?1, checksum = ?2,
+                 length_bytes = ?3, updated_ns = ?4
+             WHERE extent_id = ?5 AND state = 'dead'",
+            params![
+                page_hash.as_bytes().as_slice(),
+                checksum.as_slice(),
+                length_bytes,
+                now_ns,
+                extent_id.as_slice(),
+            ],
+        )
+        .map_err(|e| sqlite(e, "physical extent revive failed"))?;
+    if changed == 0 {
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM physical_extents WHERE extent_id = ?1",
+                [extent_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| sqlite(e, "physical extent lookup failed"))?;
+        match state.as_deref() {
+            Some("alive") => {}
+            None => {
+                transaction
+                    .execute(
+                        &format!(
+                            "INSERT INTO physical_extents({EXTENT_COLUMNS})
+                             VALUES (?1, ?2, ?3, ?4, 'alive', ?5, ?6, 0, 0, ?7)"
+                        ),
+                        params![
+                            extent_id.as_slice(),
+                            file_id.as_slice(),
+                            slot_index,
+                            length_bytes,
+                            page_hash.as_bytes().as_slice(),
+                            checksum.as_slice(),
+                            now_ns,
+                        ],
+                    )
+                    .map_err(|e| sqlite(e, "physical extent reinsert failed"))?;
+            }
+            Some(_) => {
+                return Err(MirageError::repository_conflict(
+                    "physical extent is not revivable",
+                ));
+            }
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "physical revive commit failed"))
+}
+
 /// Pins or unpins an extent; a nonzero pin count locks it against eviction.
 pub fn adjust_extent_pin(
     connection: &mut Connection,

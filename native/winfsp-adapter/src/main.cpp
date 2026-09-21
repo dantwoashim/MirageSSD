@@ -68,6 +68,8 @@ int wmain(int argc, wchar_t** argv) {
                 if (command.compare(0, 6, "TOKEN ") == 0) { host.set_drive_token(command.substr(6)); continue; }
                 // EVICT <bytes>: evict published payloads; reply MIRAGE_EVICTED <freed>.
                 if (command.compare(0, 6, "EVICT ") == 0) { host.request_eviction(command.substr(6)); continue; }
+                // PINS-RELOAD: refresh the pinned-inode set after pin/unpin.
+                if (command == "PINS-RELOAD") { mirage_engine_reload_pins(host.engine()); continue; }
                 if (!command.empty()) std::cerr << "ignoring unknown control command\n";
             }
         });

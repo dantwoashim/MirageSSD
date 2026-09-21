@@ -29,12 +29,15 @@ pub trait MountControl: Send {
         token: &str,
     ) -> Result<(), MirageError>;
     /// Asks a mounted managed host to evict published payloads, returning the
-    /// freed journal bytes reported by `MIRAGE_EVICTED` within 30 s.
+    /// `(freed, pinned_blocked)` journal bytes reported by `MIRAGE_EVICTED`
+    /// within 30 s.
     fn request_eviction(
         &mut self,
         repository_id: RepositoryId,
         bytes: u64,
-    ) -> Result<u64, MirageError>;
+    ) -> Result<(u64, u64), MirageError>;
+    /// Tells a mounted host to refresh its pinned-inode set.
+    fn reload_pins(&mut self, repository_id: RepositoryId) -> Result<(), MirageError>;
     fn unmount(&mut self, repository_id: RepositoryId) -> Result<(), MirageError>;
     fn is_running(&mut self, repository_id: RepositoryId) -> Result<bool, MirageError>;
 }
@@ -173,9 +176,15 @@ impl MountControl for NativeMountControl {
         &mut self,
         repository_id: RepositoryId,
         bytes: u64,
-    ) -> Result<u64, MirageError> {
+    ) -> Result<(u64, u64), MirageError> {
         self.supervisor
             .request_eviction(&host_id(repository_id)?, bytes, Duration::from_secs(30))
+            .map_err(io_error)
+    }
+
+    fn reload_pins(&mut self, repository_id: RepositoryId) -> Result<(), MirageError> {
+        self.supervisor
+            .reload_pins(&host_id(repository_id)?)
             .map_err(io_error)
     }
 
@@ -292,7 +301,12 @@ impl MountControl for UnavailableMountControl {
             "filesystem host is not configured",
         ))
     }
-    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<u64, MirageError> {
+    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<(u64, u64), MirageError> {
+        Err(MirageError::provider_unavailable(
+            "filesystem host is not configured",
+        ))
+    }
+    fn reload_pins(&mut self, _: RepositoryId) -> Result<(), MirageError> {
         Err(MirageError::provider_unavailable(
             "filesystem host is not configured",
         ))

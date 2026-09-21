@@ -23,7 +23,8 @@ MirageStatus mirage_engine_set_drive_token(MirageEngineHandle *engine,const uint
 /* Write-admission free-space floor for the journal volume (--floor; 0 disables). */
 MirageStatus mirage_engine_set_disk_floor(MirageEngineHandle *engine,uint64_t floor_bytes);
 /* EVICT <bytes> stdin command: evicts published payloads oldest-first. */
-MirageStatus mirage_engine_evict_published(MirageEngineHandle *engine,uint64_t target_bytes,uint64_t *freed_bytes);
+MirageStatus mirage_engine_evict_published(MirageEngineHandle *engine,uint64_t target_bytes,uint64_t *freed_bytes,uint64_t *blocked_bytes);
+MirageStatus mirage_engine_reload_pins(MirageEngineHandle *engine);
 /* Remaining dirty-payload budget for a managed volume; legacy engines report their configured free space is unavailable. */
 MirageStatus mirage_engine_dirty_free(const MirageEngineHandle *engine,uint64_t *output);
 /* Payload publication counters for a managed volume. */

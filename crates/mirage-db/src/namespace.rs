@@ -884,6 +884,42 @@ impl crate::Database {
             .namespace_delete(volume_id, parent, name, now_ns)
     }
 
+    /// Pins an inode (file or directory); descendants of a pinned directory
+    /// are protected from eviction.
+    pub fn namespace_pin(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        pinned_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.writer().namespace_pin(volume_id, inode, pinned_ns)
+    }
+
+    /// Removes a pin; `false` when the inode was not pinned.
+    pub fn namespace_unpin(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+    ) -> Result<bool, MirageError> {
+        self.writer().namespace_unpin(volume_id, inode)
+    }
+
+    /// Every pinned inode of the volume.
+    pub fn namespace_pins(&self, volume_id: RepositoryId) -> Result<Vec<InodeId>, MirageError> {
+        self.reads()
+            .with_connection(|connection| pins(connection, volume_id))
+    }
+
+    /// True when `inode` is pinned itself or under a pinned directory.
+    pub fn namespace_pin_held(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+    ) -> Result<bool, MirageError> {
+        self.reads()
+            .with_connection(|connection| pin_held(connection, volume_id, inode))
+    }
+
     pub fn namespace_set_file_roots(
         &self,
         volume_id: RepositoryId,
@@ -1223,6 +1259,94 @@ pub fn entry_of_child(
         .map_err(|e| sqlite(e, "namespace child entry lookup failed"))?
         .map(|(parent, name)| decode_inode(&parent).map(|inode| (inode, name)))
         .transpose()
+}
+
+// ---------------------------------------------------------------------------
+// Folder pinning (namespace_pins)
+// ---------------------------------------------------------------------------
+
+/// Pins an inode (file or directory); pinning a directory transitively
+/// protects its descendants at eviction time.
+pub fn pin(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+    pinned_ns: i64,
+) -> Result<(), MirageError> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO namespace_pins(volume_id, inode, pinned_ns)
+             VALUES (?1, ?2, ?3)",
+            params![
+                volume_id.as_bytes().as_slice(),
+                inode.as_bytes().as_slice(),
+                pinned_ns
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace pin insert failed"))?;
+    Ok(())
+}
+
+/// Removes a pin; `false` when the inode was not pinned.
+pub fn unpin(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+) -> Result<bool, MirageError> {
+    let changed = connection
+        .execute(
+            "DELETE FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
+            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+        )
+        .map_err(|e| sqlite(e, "namespace pin delete failed"))?;
+    Ok(changed == 1)
+}
+
+/// Every pinned inode of the volume.
+pub fn pins(connection: &Connection, volume_id: RepositoryId) -> Result<Vec<InodeId>, MirageError> {
+    connection
+        .prepare("SELECT inode FROM namespace_pins WHERE volume_id = ?1")
+        .map_err(|e| sqlite(e, "namespace pin scan prepare failed"))?
+        .query_map([volume_id.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(|e| sqlite(e, "namespace pin scan failed"))?
+        .collect::<Result<Vec<Vec<u8>>, _>>()
+        .map_err(|e| sqlite(e, "namespace pin row failed"))?
+        .iter()
+        .map(|bytes| decode_inode(bytes))
+        .collect()
+}
+
+/// True when `inode` is pinned itself or any ancestor directory is pinned.
+/// Walks dirents upward, bounded at 128 hops.
+pub fn pin_held(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+) -> Result<bool, MirageError> {
+    let mut current = inode;
+    for _ in 0..128 {
+        let pinned: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    current.as_bytes().as_slice()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| sqlite(e, "namespace pin check failed"))?;
+        if pinned.is_some() {
+            return Ok(true);
+        }
+        match entry_of_child(connection, volume_id, current)? {
+            Some((parent, _)) => current = parent,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------

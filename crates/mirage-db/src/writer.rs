@@ -79,6 +79,8 @@ enum Command {
         i64,
         Reply<DirEntry>,
     ),
+    NamespacePin(RepositoryId, InodeId, i64, Reply<()>),
+    NamespaceUnpin(RepositoryId, InodeId, Reply<bool>),
     NamespaceRename(
         RepositoryId,
         InodeId,
@@ -114,6 +116,16 @@ enum Command {
     PhysicalCommitExtent([u8; 16], mirage_types::PageHash, [u8; 32], i64, Reply<()>),
     PhysicalReleaseExtent([u8; 16], i64, Reply<()>),
     PhysicalMarkExtentDead([u8; 16], i64, Reply<()>),
+    PhysicalReviveExtent(
+        [u8; 16],
+        [u8; 16],
+        i64,
+        i64,
+        mirage_types::PageHash,
+        [u8; 32],
+        i64,
+        Reply<()>,
+    ),
     PhysicalAdjustExtentPin([u8; 16], i64, Reply<()>),
     PhysicalReapReservations(i64, Reply<u64>),
     OperationBegin(OperationRecord, Vec<OperationPayloadRecord>, Reply<()>),
@@ -353,6 +365,15 @@ impl DbWriter {
                                 ),
                             );
                         }
+                        Command::NamespacePin(volume_id, inode, pinned_ns, reply) => {
+                            respond(
+                                reply,
+                                namespace::pin(&connection, volume_id, inode, pinned_ns),
+                            );
+                        }
+                        Command::NamespaceUnpin(volume_id, inode, reply) => {
+                            respond(reply, namespace::unpin(&connection, volume_id, inode));
+                        }
                         Command::NamespaceRename(
                             volume_id,
                             from_parent,
@@ -468,6 +489,30 @@ impl DbWriter {
                         }
                         Command::PhysicalMarkExtentDead(id, now, reply) => {
                             respond(reply, physical::mark_extent_dead(&mut connection, &id, now));
+                        }
+                        Command::PhysicalReviveExtent(
+                            id,
+                            file_id,
+                            slot,
+                            length,
+                            hash,
+                            checksum,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                physical::revive_extent(
+                                    &mut connection,
+                                    &id,
+                                    &file_id,
+                                    slot,
+                                    length,
+                                    hash,
+                                    checksum,
+                                    now,
+                                ),
+                            );
                         }
                         Command::PhysicalAdjustExtentPin(id, delta, reply) => {
                             respond(
@@ -975,6 +1020,25 @@ impl DbWriter {
         self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, now_ns, reply))
     }
 
+    /// Pins an inode; descendants of a pinned directory inherit protection.
+    pub fn namespace_pin(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        pinned_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::NamespacePin(volume_id, inode, pinned_ns, reply))
+    }
+
+    /// Removes a pin; `false` when the inode was not pinned.
+    pub fn namespace_unpin(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+    ) -> Result<bool, MirageError> {
+        self.request(|reply| Command::NamespaceUnpin(volume_id, inode, reply))
+    }
+
     pub fn namespace_set_file_roots(
         &self,
         volume_id: RepositoryId,
@@ -1100,6 +1164,33 @@ impl DbWriter {
         now_ns: i64,
     ) -> Result<(), MirageError> {
         self.request(|reply| Command::PhysicalMarkExtentDead(extent_id, now_ns, reply))
+    }
+
+    /// Transitions a dead extent back to alive after its bytes were
+    /// re-staged, or inserts a fresh alive row when compaction reaped it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn physical_revive_extent(
+        &self,
+        extent_id: [u8; 16],
+        file_id: [u8; 16],
+        slot_index: i64,
+        length_bytes: i64,
+        page_hash: mirage_types::PageHash,
+        checksum: [u8; 32],
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::PhysicalReviveExtent(
+                extent_id,
+                file_id,
+                slot_index,
+                length_bytes,
+                page_hash,
+                checksum,
+                now_ns,
+                reply,
+            )
+        })
     }
 
     /// Pins (+1) or unpins (-1) an alive extent against eviction.

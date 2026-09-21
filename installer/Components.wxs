@@ -27,7 +27,12 @@
         <ServiceControl Id="MirageServiceControl" Name="MirageSSD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="FilesystemHostComponent" Guid="B4DD6030-12F7-4C33-85B2-C315DB9B0F66" Bitness="always64">
+        <!-- mirage-fs.exe carries no version resource, so unversioned-file
+             rules can leave a stale adapter on upgrades (observed: a 0.1.5-era
+             binary survived to 0.1.7). RemoveFile-on-install deletes any
+             existing copy first so the new binary always lands. -->
         <File Id="MirageFilesystemHost" Source="$(var.BinDir)\mirage-fs.exe" KeyPath="yes" />
+        <RemoveFile Id="RemoveStaleFilesystemHost" Name="mirage-fs.exe" On="install" />
       </Component>
       <Component Id="UiHostComponent" Guid="731D5096-1959-4482-9F57-9219BC9680D2" Bitness="always64">
         <File Id="MirageUiHost" Source="$(var.BinDir)\mirage-ui.exe" KeyPath="yes">

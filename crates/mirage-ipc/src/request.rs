@@ -144,6 +144,20 @@ pub enum Command {
     },
     /// Free space, floor state, and last reclaim outcome per configured volume.
     DiskStatus,
+    /// Pin a namespace path: pinned files and everything under a pinned
+    /// directory are never evicted by floor/budget reclaim.
+    NamespacePin {
+        repository_id: RepositoryId,
+        path: String,
+    },
+    NamespaceUnpin {
+        repository_id: RepositoryId,
+        path: String,
+    },
+    /// List the pinned inodes of a repository with their paths.
+    NamespacePins {
+        repository_id: RepositoryId,
+    },
     Profile {
         repository_id: RepositoryId,
         maximum_duration_seconds: u32,

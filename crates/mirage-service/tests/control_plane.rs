@@ -538,9 +538,13 @@ impl MountControl for FakeMountControl {
         self.calls.lock().unwrap().push("mount");
         Ok(())
     }
-    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<u64, MirageError> {
+    fn request_eviction(&mut self, _: RepositoryId, _: u64) -> Result<(u64, u64), MirageError> {
         self.calls.lock().unwrap().push("request_eviction");
-        Ok(0)
+        Ok((0, 0))
+    }
+    fn reload_pins(&mut self, _: RepositoryId) -> Result<(), MirageError> {
+        self.calls.lock().unwrap().push("reload_pins");
+        Ok(())
     }
     fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("send_drive_token");
@@ -610,4 +614,105 @@ fn drive_token_supply_requires_a_mounted_repository() {
     };
     assert!(message.contains("not mounted"), "{message}");
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn namespace_pin_unpin_list_round_trip() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x63; 16]);
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "pin fixture".into(),
+            local_root: directory.path().join("repository"),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    let root = database
+        .namespace_create_volume(repository_id, 1)
+        .expect("namespace volume");
+    database
+        .namespace_create(
+            repository_id,
+            root,
+            "keep",
+            mirage_db::NamespaceNodeKind::Directory,
+            2,
+        )
+        .expect("dir");
+    let handler = ControlPlaneHandler::new(database.clone());
+
+    let pinned = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::NamespacePin {
+                repository_id,
+                path: "keep".into(),
+            },
+        ),
+    );
+    let ResponseBody::Json(pinned) = pinned else {
+        panic!("pin response: {pinned:?}")
+    };
+    assert_eq!(pinned["pinned"], true);
+
+    // Case-folded resolution matches the namespace lookup rules.
+    let listed = handler.handle(
+        &principal(),
+        request(2, Command::NamespacePins { repository_id }),
+    );
+    let ResponseBody::Json(listed) = listed else {
+        panic!("pins response: {listed:?}")
+    };
+    assert_eq!(listed["pins"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["pins"][0]["path"], "/keep");
+
+    let missing = handler.handle(
+        &principal(),
+        request(
+            3,
+            Command::NamespacePin {
+                repository_id,
+                path: "gone".into(),
+            },
+        ),
+    );
+    assert!(
+        matches!(missing, ResponseBody::Error { ref code, .. } if code == "MIRAGE_INVALID_ARGUMENT"),
+        "{missing:?}"
+    );
+
+    let unpinned = handler.handle(
+        &principal(),
+        request(
+            4,
+            Command::NamespaceUnpin {
+                repository_id,
+                path: "/KEEP".into(),
+            },
+        ),
+    );
+    let ResponseBody::Json(unpinned) = unpinned else {
+        panic!("unpin response: {unpinned:?}")
+    };
+    assert_eq!(unpinned["pinned"], false);
+    assert!(database.namespace_pins(repository_id).unwrap().is_empty());
+
+    // Unpinning an unpinned path is an error, not a silent success.
+    let again = handler.handle(
+        &principal(),
+        request(
+            5,
+            Command::NamespaceUnpin {
+                repository_id,
+                path: "keep".into(),
+            },
+        ),
+    );
+    assert!(matches!(again, ResponseBody::Error { .. }), "{again:?}");
 }

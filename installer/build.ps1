@@ -3,7 +3,7 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.6',
+  [string]$Version = '0.1.7',
   [long]$SourceDateEpoch = 946684800,
   [string]$Output = "$PSScriptRoot\out"
 )

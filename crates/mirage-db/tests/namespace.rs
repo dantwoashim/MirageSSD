@@ -306,3 +306,32 @@ fn checkpoint_document_decodes_with_live_entries() {
     // The checkpoint closes the open segment; new deltas start at 0.
     assert_eq!(db.namespace_delta_backlog(volume).unwrap(), 0);
 }
+
+#[test]
+fn pin_held_covers_descendants_and_unpin_releases() {
+    let (_dir, db) = open();
+    let volume = vol(9);
+    let root = db.namespace_create_volume(volume, 1).unwrap();
+    let dir = db
+        .namespace_create(volume, root, "keep", NamespaceNodeKind::Directory, 2)
+        .unwrap();
+    let file = db
+        .namespace_create(volume, dir.inode, "a.bin", NamespaceNodeKind::File, 3)
+        .unwrap();
+    let other = db
+        .namespace_create(volume, root, "free.bin", NamespaceNodeKind::File, 4)
+        .unwrap();
+
+    db.namespace_pin(volume, dir.inode, 5).unwrap();
+    assert!(db.namespace_pin_held(volume, dir.inode).unwrap());
+    // A file under the pinned directory is protected without its own row.
+    assert!(db.namespace_pin_held(volume, file.inode).unwrap());
+    assert!(!db.namespace_pin_held(volume, other.inode).unwrap());
+    assert!(!db.namespace_pin_held(volume, root).unwrap());
+    assert_eq!(db.namespace_pins(volume).unwrap(), vec![dir.inode]);
+
+    assert!(db.namespace_unpin(volume, dir.inode).unwrap());
+    assert!(!db.namespace_pin_held(volume, file.inode).unwrap());
+    // Unpinning something never pinned reports false, not an error.
+    assert!(!db.namespace_unpin(volume, other.inode).unwrap());
+}

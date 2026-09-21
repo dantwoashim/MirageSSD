@@ -271,6 +271,9 @@ pub struct MirageEngineHandle {
     pub disk_floor: Arc<AtomicU64>,
     /// 1-second cached free-space reading of the journal volume.
     pub floor_free_cache: Arc<Mutex<(std::time::Instant, u64)>>,
+    /// Pinned inodes (files, and directories whose descendants inherit
+    /// protection); refreshed at create and on `PINS-RELOAD`.
+    pub pins: Arc<std::sync::RwLock<std::collections::HashSet<mirage_types::InodeId>>>,
 }
 
 /// A page provider waiting for its first credential: the coordinator's
@@ -437,6 +440,8 @@ pub struct MirageFileHandle {
     /// Sequential-miss tracking for `prefetch` (file-relative page hashes and
     /// the last provider-fetched position).
     pub prefetch_state: Arc<PrefetchState>,
+    /// Pinned inodes shared with the engine (eviction exclusion).
+    pub pins: Arc<std::sync::RwLock<std::collections::HashSet<mirage_types::InodeId>>>,
 }
 
 /// Per-open sequential-read tracking for managed readahead.
@@ -495,6 +500,7 @@ impl MirageEngineHandle {
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 0,
             ))),
+            pins: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
     /// Owner-side origin decodes performed by this engine.

@@ -644,6 +644,15 @@ impl RequestHandler for ControlPlaneHandler {
             } => self.disk_floor_set(&volume_root, floor_bytes, hysteresis_bytes),
             Command::DiskFloorClear { volume_root } => self.disk_floor_clear(&volume_root),
             Command::DiskStatus => self.disk_status(),
+            Command::NamespacePin {
+                repository_id,
+                path,
+            } => self.namespace_pin_set(repository_id, &path, true),
+            Command::NamespaceUnpin {
+                repository_id,
+                path,
+            } => self.namespace_pin_set(repository_id, &path, false),
+            Command::NamespacePins { repository_id } => self.namespace_pins_list(repository_id),
             Command::ProfileConfigure {
                 repository_id,
                 launcher_relative,
@@ -1074,6 +1083,103 @@ impl ControlPlaneHandler {
         Ok(ResponseBody::Json(json!({ "floors": entries })))
     }
 
+    /// Resolves a mount-relative path (`/` or `\` separated) to a namespace
+    /// inode; an empty path resolves to the volume root.
+    fn resolve_namespace_path(
+        &self,
+        repository_id: RepositoryId,
+        path: &str,
+    ) -> Result<mirage_types::InodeId, MirageError> {
+        let components: Vec<String> = path
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if components.is_empty() {
+            return self.database.namespace_root(repository_id)?.ok_or_else(|| {
+                MirageError::invalid_argument("repository has no managed namespace")
+            });
+        }
+        self.database
+            .namespace_resolve_components(repository_id, &components)?
+            .ok_or_else(|| MirageError::invalid_argument("path not found in the managed namespace"))
+    }
+
+    /// Reconstructs the `/`-joined namespace path of an inode by walking
+    /// dirents upward; `None` for the root (listed as "/").
+    fn namespace_path_of(
+        &self,
+        repository_id: RepositoryId,
+        inode: mirage_types::InodeId,
+    ) -> String {
+        let mut names = Vec::new();
+        let mut current = inode;
+        for _ in 0..128 {
+            match self
+                .database
+                .namespace_entry(repository_id, current)
+                .ok()
+                .flatten()
+            {
+                Some((parent, name)) => {
+                    names.push(name);
+                    current = parent;
+                }
+                None => break,
+            }
+        }
+        names.reverse();
+        format!("/{}", names.join("/"))
+    }
+
+    fn namespace_pin_set(
+        &self,
+        repository_id: RepositoryId,
+        path: &str,
+        pin: bool,
+    ) -> Result<ResponseBody, MirageError> {
+        let inode = self.resolve_namespace_path(repository_id, path)?;
+        if pin {
+            self.database
+                .namespace_pin(repository_id, inode, now_ns())?;
+        } else if !self.database.namespace_unpin(repository_id, inode)? {
+            return Err(MirageError::invalid_argument("path is not pinned"));
+        }
+        // Refresh the live host's pinned set; an unmounted repo picks the
+        // rows up at mount time.
+        if let Ok(mut mounts) = self.mounts.lock()
+            && mounts.is_running(repository_id).unwrap_or(false)
+        {
+            let _ = mounts.reload_pins(repository_id);
+        }
+        Ok(ResponseBody::Json(json!({
+            "repository_id": repository_id.to_string(),
+            "path": path,
+            "inode": hex_inode(inode),
+            "pinned": pin,
+        })))
+    }
+
+    fn namespace_pins_list(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<ResponseBody, MirageError> {
+        let pins = self.database.namespace_pins(repository_id)?;
+        let entries: Vec<_> = pins
+            .iter()
+            .map(|inode| {
+                json!({
+                    "inode": hex_inode(*inode),
+                    "path": self.namespace_path_of(repository_id, *inode),
+                })
+            })
+            .collect();
+        Ok(ResponseBody::Json(json!({
+            "repository_id": repository_id.to_string(),
+            "pins": entries,
+        })))
+    }
+
     /// One disk-floor reclaim pass over every configured volume: reclaim
     /// verified-clean cache/shadow data of unmounted repositories and ask
     /// mounted managed hosts to evict published payloads. Never removes data
@@ -1098,6 +1204,7 @@ impl ControlPlaneHandler {
                 continue;
             };
             let mut freed = 0_u64;
+            let mut pinned_blocked = 0_u64;
             for repository in self.repositories()? {
                 if freed >= target {
                     break;
@@ -1119,7 +1226,9 @@ impl ControlPlaneHandler {
                         })?
                         .request_eviction(repository.repository_id, target - freed)
                     {
+                        let (bytes, blocked) = bytes;
                         freed += bytes;
+                        pinned_blocked += blocked;
                     }
                     continue;
                 }
@@ -1144,12 +1253,14 @@ impl ControlPlaneHandler {
             }
             let outcome = if freed >= target {
                 "ok"
+            } else if pinned_blocked > 0 {
+                "blocked_by_pins"
             } else {
                 "insufficient_evictable"
             };
             eprintln!(
-                "disk floor breached on {}: free={} floor={} freed={} outcome={outcome}",
-                floor.volume_root, free_bytes, floor.floor_bytes, freed,
+                "disk floor breached on {}: free={} floor={} freed={} pinned_blocked={} outcome={outcome}",
+                floor.volume_root, free_bytes, floor.floor_bytes, freed, pinned_blocked,
             );
             self.database
                 .record_disk_floor_run(mirage_db::DiskFloorRun {
@@ -1492,6 +1603,14 @@ fn repair_response(
     })))
 }
 
+fn hex_inode(inode: mirage_types::InodeId) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in inode.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn repository_id(command: &Command) -> Option<RepositoryId> {
     match command {
         Command::RepositoryDetail { repository_id }
@@ -1521,6 +1640,9 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::UpdateStatus { repository_id }
         | Command::UpdateCommit { repository_id }
         | Command::UpdateRollback { repository_id }
+        | Command::NamespacePin { repository_id, .. }
+        | Command::NamespaceUnpin { repository_id, .. }
+        | Command::NamespacePins { repository_id }
         | Command::Repair { repository_id }
         | Command::Cancel { repository_id, .. } => Some(*repository_id),
         Command::Status

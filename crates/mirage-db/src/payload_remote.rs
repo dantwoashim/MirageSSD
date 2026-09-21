@@ -208,6 +208,13 @@ pub fn unpublished_payloads(
                               AND e.payload_id = p.payload_id)
                AND NOT EXISTS (SELECT 1 FROM payload_remote_objects r
                                WHERE r.payload_id = p.payload_id)
+               -- A dead physical extent means the journal file was
+               -- intentionally released (delete/supersede/compaction):
+               -- there is nothing left to upload, and retrying it forever
+               -- starves real publications.
+               AND NOT EXISTS (SELECT 1 FROM physical_extents x
+                               WHERE x.extent_id = p.payload_id
+                                 AND x.state = 'dead')
              ORDER BY o.device_seq",
         )
         .map_err(|e| sqlite(e, "unpublished payload scan prepare failed"))?;
@@ -309,7 +316,10 @@ pub fn payload_publication_stats(
                             WHERE e.volume_id = o.volume_id
                               AND e.payload_id = p.payload_id)
                AND NOT EXISTS (SELECT 1 FROM payload_remote_objects r
-                               WHERE r.payload_id = p.payload_id)",
+                               WHERE r.payload_id = p.payload_id)
+               AND NOT EXISTS (SELECT 1 FROM physical_extents x
+                               WHERE x.extent_id = p.payload_id
+                                 AND x.state = 'dead')",
             [volume_id.as_bytes().as_slice()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

@@ -125,8 +125,10 @@ impl TestHost {
     }
     fn stop(&mut self) {
         if let Some(stdin) = &mut self.0.stdin {
-            let _ = stdin.write_all(b"STOP
-");
+            let _ = stdin.write_all(
+                b"STOP
+",
+            );
             let _ = stdin.flush();
         }
         let deadline = Instant::now() + Duration::from_secs(10);

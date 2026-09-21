@@ -181,10 +181,20 @@ fn request_eviction_parses_mirage_evicted_and_times_out() {
     let responder = reply_tx.lock().unwrap().clone();
     responder.send("unrelated".to_owned()).unwrap();
     responder.send("MIRAGE_EVICTED 4096".to_owned()).unwrap();
-    let freed = supervisor
+    let (freed, blocked) = supervisor
         .request_eviction(&id, 8192, Duration::from_secs(5))
         .expect("eviction reply");
     assert_eq!(freed, 4096);
+    assert_eq!(blocked, 0);
+
+    // Extended reply: freed + pin-blocked bytes.
+    responder
+        .send("MIRAGE_EVICTED 2048 1024".to_owned())
+        .unwrap();
+    let (freed, blocked) = supervisor
+        .request_eviction(&id, 8192, Duration::from_secs(5))
+        .expect("extended eviction reply");
+    assert_eq!((freed, blocked), (2048, 1024));
     assert_eq!(*lines.lock().unwrap(), vec!["EVICT 8192"]);
 
     // No reply queued → timeout error.

@@ -147,3 +147,106 @@ fn breached_floor_records_a_run_with_fake_probe() {
         .expect("recorded");
     assert_eq!(run2.at_ns, run.at_ns);
 }
+
+#[test]
+fn breached_floor_requests_eviction_from_mounted_host() {
+    use mirage_service::MountControl;
+    use mirage_types::{MirageError, RepositoryEvent, RepositoryId, RepositoryState};
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingMounts {
+        evictions: Arc<Mutex<Vec<u64>>>,
+    }
+    impl MountControl for RecordingMounts {
+        fn mount(
+            &mut self,
+            _: RepositoryId,
+            _: &Path,
+            _: &Path,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+            _: (u64, u64),
+            _: bool,
+            _: Option<(&Path, &Path)>,
+            _: Option<u64>,
+        ) -> Result<(), MirageError> {
+            Ok(())
+        }
+        fn request_eviction(
+            &mut self,
+            _: RepositoryId,
+            bytes: u64,
+        ) -> Result<(u64, u64), MirageError> {
+            self.evictions.lock().unwrap().push(bytes);
+            Ok((512, 0))
+        }
+        fn reload_pins(&mut self, _: RepositoryId) -> Result<(), MirageError> {
+            Ok(())
+        }
+        fn send_drive_token(&mut self, _: RepositoryId, _: &str) -> Result<(), MirageError> {
+            Ok(())
+        }
+        fn unmount(&mut self, _: RepositoryId) -> Result<(), MirageError> {
+            Ok(())
+        }
+        fn is_running(&mut self, _: RepositoryId) -> Result<bool, MirageError> {
+            Ok(true)
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Database::open(&dir.path().join("control.db")).expect("db");
+    let repository_id = RepositoryId::from_bytes([0x42; 16]);
+    db.create_repository(mirage_db::NewRepository {
+        repository_id,
+        display_name: "mounted".into(),
+        local_root: dir.path().join("native"),
+        owner_sid: "S-1-5-18".into(),
+        content_encrypted: false,
+        initial_state: RepositoryState::ReadyUnmounted,
+        created_at_ns: 1,
+    })
+    .expect("repo");
+    db.set_repository_state(
+        repository_id,
+        RepositoryState::ReadyUnmounted,
+        RepositoryEvent::MountRequested,
+        2,
+    )
+    .unwrap();
+    db.set_repository_state(
+        repository_id,
+        RepositoryState::Mounting,
+        RepositoryEvent::MountSucceeded,
+        3,
+    )
+    .unwrap();
+
+    let evictions = Arc::new(Mutex::new(Vec::new()));
+    let handler = ControlPlaneHandler::with_mount_control(
+        db.clone(),
+        RecordingMounts {
+            evictions: Arc::clone(&evictions),
+        },
+    );
+    let root = temp_volume_root(dir.path());
+    db.set_disk_floor(mirage_db::DiskFloor {
+        volume_root: root.clone(),
+        floor_bytes: 1_000,
+        hysteresis_bytes: 100,
+        updated_ns: 1,
+    })
+    .expect("floor");
+
+    handler
+        .enforce_disk_floors_with(|_| Ok(400))
+        .expect("enforce");
+    assert_eq!(evictions.lock().unwrap().as_slice(), &[700]);
+    let run = db
+        .latest_disk_floor_run(&root)
+        .expect("run")
+        .expect("recorded");
+    assert_eq!(run.freed_bytes, 512);
+    assert_eq!(run.outcome, "insufficient_evictable");
+}

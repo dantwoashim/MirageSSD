@@ -139,6 +139,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 0,
             ))),
+            pins: std::sync::Arc::new(std::sync::RwLock::new(Default::default())),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -227,6 +228,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 0,
             ))),
+            pins: std::sync::Arc::new(std::sync::RwLock::new(Default::default())),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -429,6 +431,7 @@ unsafe fn create_cache_impl(
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 0,
             ))),
+            pins: std::sync::Arc::new(std::sync::RwLock::new(Default::default())),
         };
         unsafe { ptr::write(output, Box::into_raw(Box::new(handle))) };
         MirageStatus::Ok
@@ -977,6 +980,11 @@ fn create_managed_impl(
                 Some(Arc::new(move |hash| coordinator.provide_page(hash))
                     as Arc<handles::PageProviderHook>)
             },
+            pins: std::sync::Arc::new(std::sync::RwLock::new(
+                db.namespace_pins(volume)
+                    .map(|inodes| inodes.into_iter().collect())
+                    .unwrap_or_default(),
+            )),
             db: Some(db),
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -1525,12 +1533,17 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
         let used = dirty.used.load(Ordering::Acquire);
         if used > dirty.budget_bytes * 80 / 100 {
             let target = used.saturating_sub(dirty.budget_bytes * 60 / 100);
+            let pins = engine
+                .pins
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
             let _ = publisher::evict_published(
                 db,
                 dirty,
                 &journal_dir,
                 volume,
                 &engine.handles,
+                &pins,
                 target,
             );
         }
@@ -1752,6 +1765,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         remote_payloads: engine.remote_payloads.clone(),
                         disk_floor: engine.disk_floor.clone(),
                         floor_free_cache: engine.floor_free_cache.clone(),
+                        pins: Arc::clone(&engine.pins),
                         prefetch_state: Arc::new(handles::PrefetchState {
                             hashes: std::sync::OnceLock::new(),
                             last: AtomicI64::new(-1),
@@ -1806,6 +1820,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     remote_payloads: engine.remote_payloads.clone(),
                     disk_floor: engine.disk_floor.clone(),
                     floor_free_cache: engine.floor_free_cache.clone(),
+                    pins: Arc::clone(&engine.pins),
                     prefetch_state: Arc::new(handles::PrefetchState {
                         hashes: std::sync::OnceLock::new(),
                         last: AtomicI64::new(-1),
@@ -1952,6 +1967,13 @@ fn file_path(index: &MountIndex, file: FileView<'_>) -> String {
 /// Sequential readahead: when a provider fetch serves the page right after
 /// the last served miss, speculative fetches for the file's next four pages
 /// queue behind it. Best-effort only — never blocks or fails the read.
+/// Files at or below this size are prefetched wholesale on their first
+/// provider miss: the fetch pool's speculative queue pulls every non-resident
+/// page in the background (single-flight dedupes with demand reads, resident
+/// pages no-op), so a cold small file needs one miss instead of one per page.
+/// Larger files keep windowed readahead only.
+const WHOLE_FILE_PREFETCH_BYTES: u64 = 64 * 1024 * 1024;
+
 fn readahead_prefetch(
     handle: &MirageFileHandle,
     index: &MountIndex,
@@ -1973,6 +1995,18 @@ fn readahead_prefetch(
         .prefetch_state
         .last
         .swap(position as i64, Ordering::Relaxed);
+    // First miss on a small file: schedule the whole file. Resident pages
+    // short-circuit inside the provider fetch; the current page is already
+    // in flight and shares the flight map.
+    if last < 0 && file.logical_size() <= WHOLE_FILE_PREFETCH_BYTES {
+        for next in &hashes[position + 1..] {
+            prefetch(*next);
+        }
+        for previous in &hashes[..position] {
+            prefetch(*previous);
+        }
+        return;
+    }
     if last >= 0 && last + 1 != position as i64 {
         return;
     }
@@ -3264,12 +3298,17 @@ pub unsafe extern "C" fn mirage_write(
                 return MirageStatus::IntegrityFailure;
             };
             let target = length.max(dirty.budget_bytes / 4);
+            let pins = handle
+                .pins
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
             let _ = publisher::evict_published(
                 db,
                 dirty,
                 &journal_dir,
                 volume,
                 &handle.handles,
+                &pins,
                 target,
             );
             if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
@@ -3286,12 +3325,17 @@ pub unsafe extern "C" fn mirage_write(
                 let deficit = floor
                     .saturating_add(length)
                     .saturating_sub(free.unwrap_or(0));
+                let pins = handle
+                    .pins
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner());
                 let _ = publisher::evict_published(
                     db,
                     dirty,
                     &journal_dir,
                     volume,
                     &handle.handles,
+                    &pins,
                     length.max(deficit),
                 );
                 let free = floor_free_space(&handle.floor_free_cache, &journal_dir, true);
@@ -3539,10 +3583,25 @@ unsafe fn read_via_extents(
                             return MirageStatus::IoError;
                         }
                     }
-                    // An evicted payload is remote-only: fetch the published
-                    // frames, verify, and serve the slice. No publication row
-                    // means the data is genuinely unavailable — never zeros.
+                    // An evicted payload is remote-only: first try to re-stage
+                    // the whole file (budget/floor permitting) so subsequent
+                    // reads are local; otherwise fetch just the needed frames.
+                    // No publication row means genuinely unavailable — never
+                    // zeros.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if restage_evicted_payload(handle, journal_dir, &payload_id).is_ok()
+                            && let Ok(mut file) = std::fs::File::open(&path)
+                        {
+                            if file.seek(SeekFrom::Start(payload_offset)).is_err() {
+                                return MirageStatus::IoError;
+                            }
+                            let destination =
+                                unsafe { std::slice::from_raw_parts_mut(output.add(dst), len) };
+                            if file.read_exact(destination).is_err() {
+                                return MirageStatus::IoError;
+                            }
+                            continue;
+                        }
                         let (Some(remote), Some(db)) = (&handle.remote_payloads, &handle.db) else {
                             return MirageStatus::IoError;
                         };
@@ -3600,6 +3659,74 @@ unsafe fn read_via_extents(
     }
     unsafe { *transferred = (covered_end - offset) as usize };
     MirageStatus::Ok
+}
+
+/// Re-stages an evicted published payload: fetch and verify the whole remote
+/// object, write it back to the journal atomically, revive the physical
+/// extent in one writer transaction, and re-add its bytes to the dirty
+/// ledger — only when the dirty budget and the disk floor admit it.
+/// Callers fall back to the transient frame fetch on any error.
+fn restage_evicted_payload(
+    handle: &MirageFileHandle,
+    journal_dir: &Path,
+    payload_id: &[u8; 16],
+) -> Result<(), MirageError> {
+    let (Some(remote), Some(db), Some(dirty)) =
+        (&handle.remote_payloads, &handle.db, &handle.dirty)
+    else {
+        return Err(MirageError::backend_unavailable(
+            "restage needs publication state",
+        ));
+    };
+    let Some(volume) = handle
+        .index
+        .as_ref()
+        .map(|index| index.header().repository_id)
+    else {
+        return Err(MirageError::internal_invariant("restage without a volume"));
+    };
+    // Dedupes concurrent cold reads of the same payload.
+    let _slot = remote
+        .begin_restage(payload_id)
+        .ok_or_else(|| MirageError::repository_conflict("payload restage already in flight"))?;
+    let Some(whole) = remote.fetch_whole(db, volume, payload_id)? else {
+        return Err(MirageError::backend_unavailable("no publication record"));
+    };
+    let bytes = whole.bytes;
+    let length = bytes.len() as u64;
+    // The ledger mutex serializes the budget check with the byte add.
+    let _serialize = dirty
+        .mutex
+        .lock()
+        .map_err(|_| MirageError::internal_invariant("dirty ledger lock poisoned"))?;
+    if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
+        return Err(MirageError::repository_conflict("dirty budget full"));
+    }
+    let floor = handle.disk_floor.load(Ordering::Acquire);
+    if floor > 0 {
+        let free = floor_free_space(&handle.floor_free_cache, journal_dir, false)
+            .ok_or_else(|| MirageError::backend_unavailable("free space probe failed"))?;
+        if free.saturating_sub(length) < floor {
+            return Err(MirageError::repository_conflict("disk floor would breach"));
+        }
+    }
+    let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
+    let staged = journal.stage_payload_as(journal_dir, &bytes, *payload_id)?;
+    db.writer().physical_revive_extent(
+        *payload_id,
+        dirty.file_id,
+        dirty.next_slot.fetch_add(1, Ordering::AcqRel),
+        i64::try_from(staged.bytes).unwrap_or(i64::MAX),
+        mirage_types::PageHash::from_bytes(staged.checksum),
+        staged.checksum,
+        now_ns_i64(),
+    )?;
+    dirty.used.fetch_add(length, Ordering::AcqRel);
+    // Force the next floor probe to see the re-staged bytes.
+    if let Ok(mut cache) = handle.floor_free_cache.lock() {
+        cache.0 = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    }
+    Ok(())
 }
 
 /// Free bytes on the volume holding `path`, read through a 1-second cache
@@ -3669,6 +3796,7 @@ pub unsafe extern "C" fn mirage_engine_evict_published(
     engine: *mut MirageEngineHandle,
     target_bytes: u64,
     freed_bytes: *mut u64,
+    blocked_bytes: *mut u64,
 ) -> MirageStatus {
     let Some(handle) = (unsafe { engine.as_ref() }) else {
         return MirageStatus::InvalidArgument;
@@ -3684,18 +3812,60 @@ pub unsafe extern "C" fn mirage_engine_evict_published(
     ) else {
         return MirageStatus::InvalidArgument;
     };
+    let pins = handle
+        .pins
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner());
     match publisher::evict_published(
         db,
         dirty,
         &state_root.join("journal"),
         volume,
         &handle.handles,
+        &pins,
         target_bytes,
     ) {
-        Ok(freed) => {
+        Ok((freed, blocked)) => {
             if let Some(out) = unsafe { freed_bytes.as_mut() } {
                 *out = freed;
             }
+            if let Some(out) = unsafe { blocked_bytes.as_mut() } {
+                *out = blocked;
+            }
+            MirageStatus::Ok
+        }
+        Err(_) => MirageStatus::IoError,
+    }
+}
+
+/// `PINS-RELOAD` control command: refreshes the pinned-inode set from the
+/// durable `namespace_pins` table after a `mirage pin/unpin`.
+///
+/// # Safety
+/// `engine` must be a live managed engine handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_reload_pins(
+    engine: *mut MirageEngineHandle,
+) -> MirageStatus {
+    let Some(handle) = (unsafe { engine.as_ref() }) else {
+        return MirageStatus::InvalidArgument;
+    };
+    let (Some(db), Some(volume)) = (
+        handle.db.as_ref(),
+        handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id),
+    ) else {
+        return MirageStatus::InvalidArgument;
+    };
+    match db.namespace_pins(volume) {
+        Ok(inodes) => {
+            let mut set = handle
+                .pins
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *set = inodes.into_iter().collect();
             MirageStatus::Ok
         }
         Err(_) => MirageStatus::IoError,
