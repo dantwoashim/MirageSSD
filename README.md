@@ -6,7 +6,7 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 
 **Engineering preview · Windows 11 x64 · macOS 12+**
 
-[Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Get started](#get-started) · [Performance](#performance) · [Project map](#repository-map)
+[Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Verify the engine](#verify-the-engine-yourself) · [Get started](#get-started) · [Performance](#performance) · [Project map](#repository-map)
 
 ## Download
 
@@ -39,6 +39,49 @@ When you open a file, MirageSSD serves cached bytes locally and fetches missing 
 The Windows mount combines a pinned rclone provider with WinFsp. The macOS app uses the same provider with macFUSE and exposes the folder in Finder. Startup supervision restores the mount when you sign in.
 
 For large folders, the repository also includes packed archive and backup helpers. The separate Rust asset engine explores preparing a game's working set in advance, with page-level caching and session admission. Read the [architecture guide](docs/architecture.md) for the component boundaries.
+
+## Verify the engine yourself
+
+The installer is Windows/macOS only, but the Rust engine underneath is
+platform-neutral and runs its test suite on any machine with Rust 1.94
+(the pinned `rust-toolchain.toml` installs it):
+
+```sh
+git clone https://github.com/dantwoashim/MirageSSD && cd MirageSSD
+cargo test -p mirage-cache -p mirage-scheduler -p mirage-engine
+```
+
+Excerpt from a run on Linux (127 tests, all green):
+
+```text
+     Running tests/insert_crash_points.rs
+test every_insertion_crash_point_is_invisible_until_metadata_commit ... ok
+test batch_insertion_is_all_or_nothing_at_every_crash_boundary ... ok
+test batch_rehash_failure_never_publishes_a_good_prefix ... ok
+test verified_commit_is_exact_and_duplicate_is_idempotent ... ok
+
+     Running tests/shared_miss_path.rs
+test hundred_concurrent_readers_share_one_fetch_and_one_reservation ... ok
+test dropped_owner_future_does_not_strand_subscribers ... ok
+test all_waiters_cancelled_cancels_underlying_fetch ... ok
+test failure_causes_are_typed_for_every_waiter ... ok
+
+     Running tests/representation_proof.rs
+test tampered_frame_byte_is_integrity_mismatch_and_never_resident ... ok
+test encrypted_frame_with_wrong_key_is_rejected_and_never_resident ... ok
+```
+
+Those test names are the design: a crash at any step of a cache insert must
+leave the slot invisible until metadata commits (`crates/mirage-cache/src/insert.rs`);
+concurrent misses for one page share a single fetch and reservation
+(`crates/mirage-engine/src/get_or_fetch.rs`); and no unverified byte ever
+becomes resident. The full workspace (`cargo test --workspace --locked`) is
+460+ tests; `fuzz/fuzz_targets/` holds six cargo-fuzz harnesses for the
+on-disk and wire formats. The workspace lints with `unsafe_code = "deny"`;
+`unsafe` is re-allowed only in small, named blocks: the aligned arena
+buffer, the Win32 sparse-file and ETW calls, the C ABI in `mirage-ffi`, and
+the DPAPI wrapper in `mirage-crypto`
+([ADR 0007](docs/adr/0007-dpapi-boundary.md)).
 
 ## Get started
 
