@@ -1,0 +1,20 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="MirageSSD" Manufacturer="MirageSSD" Version="$(var.ProductVersion)"
+          UpgradeCode="4E4C24F7-4A21-4A2B-8B8B-1E3E6E39A7C0">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication LicenseUrl="https://github.com/dantwoashim/MirageSSD" LicenseFile="LICENSE.txt" Theme="hyperlinkLicense" SuppressOptionsUI="yes" SuppressRepair="yes" />
+    </BootstrapperApplication>
+    <util:RegistrySearch Root="HKLM"
+                         Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{C79D9B29-3AF0-45B3-9DB9-226F3C2D2204}"
+                         Value="DisplayVersion" Result="value" Variable="WinFspDisplayVersion" Bitness="always64" />
+    <Chain>
+      <MsiPackage Id="WinFsp" SourceFile="$(var.WinFspMsi)" Compressed="yes" Permanent="yes" Vital="yes"
+                  DisplayName="WinFsp 2.1.25156"
+                  InstallCondition="WinFspDisplayVersion &lt;&gt; &quot;2.1.25156&quot;" />
+      <MsiPackage Id="MirageSSD" SourceFile="$(var.MirageMsi)" Compressed="yes" Vital="yes"
+                  DisplayName="MirageSSD" />
+    </Chain>
+  </Bundle>
+</Wix>

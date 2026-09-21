@@ -63,3 +63,6 @@ docs/execution/
 docs/orchestration/
 docs/reports/
 docs/roadmap/
+
+# Downloaded prerequisite installers
+installer/cache/
