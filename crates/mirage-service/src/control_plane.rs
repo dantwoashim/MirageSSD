@@ -220,6 +220,9 @@ impl ControlPlaneHandler {
         summary["pending_local_operations"] = json!(pending_operations);
         summary["diverged"] = json!(diverged);
         summary["verified_workspace_bytes"] = json!(verified_workspace_bytes);
+        if let Ok(Some(record)) = runtime::load_mount_record(&self.database, repository_id) {
+            summary["mount_path"] = json!(record.mount_point.to_string_lossy());
+        }
         // Origin/volume mode are only known for runtime-registered
         // repositories; a bare registered fixture reports nulls.
         if let Ok(config) = runtime::load_config(&self.database, repository_id) {
@@ -644,6 +647,9 @@ impl RequestHandler for ControlPlaneHandler {
             } => self.disk_floor_set(&volume_root, floor_bytes, hysteresis_bytes),
             Command::DiskFloorClear { volume_root } => self.disk_floor_clear(&volume_root),
             Command::DiskStatus => self.disk_status(),
+            Command::DiskReclaimNow => self
+                .enforce_disk_floors()
+                .map(|_| ResponseBody::Json(json!({"reclaimed": true}))),
             Command::NamespacePin {
                 repository_id,
                 path,
@@ -1650,6 +1656,7 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::DiskFloorSet { .. }
         | Command::DiskFloorClear { .. }
         | Command::DiskStatus
+        | Command::DiskReclaimNow
         | Command::RepositoryRegister { .. }
         | Command::RepositoryAdopt { .. } => None,
     }

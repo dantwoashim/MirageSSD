@@ -4,11 +4,12 @@ use std::path::Path;
 
 use mirage_backend_drive::DriveObjectBackend;
 use mirage_engine::publish_base_generation;
-use mirage_manifest::{DecodeLimits, decode_manifest_bounded, encode_manifest};
+use mirage_manifest::{CommitSigner, DecodeLimits, decode_manifest_bounded, encode_manifest};
 use mirage_pack::{CompletedPack, PackReader};
 use mirage_types::{MirageError, RepositoryId};
 
-use super::{drive_live, repo_local};
+use super::drive_live::{self, LiveDriveSession};
+use super::repo_local;
 use crate::output;
 
 const DRIVE_MANIFEST: &str = "drive-manifest.cbor";
@@ -59,11 +60,61 @@ pub fn publish(
     }
 
     let session = drive_live::connect(client_credentials, token_store)?;
-    let backend = DriveObjectBackend::new(session.transport, session.access_token, repository_id)?;
     let signer = repo_local::signer(key_id_hex, test_key_hex)?;
-    let published = futures_executor::block_on(publish_base_generation(
-        &backend, &packs, &manifest, &signer,
-    ))?;
+    publish_inner(
+        &session,
+        &signer,
+        manifest,
+        repository_id,
+        import,
+        packs,
+        Some(json),
+    )
+}
+
+/// Drive publication for orchestrated flows that already hold a session and
+/// signer (the first-run `volume create` path generates a one-shot signer).
+pub fn publish_with_signer(
+    import: &Path,
+    repository_id: RepositoryId,
+    session: &LiveDriveSession,
+    signer: &dyn CommitSigner,
+) -> Result<serde_json::Value, MirageError> {
+    let manifest_bytes = fs::read(import.join("base-manifest.cbor")).map_err(MirageError::from)?;
+    let manifest = decode_manifest_bounded(&manifest_bytes, DecodeLimits::default())?;
+    if manifest.repository_id != repository_id {
+        return Err(MirageError::invalid_argument(
+            "import manifest repository does not match the repository ID",
+        ));
+    }
+    publish_inner(
+        session,
+        signer,
+        manifest,
+        repository_id,
+        import,
+        Vec::new(),
+        None,
+    )
+    .map(|_| serde_json::json!({"published": true}))
+}
+
+fn publish_inner(
+    session: &LiveDriveSession,
+    signer: &dyn CommitSigner,
+    manifest: mirage_manifest::RepositoryManifest,
+    repository_id: RepositoryId,
+    import: &Path,
+    packs: Vec<CompletedPack>,
+    emit: Option<bool>,
+) -> Result<(), MirageError> {
+    let backend = DriveObjectBackend::new(
+        session.transport.clone(),
+        zeroize::Zeroizing::new(session.access_token.as_str().to_owned()),
+        repository_id,
+    )?;
+    let published =
+        futures_executor::block_on(publish_base_generation(&backend, &packs, &manifest, signer))?;
     let encoded = encode_manifest(&published.published_manifest)?;
     let path = import.join(DRIVE_MANIFEST);
     write_new_or_identical(&path, &encoded)?;
@@ -77,15 +128,17 @@ pub fn publish(
         "drive_manifest": path,
         "encrypted_pack_requirement": "enforced"
     });
-    if json {
-        output::emit_success(&data)
-    } else {
-        println!(
-            "Drive publication complete: {} encrypted pack(s), commit {}",
-            published.packs.len(),
-            published.commit_hash
-        );
-        Ok(())
+    match emit {
+        Some(true) => output::emit_success(&data),
+        Some(false) => {
+            println!(
+                "Drive publication complete: {} encrypted pack(s), commit {}",
+                published.packs.len(),
+                published.commit_hash
+            );
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 

@@ -46,13 +46,21 @@ struct BackendStatus {
     credential_protection: &'static str,
 }
 
-pub fn login(
+pub struct AuthOutcome {
+    pub account_id: String,
+    pub scopes: Vec<String>,
+    pub issued_unix_seconds: u64,
+}
+
+/// Runs the loopback OAuth flow: opens the user's browser, waits for the
+/// 127.0.0.1 callback, exchanges the code, and stores the refresh token under
+/// current-user DPAPI. Shared by `backend login` and the UI wizard.
+pub fn authenticate(
     client_id: Option<&str>,
     client_credentials: Option<&Path>,
     token_path: Option<&Path>,
     timeout_seconds: u64,
-    json: bool,
-) -> Result<(), MirageError> {
+) -> Result<AuthOutcome, MirageError> {
     if !(30..=900).contains(&timeout_seconds) {
         return Err(MirageError::invalid_argument(
             "OAuth timeout must be between 30 and 900 seconds",
@@ -69,10 +77,6 @@ pub fn login(
         .authorization_url(&credentials.client_id, &redirect_uri)
         .map_err(MirageError::from)?;
 
-    if !json {
-        println!("Opening Google authorization in your default browser...");
-        println!("Waiting up to {timeout_seconds} seconds for the loopback callback.");
-    }
     open_browser(&authorization_url)?;
     let code = wait_for_callback(&listener, &attempt, Duration::from_secs(timeout_seconds))?;
 
@@ -112,17 +116,62 @@ pub fn login(
         issued,
         &mut refresh_bytes,
     )?;
+    // A signed-in user expects their volumes to reconnect at logon; register
+    // the per-user agent (HKCU Run, no elevation) idempotently.
+    let _ = super::agent::install_logon_registration();
+    Ok(AuthOutcome {
+        account_id: account,
+        scopes: grant.scopes,
+        issued_unix_seconds: issued,
+    })
+}
+
+pub fn login(
+    client_id: Option<&str>,
+    client_credentials: Option<&Path>,
+    token_path: Option<&Path>,
+    timeout_seconds: u64,
+    json: bool,
+) -> Result<(), MirageError> {
+    if !json {
+        println!("Opening Google authorization in your default browser...");
+        println!("Waiting up to {timeout_seconds} seconds for the loopback callback.");
+    }
+    let outcome = authenticate(client_id, client_credentials, token_path, timeout_seconds)?;
     emit(
         BackendStatus {
             provider: "google-drive",
             authenticated: true,
-            account_id: Some(account),
-            scopes: grant.scopes,
-            issued_unix_seconds: Some(issued),
+            account_id: Some(outcome.account_id),
+            scopes: outcome.scopes,
+            issued_unix_seconds: Some(outcome.issued_unix_seconds),
             credential_protection: "current-user-dpapi",
         },
         json,
     )
+}
+
+/// The OAuth Desktop client JSON shipped next to the installed executables
+/// (`<exe dir>\oauth-desktop.json`), used when `--client-credentials` is
+/// omitted.
+pub fn default_client_credentials() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join("oauth-desktop.json");
+    path.is_file().then_some(path)
+}
+
+/// Resolve an OAuth Desktop client JSON: explicit path, then
+/// MIRAGE_DRIVE_CLIENT_CREDENTIALS, then the shipped default.
+pub fn oauth_client_credentials(explicit: Option<PathBuf>) -> Result<PathBuf, MirageError> {
+    explicit
+        .or_else(|| std::env::var_os(CLIENT_CREDENTIALS_ENV).map(PathBuf::from))
+        .or_else(default_client_credentials)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            MirageError::invalid_argument(
+                "Google OAuth Desktop client JSON is required via --client-credentials",
+            )
+        })
 }
 
 fn resolve_client_credentials(
@@ -131,7 +180,8 @@ fn resolve_client_credentials(
 ) -> Result<ClientCredentials, MirageError> {
     let file = explicit_file
         .map(Path::to_owned)
-        .or_else(|| std::env::var_os(CLIENT_CREDENTIALS_ENV).map(PathBuf::from));
+        .or_else(|| std::env::var_os(CLIENT_CREDENTIALS_ENV).map(PathBuf::from))
+        .or_else(default_client_credentials);
     if let Some(path) = file {
         if !path.is_absolute() {
             return Err(MirageError::invalid_argument(
@@ -266,6 +316,11 @@ fn validate_client_id(client_id: &str) -> Result<(), MirageError> {
         ));
     }
     Ok(())
+}
+
+/// The per-user DPAPI token store used by `backend login` (and the UI).
+pub fn default_token_store_path() -> Result<PathBuf, MirageError> {
+    resolve_token_path(None)
 }
 
 fn resolve_token_path(explicit: Option<&Path>) -> Result<PathBuf, MirageError> {

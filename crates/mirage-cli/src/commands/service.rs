@@ -20,7 +20,10 @@ pub fn run_with(
     emit(request_with(transport, command)?, json)
 }
 
-fn request_with(transport: &impl ServiceTransport, command: Command) -> Result<Value, MirageError> {
+pub fn request_with(
+    transport: &dyn ServiceTransport,
+    command: Command,
+) -> Result<Value, MirageError> {
     let request = Request {
         protocol_version: PROTOCOL_VERSION,
         request_id: 1,

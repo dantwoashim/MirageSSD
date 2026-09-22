@@ -2,15 +2,11 @@
 
 #![deny(unsafe_code)]
 
-#[allow(unsafe_code)]
-mod client;
-mod commands;
-mod output;
-
 use std::{ffi::OsStr, fmt::Display, fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use commands::Command;
+use mirage_cli::commands::{self, Command};
+use mirage_cli::output;
 
 #[derive(Debug, Parser)]
 #[command(

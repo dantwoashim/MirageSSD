@@ -39,10 +39,14 @@ url.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lib]
+name = "mirage_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "mirage"

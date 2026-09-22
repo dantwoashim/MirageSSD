@@ -144,6 +144,9 @@ pub enum Command {
     },
     /// Free space, floor state, and last reclaim outcome per configured volume.
     DiskStatus,
+    /// Run one floor-enforcement pass immediately (evict safely-published
+    /// data to satisfy configured floors; the periodic tick also does this).
+    DiskReclaimNow,
     /// Pin a namespace path: pinned files and everything under a pinned
     /// directory are never evicted by floor/budget reclaim.
     NamespacePin {
@@ -278,6 +281,11 @@ impl Command {
                 | Self::UpdateCommit { .. }
                 | Self::UpdateRollback { .. }
                 | Self::Repair { .. }
+                | Self::NamespacePin { .. }
+                | Self::NamespaceUnpin { .. }
+                | Self::DiskFloorSet { .. }
+                | Self::DiskFloorClear { .. }
+                | Self::DiskReclaimNow
                 | Self::Cancel { .. }
         )
     }

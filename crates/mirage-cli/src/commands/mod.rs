@@ -1,7 +1,9 @@
 use clap::Subcommand;
 use mirage_types::MirageError;
 
-mod backend_login;
+#[allow(unsafe_code)]
+pub mod agent;
+pub mod backend_login;
 mod cache_check;
 mod cache_verify;
 mod config;
@@ -19,6 +21,8 @@ mod repo_scan;
 mod service;
 mod simulate;
 mod version;
+#[allow(unsafe_code)]
+pub mod volume;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -126,6 +130,11 @@ pub enum Command {
         #[command(subcommand)]
         command: NativeCommand,
     },
+    /// Create or list managed Drive-backed volumes (first-run flow).
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
     /// Mount a prepared repository.
     Mount {
         repository_id: mirage_types::RepositoryId,
@@ -139,6 +148,14 @@ pub enum Command {
         client_credentials: Option<std::path::PathBuf>,
         #[arg(long, requires = "client_credentials")]
         token_store: Option<std::path::PathBuf>,
+    },
+    /// Per-user logon agent: remount managed volumes and refresh Drive
+    /// tokens. Registered automatically on sign-in.
+    #[command(hide = true)]
+    Agent {
+        /// Run one mount/refresh cycle and exit (for tests).
+        #[arg(long, hide = true)]
+        once: bool,
     },
     /// Unmount a repository.
     Unmount {
@@ -192,7 +209,7 @@ pub enum BackendCommand {
     /// Refresh the protected token and verify the live Drive account and quota.
     VerifyLive {
         #[arg(long)]
-        client_credentials: std::path::PathBuf,
+        client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
     },
@@ -200,8 +217,9 @@ pub enum BackendCommand {
     SupplyToken {
         repository_id: mirage_types::RepositoryId,
         /// Desktop OAuth JSON used only to refresh a short-lived Drive access token.
+        /// Defaults to the installed oauth-desktop.json.
         #[arg(long)]
-        client_credentials: std::path::PathBuf,
+        client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
     },
@@ -209,8 +227,9 @@ pub enum BackendCommand {
     /// Drive-backed repository until Ctrl-C (access tokens expire ~1h).
     TokenAgent {
         /// Desktop OAuth JSON used only to refresh Drive access tokens.
+        /// Defaults to the installed oauth-desktop.json.
         #[arg(long)]
-        client_credentials: std::path::PathBuf,
+        client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
         /// Seconds between pushes; Drive access tokens live about an hour.
@@ -220,7 +239,7 @@ pub enum BackendCommand {
     /// Run authenticated Drive Gates D and F with encrypted signed generations.
     GateDrive {
         #[arg(long)]
-        client_credentials: std::path::PathBuf,
+        client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
         /// Empty or resumable state directory outside the source repository.
@@ -567,7 +586,7 @@ pub enum RepoCommand {
         #[arg(long)]
         repository_id: mirage_types::RepositoryId,
         #[arg(long)]
-        client_credentials: std::path::PathBuf,
+        client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
         token_store: Option<std::path::PathBuf>,
         #[arg(long)]
@@ -656,6 +675,34 @@ pub enum DiskCommand {
     },
     /// Show free space, floor state, and the last reclaim run per volume.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VolumeCommand {
+    /// Create an empty managed Drive-backed volume and mount it.
+    Create {
+        /// Explorer drive letter (default: first free letter from M).
+        #[arg(long)]
+        letter: Option<String>,
+        /// Display name for the new volume.
+        #[arg(long, default_value = "MirageSSD")]
+        name: String,
+        /// Local SSD budget for staged writes, e.g. `64GiB`
+        /// (default: min(25% of the freest disk, 64 GiB)).
+        #[arg(long)]
+        budget: Option<String>,
+        /// Keep at least this many bytes free on the state disk
+        /// (default: max(10% of that disk, 20 GiB)).
+        #[arg(long)]
+        floor: Option<String>,
+        /// Desktop OAuth JSON; defaults to the installed oauth-desktop.json.
+        #[arg(long)]
+        client_credentials: Option<std::path::PathBuf>,
+        #[arg(long)]
+        token_store: Option<std::path::PathBuf>,
+    },
+    /// List this user's managed Drive-backed volumes.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -823,14 +870,18 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             BackendCommand::VerifyLive {
                 client_credentials,
                 token_store,
-            } => drive_live::verify(&client_credentials, token_store.as_deref(), json),
+            } => drive_live::verify(
+                &backend_login::oauth_client_credentials(client_credentials)?,
+                token_store.as_deref(),
+                json,
+            ),
             BackendCommand::SupplyToken {
                 repository_id,
                 client_credentials,
                 token_store,
             } => {
                 let token = capacity_drive_token(
-                    Some(client_credentials.as_path()),
+                    Some(backend_login::oauth_client_credentials(client_credentials)?).as_deref(),
                     token_store.as_deref(),
                 )?
                 .ok_or_else(|| MirageError::invalid_argument("--client-credentials is required"))?;
@@ -847,7 +898,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 token_store,
                 interval_seconds,
             } => token_agent(
-                &client_credentials,
+                &backend_login::oauth_client_credentials(client_credentials)?,
                 token_store.as_deref(),
                 interval_seconds,
                 json,
@@ -857,7 +908,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 token_store,
                 work_directory,
             } => drive_gate::run(
-                &client_credentials,
+                &backend_login::oauth_client_credentials(client_credentials)?,
                 token_store.as_deref(),
                 &work_directory,
                 json,
@@ -1067,7 +1118,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             } => repo_drive::publish(
                 &import,
                 repository_id,
-                &client_credentials,
+                &backend_login::oauth_client_credentials(client_credentials)?,
                 token_store.as_deref(),
                 &key_id_hex,
                 &test_key_hex,
@@ -1410,9 +1461,66 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             },
             json,
         ),
+        Command::Agent { once } => agent::run(once),
         Command::Unmount { repository_id } => {
             service::run(mirage_ipc::Command::Unmount { repository_id }, json)
         }
+        Command::Volume { command } => match command {
+            VolumeCommand::Create {
+                letter,
+                name,
+                budget,
+                floor,
+                client_credentials,
+                token_store,
+            } => {
+                let credentials = backend_login::oauth_client_credentials(client_credentials)?;
+                let letter = match letter {
+                    Some(letter) => letter,
+                    None => volume::first_free_letter()?.to_string(),
+                };
+                let budget_bytes = match budget {
+                    Some(value) => disk::parse_byte_size(&value)?,
+                    None => volume::default_budget_bytes()?,
+                };
+                let floor_bytes = match floor {
+                    Some(value) => Some(disk::parse_byte_size(&value)?),
+                    None => Some(volume::default_floor_bytes(&volume::state_volume()?)),
+                };
+                let created = volume::create(
+                    &volume::VolumeSpec {
+                        name,
+                        drive_letter: letter,
+                        budget_bytes,
+                        floor_bytes,
+                    },
+                    &credentials,
+                    token_store.as_deref(),
+                    &mut |step| {
+                        if !json {
+                            eprintln!("{step}...");
+                        }
+                    },
+                    None,
+                )?;
+                service::emit(
+                    serde_json::json!({
+                        "repository_id": created.repository_id.to_string(),
+                        "name": created.name,
+                        "drive_letter": created.drive_letter,
+                        "budget_bytes": created.budget_bytes,
+                        "floor_bytes": created.floor_bytes,
+                        "account_id": created.account_id,
+                        "mount_point": created.mount_point,
+                        "state": created.state,
+                    }),
+                    json,
+                )
+            }
+            VolumeCommand::List => {
+                service::emit(serde_json::json!({"volumes": volume::list(None)?}), json)
+            }
+        },
         Command::Capsule { command } => match command {
             CapsuleCommand::Plan {
                 repository_id,
@@ -1501,9 +1609,12 @@ fn capacity_drive_token(
     client_credentials: Option<&std::path::Path>,
     token_store: Option<&std::path::Path>,
 ) -> Result<Option<mirage_ipc::SensitiveString>, MirageError> {
-    client_credentials
+    let credentials = client_credentials
+        .map(std::path::Path::to_path_buf)
+        .or_else(backend_login::default_client_credentials);
+    credentials
         .map(|credentials| {
-            let session = drive_live::connect(credentials, token_store)?;
+            let session = drive_live::connect(&credentials, token_store)?;
             mirage_ipc::SensitiveString::new(session.access_token.as_str().to_owned())
         })
         .transpose()
