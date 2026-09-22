@@ -569,6 +569,8 @@ impl SpaceLeaseSource for RepositoryCapacitySource {
                         "reclaim candidate disappeared before deallocation",
                     ));
                 }
+                #[cfg(test)]
+                disk_space::record_reclaimed_bytes(live.physical_bytes);
             }
             ReclaimUnit::DriveShadowPack {
                 path,
@@ -1188,8 +1190,13 @@ mod tests {
         let source = RepositoryCapacitySource::open(&database, repository_id, None)
             .expect("capacity source");
         assert!(source.cache_on_target_volume());
-        // Free space can change between queries as unrelated processes write or
-        // delete files. Plan both requests from the same measured snapshot.
+        // Real volume free space races the other tests in this binary — pin
+        // the probe baseline; record_reclaimed_bytes() models what verified
+        // reclaim frees so the plan series stays self-consistent.
+        // The reserve is a real ~25% filesystem figure, so the baseline must
+        // clear it; 64 GiB leaves ample headroom on any test machine.
+        disk_space::FREE_BYTES_OVERRIDE.with(|cell| cell.set(Some(64 << 30)));
+        disk_space::FREE_BYTES_BONUS.with(|cell| cell.set(0));
         let snapshot = source.capacity_snapshot().expect("capacity snapshot");
         let baseline = plan_space_lease(&snapshot, 1).expect("baseline plan");
         let plan = plan_space_lease(&snapshot, baseline.immediately_available_bytes + 1)

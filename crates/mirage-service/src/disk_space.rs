@@ -235,6 +235,18 @@ pub(crate) fn query(path: &Path) -> Result<VolumeSpace, MirageError> {
     if space_ok == 0 {
         return Err(MirageError::from(std::io::Error::last_os_error()));
     }
+    #[cfg(test)]
+    {
+        // Tests pin the probed free space to a fixed baseline plus whatever
+        // the reclaim path has actually freed — real volume free space races
+        // parallel tests sharing the drive, which made capacity assertions
+        // flaky by single bytes.
+        let base = FREE_BYTES_OVERRIDE.with(|cell| cell.get());
+        if let Some(base) = base {
+            let bonus = FREE_BYTES_BONUS.with(|cell| cell.get());
+            available_bytes = base.saturating_add(bonus);
+        }
+    }
     Ok(VolumeSpace {
         volume_id,
         available_bytes,
@@ -248,4 +260,20 @@ pub(crate) fn query(_path: &Path) -> Result<VolumeSpace, MirageError> {
     Err(MirageError::provider_unavailable(
         "physical volume accounting is currently available only on Windows NTFS",
     ))
+}
+
+// Test-only free-space injection: `FREE_BYTES_OVERRIDE` pins the baseline,
+// and `record_reclaimed_bytes` adds what verified reclaim actually freed so
+// lease plans see a self-consistent series.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FREE_BYTES_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static FREE_BYTES_BONUS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_reclaimed_bytes(bytes: u64) {
+    FREE_BYTES_BONUS.with(|cell| cell.set(cell.get().saturating_add(bytes)));
 }

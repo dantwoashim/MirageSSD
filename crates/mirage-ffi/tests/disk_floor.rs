@@ -315,10 +315,12 @@ fn impossible_floor_fails_diskfull_when_nothing_evictable() {
     let journal = state.path().join("journal");
     std::fs::create_dir_all(&journal).expect("journal dir");
 
-    // Floor higher than real free space: nothing published yet → DiskFull.
-    let free = real_free_bytes(&journal);
+    // An unsatisfiable floor: nothing published yet to evict → DiskFull.
+    // u64::MAX keeps this independent of the machine's real free space, which
+    // races the other tests in this binary.
+    let _ = journal;
     assert_eq!(
-        unsafe { mirage_engine_set_disk_floor(engine, free + 1) },
+        unsafe { mirage_engine_set_disk_floor(engine, u64::MAX) },
         MirageStatus::Ok
     );
     assert_eq!(
