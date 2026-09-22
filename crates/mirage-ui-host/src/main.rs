@@ -4,6 +4,10 @@
 #![cfg_attr(windows, allow(unsafe_code))]
 
 #[cfg(windows)]
+#[cfg(windows)]
+mod tray;
+
+#[cfg(windows)]
 mod windows_host {
     use mirage_ipc::{
         Command, DriveQuotaSnapshot, MAX_FRAME_BYTES, Request, Response, ResponseBody,
@@ -32,6 +36,7 @@ mod windows_host {
             .join("ui");
         let mut ui_root = default_root;
         let mut no_open = false;
+        let mut tray = false;
         let mut health_check = false;
         let mut drive_token_store = None;
         let mut arguments = std::env::args_os().skip(1);
@@ -41,6 +46,7 @@ mod windows_host {
                     ui_root = PathBuf::from(arguments.next().ok_or("--ui-root needs a path")?);
                 }
                 "--no-open" => no_open = true,
+                "--tray" => tray = true,
                 "--health-check" => health_check = true,
                 "--drive-token-store" => {
                     let path =
@@ -74,6 +80,24 @@ mod windows_host {
             }
             const ERROR_ALREADY_EXISTS: u32 = 183;
             if unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS {
+                // A tray instance owns the UI — ask it to surface the window.
+                let name: Vec<u16> = r"Local\MirageSSD.UI.Show"
+                    .encode_utf16()
+                    .chain([0])
+                    .collect();
+                let event = unsafe {
+                    windows_sys::Win32::System::Threading::OpenEventW(
+                        windows_sys::Win32::System::Threading::EVENT_MODIFY_STATE,
+                        0,
+                        name.as_ptr(),
+                    )
+                };
+                if !event.is_null() {
+                    unsafe {
+                        windows_sys::Win32::System::Threading::SetEvent(event);
+                        windows_sys::Win32::Foundation::CloseHandle(event);
+                    }
+                }
                 return Ok(());
             }
             handle
@@ -96,9 +120,54 @@ mod windows_host {
         {
             log_event("agent.registration_failed", &error.to_string());
         }
-        if !no_open {
-            open_browser(&format!("{origin}/#{token}"))?;
+        // The tray companion keeps the host alive after the browser tab
+        // closes; re-register on every start so updates repair the path.
+        if let Err(error) = mirage_cli::commands::agent::install_tray_registration() {
+            log_event("tray.registration_failed", &error.to_string());
         }
+        let page_url = format!("{origin}/#{token}");
+        if tray {
+            // The tray owns the foreground: the accept loop moves to a
+            // worker and the hidden icon lives on this thread.
+            let url = page_url.clone();
+            let worker_root = ui_root.clone();
+            let worker_origin = origin.clone();
+            let worker_token = token.clone();
+            let worker_store = drive_token_store.clone();
+            let worker_shared = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let _ = serve(
+                    listener,
+                    &worker_root,
+                    &worker_origin,
+                    &worker_token,
+                    worker_store.as_deref(),
+                    &worker_shared,
+                );
+            });
+            crate::tray::run(url);
+        }
+        if !no_open {
+            open_browser(&page_url)?;
+        }
+        serve(
+            listener,
+            &ui_root,
+            &origin,
+            &token,
+            drive_token_store.as_deref(),
+            &shared,
+        )
+    }
+
+    fn serve(
+        listener: TcpListener,
+        ui_root: &Path,
+        origin: &str,
+        token: &str,
+        drive_token_store: Option<&Path>,
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for connection in listener.incoming() {
             match connection {
                 Ok(mut stream) => {
@@ -108,9 +177,9 @@ mod windows_host {
                         &mut stream,
                         &ui_root,
                         &origin,
-                        &token,
-                        drive_token_store.as_deref(),
-                        &shared,
+                        token,
+                        drive_token_store,
+                        shared,
                     ) {
                         let _ = write_response(
                             &mut stream,
@@ -943,6 +1012,12 @@ mod windows_host {
             .zip(right.as_bytes())
             .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
             == 0
+    }
+
+    /// Opens `url` in the default browser (used by run, the tray, and
+    /// second-instance handoff).
+    pub(crate) fn open_browser_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+        open_browser(url)
     }
 
     fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {

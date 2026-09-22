@@ -19,7 +19,7 @@ mod repo_drive;
 mod repo_import_local;
 mod repo_local;
 mod repo_scan;
-mod service;
+pub mod service;
 mod simulate;
 mod version;
 #[allow(unsafe_code)]

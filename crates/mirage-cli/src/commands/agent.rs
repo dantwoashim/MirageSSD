@@ -240,6 +240,84 @@ fn install_logon_registration_windows() -> Result<(), MirageError> {
     Ok(())
 }
 
+/// Writes `HKCU\...\Run\<value_name>` = `command` (idempotent).
+#[cfg(windows)]
+fn run_key_set(value_name: &str, command: &str) -> Result<(), MirageError> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    };
+    let subkey: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut key = std::ptr::null_mut();
+    let result = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        return Err(MirageError::from(std::io::Error::from_raw_os_error(
+            result as i32,
+        )));
+    }
+    let data: Vec<u8> = command
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let set = unsafe {
+        RegSetValueExW(
+            key,
+            value_name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr(),
+            data.len() as u32,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    if set != 0 {
+        return Err(MirageError::from(std::io::Error::from_raw_os_error(
+            set as i32,
+        )));
+    }
+    Ok(())
+}
+
+/// `HKCU Run\MirageSSD Tray` = `"<mirage-ui.exe>" --tray`, written by the UI
+/// host on every start so updates repair stale paths.
+pub fn install_tray_registration() -> Result<(), MirageError> {
+    #[cfg(windows)]
+    {
+        let executable = std::env::current_exe().map_err(MirageError::from)?;
+        run_key_set(
+            "MirageSSD Tray",
+            &format!("\"{}\" --tray", executable.display()),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Err(MirageError::provider_unavailable(
+            "tray registration requires Windows",
+        ))
+    }
+}
+
 /// Hidden single-instance guard: the agent exits quietly if another copy is
 /// already running for this session.
 #[cfg(windows)]
