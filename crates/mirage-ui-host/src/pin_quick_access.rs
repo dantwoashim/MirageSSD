@@ -13,6 +13,7 @@ use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitial
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{SHBindToParent, SHParseDisplayName};
 
+#[allow(clippy::upper_case_acronyms)]
 type HRESULT = i32;
 type IUnknownPtr = *mut core::ffi::c_void;
 
@@ -53,6 +54,7 @@ struct IContextMenu {
 }
 
 #[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
 struct CMINVOKECOMMANDINFO {
     cb_size: u32,
     mask: u32,

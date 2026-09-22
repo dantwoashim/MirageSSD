@@ -186,8 +186,8 @@ mod windows_host {
                     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                     if let Err(error) = handle_connection(
                         &mut stream,
-                        &ui_root,
-                        &origin,
+                        ui_root,
+                        origin,
                         token,
                         drive_token_store,
                         shared,

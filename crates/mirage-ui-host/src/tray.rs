@@ -42,7 +42,7 @@ fn small_icon() -> windows_sys::Win32::Foundation::HANDLE {
     unsafe {
         LoadImageW(
             GetModuleHandleW(ptr::null()),
-            IDI_APPLICATION as *const u16,
+            IDI_APPLICATION,
             IMAGE_ICON,
             16,
             16,
