@@ -10,7 +10,21 @@ function refreshedLabel(issued?: number): string {
 }
 
 /** Always-visible Google account control for the sidebar. */
-export function AccountChip({ account, onChanged }: { account: DriveAccount; onChanged?: () => void }) {
+export function AccountChip({ account, onChanged, unavailable }: { account: DriveAccount; onChanged?: () => void; unavailable?: boolean }) {
+  if (unavailable) {
+    return (
+      <div className="account-chip" aria-live="polite">
+        <div className="account-chip-row">
+          <span className="account-chip-icon" aria-hidden="true"><GoogleLogo size={17} weight="bold" /></span>
+          <span className="account-chip-status text-zinc-500">Unavailable</span>
+        </div>
+      </div>
+    );
+  }
+  return <AccountChipInner account={account} onChanged={onChanged} />;
+}
+
+function AccountChipInner({ account, onChanged }: { account: DriveAccount; onChanged?: () => void }) {
   const state = useDriveAccount(account);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);

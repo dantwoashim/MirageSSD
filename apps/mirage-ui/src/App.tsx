@@ -2,6 +2,7 @@ import { ArrowClockwise, ArrowRight, CheckCircle, CloudSlash, Database, Download
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveAccount } from './api/account';
 import type { ServiceClient } from './api/client';
+import { ThemeToggle } from './components/ThemeToggle';
 import { AccountChip } from './components/AccountChip';
 import { EMPTY_READINESS, type CapacityLease, type CapacityPlan, type Readiness, type RepositoryState, type ServiceSnapshot, type UpdateCheck } from './models';
 import { operationMessage, readinessFromPlan, record, repositoryScope } from './presentation';
@@ -36,7 +37,11 @@ const titles: Record<View, [string, string]> = {
 };
 
 export function App({ client }: { client: ServiceClient }) {
-  const [view, setView] = useState<View>('overview');
+  const [view, setView] = useState<View>(() => {
+    const requested = new URLSearchParams(window.location.search).get('view');
+    const allowed: View[] = ['overview', 'capacity', 'launch', 'import', 'setup', 'update', 'recovery', 'exit'];
+    return allowed.includes(requested as View) ? (requested as View) : 'overview';
+  });
   const [snapshot, setSnapshot] = useState<ServiceSnapshot | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheck>();
   useEffect(() => {
@@ -219,7 +224,8 @@ export function App({ client }: { client: ServiceClient }) {
           <button className="nav-item" aria-current={view === 'exit' ? 'page' : undefined} onClick={() => setView('exit')}><SignOut size={18} />Restore & leave</button>
         </details>
         <div className="sidebar-note"><ShieldCheck size={19} aria-hidden="true" /><div>Your storage. Your control.<p>Keep files close. Keep your options open.</p></div></div>
-        <AccountChip account={driveAccount} onChanged={() => void refresh()} />
+        <AccountChip account={driveAccount} onChanged={() => void refresh()} unavailable={!snapshot && connectionError !== undefined} />
+        <ThemeToggle />
         <div className="service-indicator" role="status"><span className={unavailable ? 'status-dot status-muted' : 'status-dot'} />{snapshot ? connectionError ? 'Connection interrupted' : 'Desktop service connected' : connectionError ? 'Desktop service unavailable' : 'Connecting to your desktop…'}</div>
         <button className="quiet-button diagnostics-link" onClick={() => {
           client.diagnosticsCollect()
@@ -237,12 +243,12 @@ export function App({ client }: { client: ServiceClient }) {
             <DownloadSimple size={14} />{(updateInfo.latest ?? '').replace(/^v/, '')} is available — Download
           </a>
         )}
-        {connectionError && <div className="feedback feedback-warning" role="alert"><CloudSlash size={22} /><div><strong>{snapshot ? 'Showing the last known state' : 'Let’s reconnect your desktop'}</strong><p>{connectionError}</p>{lastChecked && <small>Last connected at {lastChecked.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Actions are paused until the connection returns.</small>}</div><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Reconnect</button></div>}
-        {actionError && <div className="feedback feedback-error" role="alert"><Info size={22} /><div><strong>The operation needs your attention</strong><p>{actionError}</p></div><button className="icon-button" aria-label="Dismiss operation error" onClick={() => setActionError(undefined)}><X size={18} /></button></div>}
+        {connectionError && snapshot && <div className="feedback feedback-warning" role="alert"><CloudSlash size={22} /><div><strong>{snapshot ? 'Showing the last known state' : 'Let’s reconnect your desktop'}</strong><p>{connectionError}</p>{lastChecked && <small>Last connected at {lastChecked.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Actions are paused until the connection returns.</small>}</div><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Reconnect</button></div>}
+        {actionError && !(!snapshot && connectionError !== undefined) && <div className="feedback feedback-error" role="alert"><Info size={22} /><div><strong>The operation needs your attention</strong><p>{actionError}</p></div><button className="icon-button" aria-label="Dismiss operation error" onClick={() => setActionError(undefined)}><X size={18} /></button></div>}
         {notice && !actionError && <div className="feedback feedback-success" role="status"><CheckCircle size={21} /><p>{notice}</p><button className="icon-button" aria-label="Dismiss notification" onClick={() => setNotice(undefined)}><X size={18} /></button></div>}
         {busy && <div className="working-banner" role="status"><span className="working-indicator" /><span>{busy} in progress. You can keep this window open while MirageSSD works.</span></div>}
 
-        {!snapshot ? connectionError ? <section className="disconnected-state"><HardDrives size={40} weight="duotone" /><h2>MirageSSD’s background service isn’t running</h2><p>Your files on Drive are safe. Start the service to bring your drives back — Windows may ask for permission.</p><div className="button-row"><button className="primary-button" disabled={refreshing} onClick={() => void client.serviceStart().then(() => window.setTimeout(() => void refresh(), 3000)).catch((failure) => setConnectionError(failure instanceof Error ? failure.message : String(failure)))}>Start service</button><button className="secondary-button" onClick={() => void client.diagnosticsCollect().then(setNotice).catch(() => {})}>Collect diagnostics</button><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Try reconnecting <ArrowRight size={17} /></button></div></section> : <LoadingState /> : <div className="view-content">
+        {!snapshot ? connectionError ? <section className="disconnected-state"><HardDrives size={40} weight="duotone" />{connectionError.includes('bridge token') ? <><h2>This window lost its connection to the MirageSSD app</h2><p>Close it and open MirageSSD again from the Start menu.</p></> : <><h2>MirageSSD’s background service isn’t running</h2><p>Your files on Drive are safe. Start the service to bring your drives back — Windows may ask for permission.</p><div className="button-row"><button className="primary-button" disabled={refreshing} onClick={() => void client.serviceStart().then(() => window.setTimeout(() => void refresh(), 3000)).catch((failure) => setConnectionError(failure instanceof Error ? failure.message : String(failure)))}>Start service</button><button className="secondary-button" onClick={() => void client.diagnosticsCollect().then(setNotice).catch(() => {})}>Collect diagnostics</button><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Try reconnecting <ArrowRight size={17} /></button></div></>}</section> : <LoadingState /> : <div className="view-content">
           {view === 'setup' && <SetupWizard client={client} account={driveAccount} onDone={() => { setView('overview'); void refresh(); }} />}
           {view === 'overview' && <>
             <Dashboard repositories={snapshot.repositories} selectedId={selectedId} onSelect={select} onRefresh={() => void refresh()} busy={Boolean(busy)} onSetup={() => setView('setup')} />

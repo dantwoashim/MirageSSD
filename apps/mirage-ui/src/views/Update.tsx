@@ -1,3 +1,4 @@
+import { ThemeToggle } from '../components/ThemeToggle';
 import { ArrowCounterClockwise, ArrowsClockwise, CheckCircle, DownloadSimple } from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
 import type { ServiceClient } from '../api/client';
@@ -32,6 +33,7 @@ export function UpdateView({ client, busy, onBegin, onRefresh, onCommit, onRollb
           )}
         </div>
       )}
+      <ThemeToggle labelled />
       <div className="mt-8 divide-y divide-white/7 border-y border-white/8">
         {actions.map(({ label, detail, Icon, action }) => (
           <button key={label} onClick={action} disabled={busy} className="grid w-full grid-cols-[2.5rem_1fr_auto] items-center gap-4 py-4 text-left transition duration-300 ease-out hover:bg-white/[0.025] active:translate-y-px disabled:opacity-45">
