@@ -57,6 +57,17 @@ export type DriveStatus = {
   login: 'idle' | 'in_flight' | { done: string } | { failed: string };
 };
 
+export type UpdateCheck = {
+  ok?: boolean;
+  checked?: boolean;
+  checked_at?: number;
+  current?: string;
+  channel?: string;
+  latest?: string;
+  url?: string;
+  update_available?: boolean;
+};
+
 export type VolumeCreateStatus = {
   in_flight?: boolean;
   step?: string;

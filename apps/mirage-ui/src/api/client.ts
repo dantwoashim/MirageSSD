@@ -11,6 +11,7 @@ import {
   type Response,
   type ServiceRepository,
   type ServiceSnapshot,
+  type UpdateCheck,
   type VolumeCreateStatus,
 } from '../models';
 import { record } from '../presentation';
@@ -297,6 +298,10 @@ export class ServiceClient {
     if (record(value) && value.started === false && value.in_flight !== true) {
       throw new Error(typeof value.error === 'string' ? value.error : 'Sign-in could not be started.');
     }
+  }
+
+  async updateCheck(): Promise<UpdateCheck> {
+    return await this.apiGet('/api/update/check') as UpdateCheck;
   }
 
   async pinQuickAccess(letter: string): Promise<void> {

@@ -8,6 +8,7 @@
 mod pin_quick_access;
 #[cfg(windows)]
 mod tray;
+mod update_check;
 
 #[cfg(windows)]
 mod windows_host {
@@ -617,6 +618,25 @@ mod windows_host {
                     200,
                     "application/json; charset=utf-8",
                     &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("GET", "/api/update/check") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&crate::update_check::check())?,
                     false,
                 )?;
             }

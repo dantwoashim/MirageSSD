@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createDriveAccount } from './api/account';
 import type { ServiceClient } from './api/client';
 import { AccountChip } from './components/AccountChip';
-import { EMPTY_READINESS, type CapacityLease, type CapacityPlan, type Readiness, type RepositoryState, type ServiceSnapshot } from './models';
+import { EMPTY_READINESS, type CapacityLease, type CapacityPlan, type Readiness, type RepositoryState, type ServiceSnapshot, type UpdateCheck } from './models';
 import { operationMessage, readinessFromPlan, record, repositoryScope } from './presentation';
 import { CapacityView } from './views/Capacity';
 import { Dashboard } from './views/Dashboard';
@@ -38,6 +38,10 @@ const titles: Record<View, [string, string]> = {
 export function App({ client }: { client: ServiceClient }) {
   const [view, setView] = useState<View>('overview');
   const [snapshot, setSnapshot] = useState<ServiceSnapshot | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheck>();
+  useEffect(() => {
+    void client.updateCheck().then(setUpdateInfo).catch(() => {});
+  }, [client]);
   const [selectedId, setSelectedId] = useState<string>();
   const selectedRef = useRef<string | undefined>(undefined);
   const [detail, setDetail] = useState<RepositoryState>();
@@ -228,6 +232,11 @@ export function App({ client }: { client: ServiceClient }) {
         <div className="workspace-bar"><span>Personal workspace <span className="workspace-separator">/</span> {navigation.find((item) => item.id === view)?.label ?? 'Tools'}</span><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing} aria-label="Refresh drive status"><ArrowClockwise size={16} className={refreshing ? 'refreshing' : ''} />{refreshing ? 'Checking' : 'Refresh'}</button></div>
         <header className="page-heading"><div><span className="eyebrow">MirageSSD workspace</span><h1>{title}</h1><p>{description}</p></div>{selected && <label className="drive-selector"><span>Selected drive</span><select aria-label="Selected drive" value={selectedId} onChange={(event) => select(event.target.value)} disabled={Boolean(busy)}>{snapshot?.repositories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</header>
 
+        {updateInfo?.update_available && updateInfo.url && (
+          <a className="update-banner" href={updateInfo.url} target="_blank" rel="noreferrer">
+            <DownloadSimple size={14} />{(updateInfo.latest ?? '').replace(/^v/, '')} is available — Download
+          </a>
+        )}
         {connectionError && <div className="feedback feedback-warning" role="alert"><CloudSlash size={22} /><div><strong>{snapshot ? 'Showing the last known state' : 'Let’s reconnect your desktop'}</strong><p>{connectionError}</p>{lastChecked && <small>Last connected at {lastChecked.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Actions are paused until the connection returns.</small>}</div><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Reconnect</button></div>}
         {actionError && <div className="feedback feedback-error" role="alert"><Info size={22} /><div><strong>The operation needs your attention</strong><p>{actionError}</p></div><button className="icon-button" aria-label="Dismiss operation error" onClick={() => setActionError(undefined)}><X size={18} /></button></div>}
         {notice && !actionError && <div className="feedback feedback-success" role="status"><CheckCircle size={21} /><p>{notice}</p><button className="icon-button" aria-label="Dismiss notification" onClick={() => setNotice(undefined)}><X size={18} /></button></div>}
@@ -256,7 +265,7 @@ export function App({ client }: { client: ServiceClient }) {
           {view === 'capacity' && selected && <CapacityView requestedGiB={requestedGiB} plan={capacityPreview} lease={capacityLease} busy={disabled} onRequestedGiB={(value) => { setRequestedGiB(value); setPreview(undefined); }} onPlan={() => void analyzeCapacity()} onAcquire={() => void acquireCapacity()} onRelease={() => void releaseCapacity()} />}
           {view === 'launch' && selected && <Launch mode="verified_local" readiness={readiness} busy={disabled} onMode={() => {}} onPlan={() => void plan()} onMaterialize={() => void materialize()} onAdmit={() => void admit()} onLaunch={() => void perform('Application launch', () => client.launch(selected.id, 'verified_local', readiness.state, readiness.capsuleId))} />}
           {view === 'import' && <ImportWizard />}
-          {view === 'update' && selected && <UpdateView busy={disabled} onBegin={() => void perform('Update preparation', () => client.beginUpdate(selected.id))} onRefresh={() => void perform('Update check', () => client.updateStatus(selected.id))} onCommit={() => void perform('Version activation', () => client.commitUpdate(selected.id))} onRollback={() => void perform('Version rollback', () => client.rollbackUpdate(selected.id))} />}
+          {view === 'update' && selected && <UpdateView client={client} busy={disabled} onBegin={() => void perform('Update preparation', () => client.beginUpdate(selected.id))} onRefresh={() => void perform('Update check', () => client.updateStatus(selected.id))} onCommit={() => void perform('Version activation', () => client.commitUpdate(selected.id))} onRollback={() => void perform('Version rollback', () => client.rollbackUpdate(selected.id))} />}
           {view === 'recovery' && selected && <Recovery busy={disabled} onRepair={() => void perform('Workspace check', () => client.repair(selected.id))} />}
           {view === 'exit' && <UninstallPreparation mounted={selected?.mounted ?? false} />}
           {!selected && !['overview', 'import', 'exit'].includes(view) && <section className="empty-state"><Database size={30} /><h2>Choose a workspace first</h2><p>Your storage and recovery tools appear here when a workspace is connected.</p><button className="primary-button" onClick={() => setView('import')}>Add a workspace <ArrowRight size={17} /></button></section>}
