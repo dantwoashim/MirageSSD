@@ -22,6 +22,10 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 - **Your account, your capacity.** Sign-in uses the system browser. Reported capacity comes from the connected account's quota.
 - **Windows file attributes.** A pinned rclone patch preserves hidden, read-only, system, and archive flags in a local metadata journal.
 - **A single-file installer.** The builder packages the application, patched provider, checksum-verified WinFsp prerequisite, and upstream notices.
+- **System tray companion.** A notification-area icon shows mounted drives, offers per-drive shortcuts and space reclaim, and warns when the service is unreachable.
+- **Explorer integration.** Managed drive letters carry the MirageSSD label and icon, and right-clicking a folder offers "Keep on this device" / "Free up space".
+- **Update checks.** The app checks for newer releases every six hours and links the download — it never auto-installs.
+- **Safe removal.** `mirage volume remove` (or the drive card) deletes local state only, warns about pending uploads, and never touches Drive.
 
 The drive uses storage in your own Google account. Google's `drive.file` access gives MirageSSD a dedicated application-managed folder.
 

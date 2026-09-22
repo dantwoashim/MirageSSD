@@ -50,6 +50,23 @@ Every upload is read back from Drive and hash-verified before MirageSSD will
 evict the local copy — so uploads use roughly twice the bandwidth of the file
 itself, and a file is never dropped locally until Drive provably has it.
 
+## Everyday use
+
+- **Tray.** `mirage-ui.exe --tray` runs MirageSSD in the notification area:
+  tooltip shows your account and mounted drives; right-click for per-drive
+  "Open X:", "Free up space now", diagnostics, and Quit. It registers itself
+  to start at logon.
+- **Explorer verbs.** On a managed drive letter, right-click any folder →
+  "Keep on this device" pins it (never evicted); "Free up space" unpins and
+  reclaims evictable bytes immediately.
+- **Remove a drive from this PC.** `mirage volume remove <id>` (or the
+  "Remove from this PC" button on the drive card) deletes only local state —
+  the Drive folder is never touched. If uploads are still pending the command
+  explains how many bytes would be lost and requires
+  `--discard-unpublished` before it proceeds.
+- **Updates.** The app checks GitHub releases at most every six hours and
+  shows a "new version — Download" banner; nothing auto-downloads.
+
 ## Removing MirageSSD
 
 Uninstall from **Settings → Apps** (or the bundle's entry in Programs and
