@@ -21,6 +21,7 @@ mirage-backend-drive.workspace = true
 mirage-cli.workspace = true
 mirage-ipc.workspace = true
 mirage-types.workspace = true
+mirage-observability.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]

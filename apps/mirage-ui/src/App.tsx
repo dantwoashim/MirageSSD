@@ -217,6 +217,11 @@ export function App({ client }: { client: ServiceClient }) {
         <div className="sidebar-note"><ShieldCheck size={19} aria-hidden="true" /><div>Your storage. Your control.<p>Keep files close. Keep your options open.</p></div></div>
         <AccountChip account={driveAccount} onChanged={() => void refresh()} />
         <div className="service-indicator" role="status"><span className={unavailable ? 'status-dot status-muted' : 'status-dot'} />{snapshot ? connectionError ? 'Connection interrupted' : 'Desktop service connected' : connectionError ? 'Desktop service unavailable' : 'Connecting to your desktop…'}</div>
+        <button className="quiet-button diagnostics-link" onClick={() => {
+          client.diagnosticsCollect()
+            .then((path) => setNotice(`Diagnostics saved to ${path}`))
+            .catch((failure: unknown) => setActionError(failure instanceof Error ? failure.message : String(failure)));
+        }}>Collect diagnostics</button>
       </aside>
 
       <main id="main-content" className="app-main" tabIndex={-1}>

@@ -292,6 +292,13 @@ export class ServiceClient {
     }
   }
 
+  async diagnosticsCollect(): Promise<string> {
+    const payload = await this.apiPost('/api/diagnostics/collect') as { path?: string; error?: string };
+    const path = payload?.path;
+    if (typeof path === 'string' && path.length > 0) return path;
+    throw new Error(typeof payload?.error === 'string' ? payload.error : 'diagnostics failed');
+  }
+
   async driveLoginCancel(): Promise<void> {
     await this.apiPost('/api/drive/login/cancel');
   }

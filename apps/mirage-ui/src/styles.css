@@ -247,3 +247,5 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .account-chip-error { align-items: flex-start; color: #e8b4a8; display: flex; font-size: 11px; gap: 6px; line-height: 1.6; margin-top: 10px; }
 .account-chip-confirm { border: 1px solid var(--line); border-radius: 8px; margin-top: 10px; padding: 10px 12px; }
 .account-chip-confirm p { color: #b2c5b8; font-size: 11px; line-height: 1.7; margin: 0; }
+
+.diagnostics-link { font-size: 11px; margin-top: 8px; min-height: 30px; padding: 4px 10px; }

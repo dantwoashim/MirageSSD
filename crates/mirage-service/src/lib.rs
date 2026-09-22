@@ -10,6 +10,7 @@ mod disk_space;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod ipc_server;
+pub mod logging;
 
 mod capacity;
 mod control_plane;

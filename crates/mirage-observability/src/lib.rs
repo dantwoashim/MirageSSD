@@ -6,6 +6,6 @@ pub mod logging;
 pub mod metrics;
 pub mod redact;
 
-pub use logging::{BoundedJsonLog, Event};
+pub use logging::{BoundedJsonLog, Event, RotatingLog};
 pub use metrics::{MetricSnapshot, Metrics};
 pub use redact::{RegisteredRoots, Secret};

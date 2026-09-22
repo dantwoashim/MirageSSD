@@ -27,6 +27,7 @@ mirage-pack.workspace = true
 mirage-predictor.workspace = true
 mirage-simulator.workspace = true
 mirage-types.workspace = true
+mirage-observability.workspace = true
 async-trait.workspace = true
 futures-executor.workspace = true
 roaring.workspace = true

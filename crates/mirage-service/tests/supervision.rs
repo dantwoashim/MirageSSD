@@ -33,7 +33,7 @@ struct Mock {
 }
 impl Launcher for Mock {
     type Child = Child;
-    fn launch(&self, _: &HostSpec) -> io::Result<Child> {
+    fn launch(&self, _: &HostId, _: &HostSpec) -> io::Result<Child> {
         Ok(Child {
             exits: self.plans.lock().unwrap().pop_front().unwrap(),
             lines: Arc::clone(&self.lines),
@@ -159,7 +159,7 @@ fn request_eviction_parses_mirage_evicted_and_times_out() {
     }
     impl Launcher for EvictLauncher {
         type Child = EvictChild;
-        fn launch(&self, _: &HostSpec) -> io::Result<EvictChild> {
+        fn launch(&self, _: &HostId, _: &HostSpec) -> io::Result<EvictChild> {
             let (tx, rx) = mpsc::channel();
             *self.reply_tx.lock().unwrap() = tx;
             Ok(EvictChild {

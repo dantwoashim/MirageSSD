@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 mod windows_service_host {
-    use mirage_service::{ControlPlaneHandler, NativeMountControl, serve, wake_server};
+    use mirage_service::{ControlPlaneHandler, NativeMountControl, logging, serve, wake_server};
     use std::{
         ffi::OsString,
         sync::{
@@ -32,7 +32,7 @@ mod windows_service_host {
 
     fn service_main(_arguments: Vec<OsString>) {
         if let Err(error) = run_service() {
-            eprintln!("MirageSSD service failed: {error}");
+            logging::log_event("service.failed", &error.to_string());
         }
     }
 
@@ -90,10 +90,10 @@ mod windows_service_host {
         let mount_watchdog = thread::spawn(move || {
             while !mount_watchdog_stopping.load(Ordering::Acquire) {
                 if let Err(error) = mount_watchdog_handler.recover_native_activations() {
-                    eprintln!("MirageSSD native activation recovery failed: {error}");
+                    logging::log_event("mount.recovery_failed", &error.to_string());
                 }
                 if let Err(error) = mount_watchdog_handler.maintain_persistent_mounts() {
-                    eprintln!("MirageSSD persistent mount maintenance failed: {error}");
+                    logging::log_event("mount.maintenance_failed", &error.to_string());
                 }
                 for _ in 0..20 {
                     if mount_watchdog_stopping.load(Ordering::Acquire) {
@@ -108,7 +108,7 @@ mod windows_service_host {
         let floor_watchdog = thread::spawn(move || {
             while !floor_stopping.load(Ordering::Acquire) {
                 if let Err(error) = floor_handler.enforce_disk_floors() {
-                    eprintln!("MirageSSD disk floor enforcement failed: {error}");
+                    logging::log_event("disk.floor_failed", &error.to_string());
                 }
                 for _ in 0..300 {
                     if floor_stopping.load(Ordering::Acquire) {
@@ -119,8 +119,9 @@ mod windows_service_host {
             }
         });
         if let Err(error) = serve(handler.as_ref(), r"\.\pipe\MirageSSD.v1", &stopping) {
-            eprintln!("MirageSSD IPC server stopped: {error}");
+            logging::log_event("ipc.stopped", &error.to_string());
         }
+        logging::log_event("service.stopping", "stop requested");
         let _ = mount_watchdog.join();
         let _ = floor_watchdog.join();
         drop(handler);

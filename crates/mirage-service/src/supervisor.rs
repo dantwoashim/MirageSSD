@@ -85,7 +85,7 @@ pub trait ManagedChild: Send {
 }
 pub trait Launcher: Send + Sync {
     type Child: ManagedChild;
-    fn launch(&self, spec: &HostSpec) -> io::Result<Self::Child>;
+    fn launch(&self, id: &HostId, spec: &HostSpec) -> io::Result<Self::Child>;
 }
 
 pub struct StdChild {
@@ -185,7 +185,7 @@ impl ManagedChild for StdChild {
 pub struct StdLauncher;
 impl Launcher for StdLauncher {
     type Child = StdChild;
-    fn launch(&self, spec: &HostSpec) -> io::Result<StdChild> {
+    fn launch(&self, id: &HostId, spec: &HostSpec) -> io::Result<StdChild> {
         let mut command = Command::new(&spec.executable);
         command.args(host_args(spec));
         command
@@ -210,6 +210,15 @@ impl Launcher for StdLauncher {
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&stderr_tail);
+            // Persist host stderr to logs\host-<repo>.log (8 MiB, keep 5) —
+            // stderr alone is lost under a service.
+            let host_log = mirage_observability::RotatingLog::new(
+                crate::logging::logs_root().join(format!("host-{}.log", id.0)),
+                8 * 1024 * 1024,
+                5,
+            )
+            .ok()
+            .map(Arc::new);
             thread::spawn(move || {
                 const CAP: usize = 8192;
                 let mut reader = BufReader::new(stderr);
@@ -218,8 +227,16 @@ impl Launcher for StdLauncher {
                     if read == 0 {
                         break;
                     }
+                    let text = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    for line in text.lines() {
+                        if !line.trim().is_empty()
+                            && let Some(log) = &host_log
+                        {
+                            log.write_line(line);
+                        }
+                    }
                     if let Ok(mut guard) = tail.lock() {
-                        guard.push_str(&String::from_utf8_lossy(&buf[..read]));
+                        guard.push_str(&text);
                         let excess = guard.len().saturating_sub(CAP);
                         if excess > 0 {
                             guard.drain(..excess);
@@ -350,7 +367,7 @@ impl<L: Launcher> Supervisor<L> {
                 "host already running",
             ));
         }
-        let child = self.launcher.launch(spec)?;
+        let child = self.launcher.launch(&id, spec)?;
         self.hosts.insert(
             id,
             Host {

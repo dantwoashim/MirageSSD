@@ -58,6 +58,27 @@ mod windows_host {
             return Ok(());
         }
 
+        // One UI per user: a second launch exits quietly; the first instance
+        // already owns the browser tab and the listener.
+        let _single_instance = {
+            let name: Vec<u16> = r"Local\MirageSSD.UI".encode_utf16().chain([0]).collect();
+            let handle = unsafe {
+                windows_sys::Win32::System::Threading::CreateMutexW(
+                    std::ptr::null(),
+                    0,
+                    name.as_ptr(),
+                )
+            };
+            if handle.is_null() {
+                return Err("UI single-instance mutex failed".into());
+            }
+            const ERROR_ALREADY_EXISTS: u32 = 183;
+            if unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS {
+                return Ok(());
+            }
+            handle
+        };
+
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let address = listener.local_addr()?;
         let origin = format!("http://127.0.0.1:{}", address.port());
@@ -73,7 +94,7 @@ mod windows_host {
             && store.is_file()
             && let Err(error) = mirage_cli::commands::agent::install_logon_registration()
         {
-            eprintln!("mirage-ui: logon agent registration failed: {error}");
+            log_event("agent.registration_failed", &error.to_string());
         }
         if !no_open {
             open_browser(&format!("{origin}/#{token}"))?;
@@ -98,10 +119,10 @@ mod windows_host {
                             br#"{"error":"local UI bridge failed"}"#,
                             false,
                         );
-                        eprintln!("MirageSSD UI request failed: {error}");
+                        log_event("request.failed", &error.to_string());
                     }
                 }
-                Err(error) => eprintln!("MirageSSD UI accept failed: {error}"),
+                Err(error) => log_event("accept.failed", &error.to_string()),
             }
         }
         Ok(())
@@ -136,6 +157,38 @@ mod windows_host {
         Failed {
             message: String,
         },
+    }
+
+    /// `%LOCALAPPDATA%\MirageSSD\logs\ui.log` — persistent UI bridge log
+    /// (8 MiB, keep 5). Never log tokens or credentials.
+    fn ui_log() -> std::sync::Arc<mirage_observability::RotatingLog> {
+        use std::sync::Arc;
+        static LOG: std::sync::OnceLock<Arc<mirage_observability::RotatingLog>> =
+            std::sync::OnceLock::new();
+        Arc::clone(LOG.get_or_init(|| {
+            let path = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join("MirageSSD")
+                .join("logs")
+                .join("ui.log");
+            Arc::new(
+                mirage_observability::RotatingLog::new(path, 8 * 1024 * 1024, 5)
+                    .expect("ui log bounds are nonzero"),
+            )
+        }))
+    }
+
+    fn log_event(event: &str, detail: &str) {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let detail = detail.replace(['\\', '"', '\n', '\r'], "_");
+        ui_log().write_line(&format!(
+            "{{\"ts\":{seconds},\"event\":\"{event}\",\"detail\":\"{detail}\"}}"
+        ));
+        eprintln!("MirageSSD UI {event}: {detail}");
     }
 
     fn authorize(request: &HttpRequest, origin: &str, token: &str) -> Result<(), Vec<u8>> {
@@ -453,6 +506,29 @@ mod windows_host {
                     200,
                     "application/json; charset=utf-8",
                     &serde_json::to_vec(&serde_json::json!({"cancelled": cancelled}))?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/diagnostics/collect") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = match mirage_cli::commands::diagnostics::collect_zip(None) {
+                    Ok(path) => serde_json::json!({"ok": true, "path": path}),
+                    Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
                     false,
                 )?;
             }

@@ -10,6 +10,7 @@ mod config;
 mod db_check;
 mod device_backup;
 mod device_drive;
+pub mod diagnostics;
 mod disk;
 mod drive_gate;
 mod drive_live;
@@ -134,6 +135,11 @@ pub enum Command {
     Volume {
         #[command(subcommand)]
         command: VolumeCommand,
+    },
+    /// Collect service, host, UI, and agent logs plus status into a zip.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
     },
     /// Mount a prepared repository.
     Mount {
@@ -703,6 +709,16 @@ pub enum VolumeCommand {
     },
     /// List this user's managed Drive-backed volumes.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticsCommand {
+    /// Write service/host/UI/agent logs and live status into a zip bundle.
+    Collect {
+        /// Output path (default: %USERPROFILE%\Desktop\MirageSSD-diagnostics-<ts>.zip).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1521,6 +1537,9 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             VolumeCommand::List => {
                 service::emit(serde_json::json!({"volumes": volume::list(None)?}), json)
             }
+        },
+        Command::Diagnostics { command } => match command {
+            DiagnosticsCommand::Collect { out } => diagnostics::collect(out.as_deref(), json),
         },
         Command::Capsule { command } => match command {
             CapsuleCommand::Plan {
