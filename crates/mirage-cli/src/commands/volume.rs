@@ -298,68 +298,159 @@ fn create_in(
     let repository_id = random_repository_id()?;
     let generation = GenerationId::ZERO;
     let root = volumes_root.join(repository_id.to_string());
+    match create_staged(
+        &root,
+        repository_id,
+        generation,
+        &name,
+        &letter,
+        spec,
+        backend,
+        transport,
+        progress,
+    ) {
+        Ok((mounted, applied_floor)) => {
+            // Sign-in happened at volume creation, so ensure the per-user
+            // agent is registered to keep the volume mounted and
+            // authenticated after reboot.
+            let _ = super::agent::install_logon_registration();
+            let mount_point = mounted["mount_point"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("{letter}:")));
+            Ok(VolumeCreated {
+                repository_id,
+                name,
+                drive_letter: letter,
+                budget_bytes: spec.budget_bytes,
+                floor_bytes: applied_floor,
+                account_id: backend.account_id().to_owned(),
+                mount_point,
+                state: mounted["state"]
+                    .as_str()
+                    .unwrap_or("ready_mounted")
+                    .to_owned(),
+            })
+        }
+        Err((step, published, error)) => {
+            // Only this run's directory — never anything else under volumes/.
+            let _ = std::fs::remove_dir_all(&root);
+            let remote_note = if published {
+                " A Drive folder for this repository may have been left behind and can be deleted from Google Drive."
+            } else {
+                ""
+            };
+            Err(MirageError::invalid_argument(format!(
+                "volume create failed at \"{step}\" (repository {repository_id}): {error}.{remote_note}"
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_staged(
+    root: &Path,
+    repository_id: RepositoryId,
+    generation: GenerationId,
+    name: &str,
+    letter: &str,
+    spec: &VolumeSpec,
+    backend: &dyn VolumeBackend,
+    transport: Option<&dyn ServiceTransport>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(serde_json::Value, Option<u64>), (String, bool, MirageError)> {
     let import = root.join("import");
     let native = root.join("native");
     let empty = root.join("empty-source");
-    for directory in [&import, &native, &empty] {
-        std::fs::create_dir_all(directory).map_err(MirageError::from)?;
-    }
+    let mut published = false;
+    let staged = |step: &'static str, published: bool, result: Result<(), MirageError>| {
+        result.map_err(|error| (step.to_owned(), published, error))
+    };
+    staged(
+        "creating volume directories",
+        published,
+        (|| {
+            for directory in [&import, &native, &empty] {
+                std::fs::create_dir_all(directory).map_err(MirageError::from)?;
+            }
+            Ok(())
+        })(),
+    )?;
     // Registration requires a launcher file inside the native root; managed
     // volumes are Explorer-browsed rather than launched, so a marker suffices.
     let launcher = PathBuf::from("volume.mirage");
-    std::fs::write(
-        native.join(&launcher),
-        b"MirageSSD managed volume marker.\n",
-    )
-    .map_err(MirageError::from)?;
+    staged(
+        "creating the launcher marker",
+        published,
+        std::fs::write(
+            native.join(&launcher),
+            b"MirageSSD managed volume marker.\n",
+        )
+        .map_err(MirageError::from),
+    )?;
 
     progress("Creating the volume index");
-    repo_import_local::run(
-        true,
-        &empty,
-        &import,
-        repository_id,
-        generation,
-        1_048_576,
-        536_870_912,
-        &[],
-        1_048_576,
-        false,
-        false,
-        true,
-        false,
+    staged(
+        "creating the volume index",
+        published,
+        repo_import_local::run(
+            true,
+            &empty,
+            &import,
+            repository_id,
+            generation,
+            1_048_576,
+            536_870_912,
+            &[],
+            1_048_576,
+            false,
+            false,
+            true,
+            false,
+        ),
     )?;
     // A fresh volume publishes exactly one signed empty generation; the
     // random signer is not persisted because no later commit re-signs it.
     let mut key_id = [0_u8; 16];
     let mut key = [0_u8; 32];
     getrandom::fill(&mut key_id)
-        .map_err(|_| MirageError::internal_invariant("operating-system randomness failed"))?;
-    getrandom::fill(&mut key)
-        .map_err(|_| MirageError::internal_invariant("operating-system randomness failed"))?;
+        .and_then(|()| getrandom::fill(&mut key))
+        .map_err(|_| {
+            (
+                "initializing the signer".to_owned(),
+                published,
+                MirageError::internal_invariant("operating-system randomness failed"),
+            )
+        })?;
     let signer = InMemoryTestSigner::new(key_id, key);
 
     progress("Publishing to Google Drive");
-    backend.publish(&import, repository_id, &signer)?;
+    backend
+        .publish(&import, repository_id, &signer)
+        .map_err(|error| ("publishing to Google Drive".to_owned(), published, error))?;
+    published = true;
 
-    let token = mirage_ipc::SensitiveString::new(backend.access_token().to_owned())?;
+    let token = mirage_ipc::SensitiveString::new(backend.access_token().to_owned())
+        .map_err(|error| ("preparing the mount token".to_owned(), published, error))?;
     let mounted = onboard(
         repository_id,
-        &name,
+        name,
         &native,
         &import,
         &launcher,
         generation,
-        &letter,
+        letter,
         spec.budget_bytes,
         token,
         transport,
         progress,
-    )?;
+    )
+    .map_err(|error| ("onboarding with the service".to_owned(), published, error))?;
 
     let mut applied_floor = None;
     if let Some(floor) = spec.floor_bytes {
-        let disk = state_volume()?;
+        let disk = state_volume()
+            .map_err(|error| ("reading the state disk".to_owned(), published, error))?;
         service_request(
             transport,
             mirage_ipc::Command::DiskFloorSet {
@@ -367,31 +458,11 @@ fn create_in(
                 floor_bytes: floor,
                 hysteresis_bytes: None,
             },
-        )?;
+        )
+        .map_err(|error| ("setting the free-space floor".to_owned(), published, error))?;
         applied_floor = Some(floor);
     }
-
-    // Sign-in happened at volume creation, so ensure the per-user agent is
-    // registered to keep the volume mounted and authenticated after reboot.
-    let _ = super::agent::install_logon_registration();
-
-    let mount_point = mounted["mount_point"]
-        .as_str()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("{letter}:")));
-    Ok(VolumeCreated {
-        repository_id,
-        name,
-        drive_letter: letter,
-        budget_bytes: spec.budget_bytes,
-        floor_bytes: applied_floor,
-        account_id: backend.account_id().to_owned(),
-        mount_point,
-        state: mounted["state"]
-            .as_str()
-            .unwrap_or("ready_mounted")
-            .to_owned(),
-    })
+    Ok((mounted, applied_floor))
 }
 
 fn service_request(
@@ -712,6 +783,65 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
         assert!(matches!(requests[3], mirage_ipc::Command::Mount { .. }));
+    }
+
+    #[test]
+    fn failed_create_rolls_back_the_local_dirs_and_reports_the_step() {
+        struct FailingTransport;
+        impl ServiceTransport for FailingTransport {
+            fn exchange(&self, request: &Request) -> Result<Response, MirageError> {
+                if matches!(
+                    request.command,
+                    mirage_ipc::Command::RepositoryRegister { .. }
+                ) {
+                    return Err(MirageError::provider_unavailable(
+                        "service pipe is unavailable",
+                    ));
+                }
+                Ok(Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    body: ResponseBody::Json(serde_json::json!({"ok": true})),
+                })
+            }
+        }
+        struct PublishOk;
+        impl VolumeBackend for PublishOk {
+            fn account_id(&self) -> &str {
+                "a@b.c"
+            }
+            fn access_token(&self) -> &str {
+                "t"
+            }
+            fn publish(
+                &self,
+                _import: &Path,
+                _repository_id: RepositoryId,
+                _signer: &dyn CommitSigner,
+            ) -> Result<(), MirageError> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("volumes root");
+        let error = create_in(
+            root.path(),
+            &VolumeSpec {
+                name: "Test".to_owned(),
+                drive_letter: "N".to_owned(),
+                budget_bytes: 8 * GIB,
+                floor_bytes: None,
+            },
+            &PublishOk,
+            &mut |_| {},
+            Some(&FailingTransport),
+        )
+        .expect_err("register failure must surface");
+        let message = error.to_string();
+        assert!(message.contains("onboarding with the service"), "{message}");
+        assert!(message.contains("Drive folder"), "{message}");
+        // The only directory under volumes/ was ours — it is gone now.
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 
     #[test]
