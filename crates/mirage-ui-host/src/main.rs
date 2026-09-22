@@ -70,6 +70,18 @@ mod windows_host {
         let origin = format!("http://127.0.0.1:{}", address.port());
         let token = random_token()?;
         let shared = std::sync::Arc::new(std::sync::Mutex::new(SharedState::default()));
+        // If this user has a stored Drive session, (re)register the logon
+        // agent idempotently — overwrites entries written by older builds
+        // that pointed at mirage-ui.exe instead of mirage.exe.
+        let token_store_path = drive_token_store
+            .clone()
+            .or_else(|| mirage_cli::commands::backend_login::default_token_store_path().ok());
+        if let Some(store) = token_store_path.as_deref()
+            && store.is_file()
+            && let Err(error) = mirage_cli::commands::agent::install_logon_registration()
+        {
+            eprintln!("mirage-ui: logon agent registration failed: {error}");
+        }
         if !no_open {
             open_browser(&format!("{origin}/#{token}"))?;
         }

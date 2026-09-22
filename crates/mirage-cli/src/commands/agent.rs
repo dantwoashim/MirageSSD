@@ -5,7 +5,7 @@
 //! and never logs tokens.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mirage_types::{GenerationId, MirageError, RepositoryId};
@@ -142,6 +142,29 @@ fn mount_letter(repository_id: RepositoryId, detail: &serde_json::Value) -> Stri
 
 /// Registers `mirage.exe agent` under the per-user Run key so volumes
 /// reconnect at every Windows sign-in. No elevation required.
+/// The Run-key command line for the agent. When called in-process from a
+/// sibling binary (mirage-ui.exe), resolve `mirage.exe` next to it rather
+/// than registering the UI executable — it ignores arguments.
+#[cfg(windows)]
+fn agent_command_line(current_exe: &Path) -> Result<String, MirageError> {
+    let executable = if current_exe.file_stem().is_some_and(|stem| stem == "mirage") {
+        current_exe.to_path_buf()
+    } else {
+        current_exe
+            .parent()
+            .map(|dir| dir.join("mirage.exe"))
+            .unwrap_or_else(|| PathBuf::from("mirage.exe"))
+    };
+    if !executable.is_file() {
+        return Err(MirageError::invalid_argument(format!(
+            "agent executable not found beside {}: {}",
+            current_exe.display(),
+            executable.display()
+        )));
+    }
+    Ok(format!("\"{}\" agent", executable.display()))
+}
+
 pub fn install_logon_registration() -> Result<(), MirageError> {
     #[cfg(windows)]
     {
@@ -164,7 +187,7 @@ fn install_logon_registration_windows() -> Result<(), MirageError> {
     };
 
     let executable = std::env::current_exe().map_err(MirageError::from)?;
-    let command = format!("\"{}\" agent", executable.display());
+    let command = agent_command_line(&executable)?;
     let subkey: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\Run")
         .encode_wide()
         .chain(std::iter::once(0))
@@ -306,5 +329,37 @@ impl AgentLog {
         {
             let _ = writeln!(file, "{stamp} {message}");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_command_line_prefers_mirage_exe_beside_the_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = dir.path().join("mirage.exe");
+        std::fs::write(&cli, b"x").expect("cli stub");
+        let ui = dir.path().join("mirage-ui.exe");
+        let command = agent_command_line(&ui).expect("command");
+        assert_eq!(command, format!("\"{}\" agent", cli.display()));
+    }
+
+    #[test]
+    fn agent_command_line_uses_mirage_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = dir.path().join("mirage.exe");
+        std::fs::write(&cli, b"x").expect("cli stub");
+        let command = agent_command_line(&cli).expect("command");
+        assert_eq!(command, format!("\"{}\" agent", cli.display()));
+    }
+
+    #[test]
+    fn agent_command_line_fails_when_mirage_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ui = dir.path().join("mirage-ui.exe");
+        let error = agent_command_line(&ui).expect_err("must fail without mirage.exe");
+        assert!(format!("{error}").contains("agent executable not found"));
     }
 }
