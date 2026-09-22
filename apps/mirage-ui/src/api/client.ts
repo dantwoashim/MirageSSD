@@ -300,6 +300,11 @@ export class ServiceClient {
     }
   }
 
+  async serviceStart(): Promise<void> {
+    const payload = await this.apiPost('/api/service/start') as { ok?: boolean };
+    if (!payload?.ok) throw new Error('Windows did not offer to start the service.');
+  }
+
   async updateCheck(): Promise<UpdateCheck> {
     return await this.apiGet('/api/update/check') as UpdateCheck;
   }

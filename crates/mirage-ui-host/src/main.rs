@@ -621,6 +621,46 @@ mod windows_host {
                     false,
                 )?;
             }
+            ("POST", "/api/service/start") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                // `sc start` needs elevation — ShellExecute "runas" surfaces
+                // the UAC prompt instead of failing silently.
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("mirage.exe")));
+                let started = exe.is_some_and(|exe| {
+                    let operation = wide("runas");
+                    let file = wide(&exe.to_string_lossy());
+                    let params = wide("service start");
+                    unsafe {
+                        ShellExecuteW(
+                            std::ptr::null_mut(),
+                            operation.as_ptr(),
+                            file.as_ptr(),
+                            params.as_ptr(),
+                            std::ptr::null(),
+                            SW_SHOWNORMAL,
+                        ) as isize
+                            > 32
+                    }
+                });
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&serde_json::json!({"ok": started}))?,
+                    false,
+                )?;
+            }
             ("GET", "/api/update/check") => {
                 if let Err(response) = authorize(&request, origin, token) {
                     write_response(
