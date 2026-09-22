@@ -205,7 +205,7 @@ void FileSystemHost::set_drive_token(const std::string& token){if(engine_){const
 void FileSystemHost::request_eviction(const std::string& bytes){std::uint64_t freed=0;std::uint64_t blocked=0;if(engine_){const auto status=mirage_engine_evict_published(engine_,std::strtoull(bytes.c_str(),nullptr,10),&freed,&blocked);if(status!=MIRAGE_OK){std::cerr<<"evict failed status="<<static_cast<int>(status)<<"\n";return;}}std::cout<<"MIRAGE_EVICTED "<<freed<<"\n"<<std::flush;}
 void FileSystemHost::begin_pending() noexcept{if(pending_count_.fetch_add(1)==0)ResetEvent(pending_zero_);}
 void FileSystemHost::end_pending() noexcept{if(pending_count_.fetch_sub(1)==1)SetEvent(pending_zero_);}
-void FileSystemHost::stop() noexcept{if(fs_){WaitForSingleObject(pending_zero_,INFINITE);FspFileSystemStopDispatcher(fs_);FspFileSystemDelete(fs_);fs_=nullptr;}if(engine_){// Quiesced means no open handles and no extent version in use: safe to
+void FileSystemHost::stop() noexcept{if(fs_){if(WaitForSingleObject(pending_zero_,60000)==WAIT_TIMEOUT){const auto abandoned=pending_count_.load();std::cerr<<"stop: "<<abandoned<<" pending read(s) abandoned after 60s drain\n";}FspFileSystemStopDispatcher(fs_);FspFileSystemDelete(fs_);fs_=nullptr;}if(engine_){// Quiesced means no open handles and no extent version in use: safe to
     // compact superseded versions and reclaim dead payloads. A compaction
     // failure must never fail the unmount — log and leave data in place.
     if(mirage_engine_quiesce(engine_,10000)==MIRAGE_OK){const auto compact=mirage_engine_compact(engine_);if(compact!=MIRAGE_OK)std::cerr<<"compaction failed status="<<static_cast<int>(compact)<<"\n";}}if(stop_event_)SetEvent(stop_event_);}
