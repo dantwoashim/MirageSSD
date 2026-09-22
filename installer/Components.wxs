@@ -47,6 +47,13 @@
         <File Id="MirageUiJavaScript" Source="$(var.UiDir)\assets\mirage-ui.js" KeyPath="yes" />
         <File Id="MirageUiStyles" Source="$(var.UiDir)\assets\mirage-ui.css" />
       </Component>
+      <Component Id="OAuthClientComponent" Guid="7C2E8B41-9D3A-4E6F-B8C5-2F1A0D4E9C3B" Bitness="always64">
+        <!-- Public Google Desktop OAuth client, shipped beside the exe so
+             `mirage backend login`/`volume create`/the UI default to it.
+             Unversioned: remove first on upgrade like mirage-fs.exe. -->
+        <File Id="MirageOAuthClient" Source="$(var.OAuthDesktop)" Name="oauth-desktop.json" KeyPath="yes" />
+        <RemoveFile Id="RemoveStaleOAuthClient" Name="oauth-desktop.json" On="install" />
+      </Component>
       <Component Id="DataRootComponent" Directory="DATAROOT" Guid="865888DE-20BB-409F-9A81-C6694ED48671" Bitness="always64">
         <CreateFolder>
           <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />

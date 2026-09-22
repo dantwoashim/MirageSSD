@@ -3,7 +3,9 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.7',
+  [string]$Version = '0.1.8',
+  [Parameter(Mandatory = $true)]
+  [string]$DriveClientCredentials,
   [long]$SourceDateEpoch = 946684800,
   [string]$Output = "$PSScriptRoot\out"
 )
@@ -68,6 +70,20 @@ function Set-CompoundFileRootModifiedTime([string]$Path, [DateTime]$Timestamp) {
 $repo = Split-Path -Parent $PSScriptRoot
 $bin = if ($BinDir) { (Resolve-Path -LiteralPath $BinDir).Path } else { Join-Path $repo "target\$Configuration" }
 $ui = if ($UiDir) { (Resolve-Path -LiteralPath $UiDir).Path } else { Join-Path $repo 'apps\mirage-ui\dist' }
+
+# The shipped OAuth Desktop client JSON is a public client; validate its
+# shape and stage it under its installed name so the MSI can embed it.
+$credentials = (Resolve-Path -LiteralPath $DriveClientCredentials).Path
+$parsed = Get-Content -LiteralPath $credentials -Raw | ConvertFrom-Json
+if (-not $parsed.installed -or -not $parsed.installed.client_id -or -not $parsed.installed.client_secret) {
+  throw 'DriveClientCredentials is not a Google "installed" (Desktop) OAuth client JSON.'
+}
+if (-not ($parsed.installed.client_id -match '\.apps\.googleusercontent\.com$')) {
+  throw 'DriveClientCredentials client_id is not an apps.googleusercontent.com client.'
+}
+$oauth = Join-Path $Output 'oauth-desktop.json'
+New-Item -ItemType Directory -Force -Path $Output | Out-Null
+Copy-Item -LiteralPath $credentials -Destination $oauth -Force
 $required = @((Join-Path $bin 'mirage.exe'), (Join-Path $bin 'mirage-service.exe'), (Join-Path $bin 'mirage-fs.exe'), (Join-Path $bin 'mirage-ui.exe'), (Join-Path $ui 'index.html'), (Join-Path $ui 'assets\mirage-ui.js'), (Join-Path $ui 'assets\mirage-ui.css'))
 foreach ($path in $required) { if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release binary: $path" } }
 $productCode = New-DeterministicGuid "MirageSSD/ProductCode/$Version"
@@ -88,6 +104,7 @@ $arguments = @(
   '-arch', 'x64',
   '-d', "BinDir=$bin",
   '-d', "UiDir=$ui",
+  '-d', "OAuthDesktop=$oauth",
   '-d', "ProductVersion=$Version",
   '-d', "ProductCode=$productCode",
   '-o', (Join-Path $Output 'MirageSSD.msi'),
