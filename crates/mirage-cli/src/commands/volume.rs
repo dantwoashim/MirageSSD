@@ -332,7 +332,12 @@ fn create_in(
                     .to_owned(),
             })
         }
-        Err((step, published, error)) => {
+        Err((step, published, onboarded, error)) => {
+            if onboarded {
+                // The repository stays registered (there is no unregister
+                // command), but it must not stay mounted over deleted files.
+                let _ = service_request(transport, mirage_ipc::Command::Unmount { repository_id });
+            }
             // Only this run's directory — never anything else under volumes/.
             let _ = std::fs::remove_dir_all(&root);
             let remote_note = if published {
@@ -340,8 +345,13 @@ fn create_in(
             } else {
                 ""
             };
+            let registered_note = if onboarded {
+                " The repository is still registered with the service; its native/import files were removed."
+            } else {
+                ""
+            };
             Err(MirageError::invalid_argument(format!(
-                "volume create failed at \"{step}\" (repository {repository_id}): {error}.{remote_note}"
+                "volume create failed at \"{step}\" (repository {repository_id}): {error}.{remote_note}{registered_note}"
             )))
         }
     }
@@ -358,13 +368,13 @@ fn create_staged(
     backend: &dyn VolumeBackend,
     transport: Option<&dyn ServiceTransport>,
     progress: &mut dyn FnMut(&str),
-) -> Result<(serde_json::Value, Option<u64>), (String, bool, MirageError)> {
+) -> Result<(serde_json::Value, Option<u64>), (String, bool, bool, MirageError)> {
     let import = root.join("import");
     let native = root.join("native");
     let empty = root.join("empty-source");
     let mut published = false;
     let staged = |step: &'static str, published: bool, result: Result<(), MirageError>| {
-        result.map_err(|error| (step.to_owned(), published, error))
+        result.map_err(|error| (step.to_owned(), published, false, error))
     };
     staged(
         "creating volume directories",
@@ -419,6 +429,7 @@ fn create_staged(
             (
                 "initializing the signer".to_owned(),
                 published,
+                false,
                 MirageError::internal_invariant("operating-system randomness failed"),
             )
         })?;
@@ -427,11 +438,25 @@ fn create_staged(
     progress("Publishing to Google Drive");
     backend
         .publish(&import, repository_id, &signer)
-        .map_err(|error| ("publishing to Google Drive".to_owned(), published, error))?;
+        .map_err(|error| {
+            (
+                "publishing to Google Drive".to_owned(),
+                published,
+                false,
+                error,
+            )
+        })?;
     published = true;
 
-    let token = mirage_ipc::SensitiveString::new(backend.access_token().to_owned())
-        .map_err(|error| ("preparing the mount token".to_owned(), published, error))?;
+    let token =
+        mirage_ipc::SensitiveString::new(backend.access_token().to_owned()).map_err(|error| {
+            (
+                "preparing the mount token".to_owned(),
+                published,
+                false,
+                error,
+            )
+        })?;
     let mounted = onboard(
         repository_id,
         name,
@@ -445,12 +470,19 @@ fn create_staged(
         transport,
         progress,
     )
-    .map_err(|error| ("onboarding with the service".to_owned(), published, error))?;
+    .map_err(|error| {
+        (
+            "onboarding with the service".to_owned(),
+            published,
+            false,
+            error,
+        )
+    })?;
 
     let mut applied_floor = None;
     if let Some(floor) = spec.floor_bytes {
         let disk = state_volume()
-            .map_err(|error| ("reading the state disk".to_owned(), published, error))?;
+            .map_err(|error| ("reading the state disk".to_owned(), published, true, error))?;
         service_request(
             transport,
             mirage_ipc::Command::DiskFloorSet {
@@ -459,7 +491,14 @@ fn create_staged(
                 hysteresis_bytes: None,
             },
         )
-        .map_err(|error| ("setting the free-space floor".to_owned(), published, error))?;
+        .map_err(|error| {
+            (
+                "setting the free-space floor".to_owned(),
+                published,
+                true,
+                error,
+            )
+        })?;
         applied_floor = Some(floor);
     }
     Ok((mounted, applied_floor))
@@ -841,6 +880,82 @@ mod tests {
         assert!(message.contains("onboarding with the service"), "{message}");
         assert!(message.contains("Drive folder"), "{message}");
         // The only directory under volumes/ was ours — it is gone now.
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn failed_create_after_mount_unmounts_and_reports_registration() {
+        struct FloorFails {
+            requests: Mutex<Vec<mirage_ipc::Command>>,
+        }
+        impl ServiceTransport for FloorFails {
+            fn exchange(&self, request: &Request) -> Result<Response, MirageError> {
+                self.requests.lock().unwrap().push(request.command.clone());
+                if matches!(request.command, mirage_ipc::Command::DiskFloorSet { .. }) {
+                    return Err(MirageError::backend_permission_denied("denied"));
+                }
+                let body = if matches!(request.command, mirage_ipc::Command::Mount { .. }) {
+                    ResponseBody::Json(
+                        serde_json::json!({"state": "ready_mounted", "mount_point": "N:"}),
+                    )
+                } else {
+                    ResponseBody::Json(serde_json::json!({"ok": true}))
+                };
+                Ok(Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    body,
+                })
+            }
+        }
+        struct PublishOk;
+        impl VolumeBackend for PublishOk {
+            fn account_id(&self) -> &str {
+                "a@b.c"
+            }
+            fn access_token(&self) -> &str {
+                "t"
+            }
+            fn publish(
+                &self,
+                _import: &Path,
+                _repository_id: RepositoryId,
+                _signer: &dyn CommitSigner,
+            ) -> Result<(), MirageError> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("volumes root");
+        let transport = FloorFails {
+            requests: Mutex::new(Vec::new()),
+        };
+        let error = create_in(
+            root.path(),
+            &VolumeSpec {
+                name: "Test".to_owned(),
+                drive_letter: "N".to_owned(),
+                budget_bytes: 8 * GIB,
+                floor_bytes: Some(20 * GIB),
+            },
+            &PublishOk,
+            &mut |_| {},
+            Some(&transport),
+        )
+        .expect_err("floor failure must surface");
+        let message = error.to_string();
+        assert!(
+            message.contains("setting the free-space floor"),
+            "{message}"
+        );
+        assert!(message.contains("still registered"), "{message}");
+        let requests = transport.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|command| matches!(command, mirage_ipc::Command::Unmount { .. })),
+            "a mounted volume must be unmounted on rollback: {requests:?}"
+        );
         assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 

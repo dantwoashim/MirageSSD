@@ -32,7 +32,7 @@ impl Authorization {
         let allowed = match principal.role {
             PrincipalRole::Service | PrincipalRole::Administrator => true,
             PrincipalRole::RepositoryOwner => true,
-            PrincipalRole::ReadOnly => !command.mutates(),
+            PrincipalRole::ReadOnly => !command.mutates() || command.user_mutable(),
         };
         if allowed {
             Ok(())

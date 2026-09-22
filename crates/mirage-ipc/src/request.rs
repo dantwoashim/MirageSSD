@@ -289,6 +289,16 @@ impl Command {
                 | Self::Cancel { .. }
         )
     }
+
+    /// Mutating commands the interactive pipe user may still perform:
+    /// per-machine disk floors and on-demand reclaim protect the user's own
+    /// disk, so they are not elevation-gated like repository administration.
+    pub const fn user_mutable(&self) -> bool {
+        matches!(
+            self,
+            Self::DiskFloorSet { .. } | Self::DiskFloorClear { .. } | Self::DiskReclaimNow
+        )
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
