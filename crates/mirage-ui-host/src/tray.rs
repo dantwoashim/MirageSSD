@@ -147,50 +147,52 @@ impl Tray {
         self.signed_in = self.account.is_some();
     }
 
-    unsafe fn menu(&mut self) {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return;
-        }
-        let open = wide("Open MirageSSD");
-        AppendMenuW(menu, MF_STRING, CMD_OPEN as usize, open.as_ptr());
-        for (i, letter) in self.mounted.iter().enumerate() {
-            let text = wide(&format!("Open {letter}"));
-            AppendMenuW(
+    fn menu(&mut self) {
+        unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            let open = wide("Open MirageSSD");
+            AppendMenuW(menu, MF_STRING, CMD_OPEN as usize, open.as_ptr());
+            for (i, letter) in self.mounted.iter().enumerate() {
+                let text = wide(&format!("Open {letter}"));
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    (CMD_OPEN_DRIVE_BASE + i as u16) as usize,
+                    text.as_ptr(),
+                );
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            let reclaim = wide("Free up space now");
+            AppendMenuW(menu, MF_STRING, CMD_RECLAIM as usize, reclaim.as_ptr());
+            let sign = wide(if self.signed_in {
+                "Sign out…"
+            } else {
+                "Sign in…"
+            });
+            AppendMenuW(menu, MF_STRING, CMD_SIGNIN as usize, sign.as_ptr());
+            let diag = wide("Collect diagnostics");
+            AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS as usize, diag.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            let quit = wide("Quit");
+            AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, quit.as_ptr());
+            let mut point = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut point);
+            SetForegroundWindow(self.hwnd);
+            let command = TrackPopupMenu(
                 menu,
-                MF_STRING,
-                (CMD_OPEN_DRIVE_BASE + i as u16) as usize,
-                text.as_ptr(),
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                point.x,
+                point.y,
+                0,
+                self.hwnd,
+                ptr::null(),
             );
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+            self.command(command as u16);
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        let reclaim = wide("Free up space now");
-        AppendMenuW(menu, MF_STRING, CMD_RECLAIM as usize, reclaim.as_ptr());
-        let sign = wide(if self.signed_in {
-            "Sign out…"
-        } else {
-            "Sign in…"
-        });
-        AppendMenuW(menu, MF_STRING, CMD_SIGNIN as usize, sign.as_ptr());
-        let diag = wide("Collect diagnostics");
-        AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS as usize, diag.as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        let quit = wide("Quit");
-        AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, quit.as_ptr());
-        let mut point = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut point);
-        SetForegroundWindow(self.hwnd);
-        let command = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
-            point.x,
-            point.y,
-            0,
-            self.hwnd,
-            ptr::null(),
-        );
-        windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
-        self.command(command as u16);
     }
 
     fn command(&mut self, command: u16) {
@@ -243,10 +245,12 @@ unsafe extern "system" fn wnd_proc(
     if message == WM_TRAYICON {
         let tray = TRAY.load(Ordering::SeqCst) as *mut Tray;
         if !tray.is_null() {
-            match lparam as u32 {
-                WM_LBUTTONUP => (*tray).command(CMD_OPEN),
-                WM_RBUTTONUP => (*tray).menu(),
-                _ => {}
+            unsafe {
+                match lparam as u32 {
+                    WM_LBUTTONUP => (*tray).command(CMD_OPEN),
+                    WM_RBUTTONUP => (*tray).menu(),
+                    _ => {}
+                }
             }
         }
         return 0;
@@ -254,12 +258,16 @@ unsafe extern "system" fn wnd_proc(
     if message == WM_COMMAND {
         let tray = TRAY.load(Ordering::SeqCst) as *mut Tray;
         if !tray.is_null() {
-            (*tray).command((wparam & 0xffff) as u16);
+            unsafe {
+                (*tray).command((wparam & 0xffff) as u16);
+            }
         }
         return 0;
     }
     if message == WM_DESTROY {
-        PostQuitMessage(0);
+        unsafe {
+            PostQuitMessage(0);
+        }
         return 0;
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
