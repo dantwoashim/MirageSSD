@@ -65,6 +65,14 @@ pub enum Command {
         /// Repository id (hex) of the managed volume.
         repository_id: mirage_types::RepositoryId,
     },
+    /// Shell-verb entry points for Explorer's per-drive context menu
+    /// (`Directory\shell\MirageSSD.*`); takes an absolute `X:\path` and
+    /// no-ops when the path isn't under the managed volume letter.
+    #[command(hide = true)]
+    ShellVerb {
+        #[command(subcommand)]
+        command: ShellVerbCommand,
+    },
     /// Inspect or reconcile the local sparse cache.
     Cache {
         #[command(subcommand)]
@@ -1291,6 +1299,18 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
         Command::Pins { repository_id } => {
             service::run(mirage_ipc::Command::NamespacePins { repository_id }, json)
         }
+        Command::ShellVerb { command } => match command {
+            ShellVerbCommand::Pin {
+                repository_id,
+                letter,
+                path,
+            } => shell_verb::pin(repository_id, &letter, &path, json),
+            ShellVerbCommand::Free {
+                repository_id,
+                letter,
+                path,
+            } => shell_verb::unpin_and_reclaim(repository_id, &letter, &path, json),
+        },
         Command::Profile { command } => match command {
             ProfileCommand::Configure {
                 repository_id,
@@ -1789,5 +1809,81 @@ fn token_agent(
             )?;
         }
         std::thread::sleep(std::time::Duration::from_secs(interval_seconds));
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShellVerbCommand {
+    /// "Keep on this device" — pin a path under the volume letter.
+    Pin {
+        repository_id: mirage_types::RepositoryId,
+        /// Volume drive letter, e.g. `N`.
+        letter: String,
+        /// Absolute path Explorer invoked the verb on.
+        path: String,
+    },
+    /// "Free up space" — unpin (if pinned) then reclaim evictable bytes.
+    Free {
+        repository_id: mirage_types::RepositoryId,
+        letter: String,
+        path: String,
+    },
+}
+
+mod shell_verb {
+    use mirage_types::MirageError;
+    use mirage_types::RepositoryId;
+
+    use super::service;
+
+    /// `N:\photos\cat` under letter `N` → `/photos/cat`; anything else → None
+    /// so the verb silently does nothing outside its own volume.
+    fn mount_relative(letter: &str, path: &str) -> Option<String> {
+        let letter = letter.trim_end_matches(':').to_ascii_uppercase();
+        let normalized = path.replace('/', "\\");
+        let prefix = format!("{letter}:\\");
+        normalized
+            .to_ascii_uppercase()
+            .strip_prefix(&prefix)
+            .map(|rest| format!("/{}", rest.trim_start_matches('\\')))
+    }
+
+    pub fn pin(
+        repository_id: RepositoryId,
+        letter: &str,
+        path: &str,
+        json: bool,
+    ) -> Result<(), MirageError> {
+        let Some(relative) = mount_relative(letter, path) else {
+            return Ok(());
+        };
+        service::run(
+            mirage_ipc::Command::NamespacePin {
+                repository_id,
+                path: relative,
+            },
+            json,
+        )
+    }
+
+    pub fn unpin_and_reclaim(
+        repository_id: RepositoryId,
+        letter: &str,
+        path: &str,
+        json: bool,
+    ) -> Result<(), MirageError> {
+        let Some(relative) = mount_relative(letter, path) else {
+            return Ok(());
+        };
+        // Unpin first so reclaim may evict it; a path that was never pinned
+        // still gets the reclaim pass.
+        let _ = service::run(
+            mirage_ipc::Command::NamespaceUnpin {
+                repository_id,
+                path: relative,
+            },
+            json,
+        );
+        service::run(mirage_ipc::Command::DiskReclaimNow, json)
     }
 }
