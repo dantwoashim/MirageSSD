@@ -6,7 +6,7 @@ MirageSSD exposes an application-owned folder in Google Drive as a writable Wind
 
 **Engineering preview · Windows 11 x64 · macOS 12+**
 
-[Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Get started](#get-started) · [Performance](#performance) · [Project map](#repository-map)
+[Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Get started](#get-started) · [Performance](#performance) · [Project map](#repository-map) · [Quick start guide](docs/quickstart.md)
 
 ## Download
 
