@@ -144,7 +144,19 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
 
         {step === 'create' && <>
           <p className="mt-3 max-w-[58ch] text-sm leading-7 text-zinc-400">
-            Signed in{status?.account_id ? ` as ${status.account_id}` : ''}. Choose a letter and how much local space MirageSSD may use for speed.
+            Signed in{status?.account_id ? ` as ${status.account_id}` : ''}. Choose a letter and how much local space MirageSSD may use for speed.{' '}
+            <button
+              className="quiet-button inline min-h-0 p-0 text-xs underline"
+              disabled={creating}
+              onClick={() => {
+                setError(undefined);
+                setStatus(undefined);
+                void client.driveLogout().then(() => { setStep('signin'); return client.driveLogin(); }).catch((failure) => {
+                  setStep('signin');
+                  setError(failure instanceof Error ? failure.message : String(failure));
+                });
+              }}
+            >Use a different account</button>
           </p>
           <div className="mt-6 grid gap-4">
             <label className="field"><span>Drive letter</span>

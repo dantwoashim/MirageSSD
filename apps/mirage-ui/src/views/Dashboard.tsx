@@ -28,9 +28,9 @@ export function Dashboard({
           </span>
           <h2 id="empty-title" className="mt-6 text-2xl font-semibold tracking-[-0.035em] text-zinc-50">A fresh start for your files.</h2>
           <p className="mt-3 max-w-[58ch] text-sm leading-7 text-zinc-400">
-            Add a workspace to see its local storage, prepare offline access, and manage recovery in one place.
+            Sign in with Google and create an encrypted drive that keeps your SSD free.
           </p>
-          <button className="primary-button mt-6" onClick={onSetup}>Set up a workspace <CaretRight size={16} /></button>
+          <button className="primary-button mt-6" onClick={onSetup}>Create your drive <CaretRight size={16} /></button>
         </div>
       </section>
     );
@@ -43,10 +43,13 @@ export function Dashboard({
           <p className="eyebrow">Connected to your desktop</p>
           <h2 id="repositories-title" className="mt-2 text-xl font-semibold tracking-[-0.025em] text-zinc-50">Your workspaces <span className="count-label">{repositories.length}</span></h2>
         </div>
-        <button onClick={onRefresh} disabled={busy} className="quiet-button">
-          <ArrowClockwise size={16} weight="bold" aria-hidden="true" />
-          Refresh
-        </button>
+        <div className="flex items-center gap-3">
+          <button className="primary-button" onClick={onSetup}>Add a drive <CaretRight size={16} /></button>
+          <button onClick={onRefresh} disabled={busy} className="quiet-button" aria-label="Refresh drives">
+            <ArrowClockwise size={16} weight="bold" aria-hidden="true" />
+            Refresh
+          </button>
+        </div>
       </div>
       <motion.div initial="hidden" animate="visible" variants={{ visible: { transition: { staggerChildren: 0.07 } } }} className="divide-y divide-white/7 border-y border-white/8">
         {repositories.map((repository) => (
