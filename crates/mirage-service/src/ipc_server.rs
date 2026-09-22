@@ -1,6 +1,7 @@
 use crate::{RequestHandler, authenticated_named_pipe_client_principal};
 use mirage_ipc::{
-    Authorization, MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, Response, decode_frame, encode_frame,
+    Authorization, MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, Response, ResponseBody,
+    decode_frame, encode_frame,
 };
 use mirage_types::{MirageError, MirageErrorKind};
 use std::sync::atomic::Ordering;
@@ -152,7 +153,25 @@ fn wait_connected(pipe: &mut File) -> Result<(), MirageError> {
 
 fn handle_connection(handler: &impl RequestHandler, mut pipe: File) -> Result<(), MirageError> {
     let frame = read_frame(&mut pipe)?;
-    let request: Request = decode_frame(&frame)?;
+    let request: Request = match decode_frame(&frame) {
+        Ok(request) => request,
+        Err(error) => {
+            // An unrecognized command variant usually means a newer client
+            // — answer with a typed error so it can explain the version
+            // skew instead of dying on a dropped pipe.
+            let response = Response {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: 0,
+                body: ResponseBody::Error {
+                    code: "MIRAGE_UNSUPPORTED".to_owned(),
+                    message: "the service is older than this request".to_owned(),
+                },
+            };
+            let _ = pipe.write_all(&encode_frame(&response)?);
+            let _ = pipe.flush();
+            return Err(error);
+        }
+    };
     request.validate()?;
     let principal = authenticated_named_pipe_client_principal(pipe.as_handle())?;
     Authorization::authenticate(&principal)?;

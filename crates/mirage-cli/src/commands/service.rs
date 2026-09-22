@@ -30,7 +30,19 @@ pub fn request_with(
         cancellation_id: None,
         command,
     };
-    let response = transport.exchange(&request)?;
+    let min_protocol = request.command.min_protocol();
+    let response = match transport.exchange(&request) {
+        Ok(response) => response,
+        Err(error)
+            if min_protocol > PROTOCOL_VERSION
+                && matches!(error.kind, mirage_types::MirageErrorKind::Io) =>
+        {
+            return Err(MirageError::provider_unavailable(
+                "the MirageSSD service is older than this app — restart your PC or reinstall MirageSSD",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     match response.body {
         ResponseBody::Json(value) => Ok(value),
         ResponseBody::Accepted { operation_id } => {
@@ -56,5 +68,41 @@ pub(crate) fn emit(value: Value, json: bool) -> Result<(), MirageError> {
             .with_source(e))?
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ServiceTransport;
+    use mirage_ipc::Response;
+
+    struct DeadTransport;
+    impl ServiceTransport for DeadTransport {
+        fn exchange(&self, _: &Request) -> Result<Response, MirageError> {
+            Err(MirageError::new(
+                mirage_types::MirageErrorKind::Io,
+                "MIRAGE_IO_ERROR",
+                "service IPC failed",
+            ))
+        }
+    }
+
+    #[test]
+    fn newer_commands_explain_service_version_skew() {
+        let failure = request_with(
+            &DeadTransport,
+            Command::RepositoryUnregister {
+                repository_id: mirage_types::RepositoryId::from_bytes([7; 16]),
+                force_unmount: false,
+                discard_unpublished: false,
+            },
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("older than this app"));
+
+        // Old-schema commands keep the underlying transport error.
+        let failure = request_with(&DeadTransport, Command::Status).unwrap_err();
+        assert!(failure.to_string().contains("service IPC failed"));
     }
 }

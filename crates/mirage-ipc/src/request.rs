@@ -318,6 +318,19 @@ pub struct Request {
     pub cancellation_id: Option<u64>,
     pub command: Command,
 }
+impl Command {
+    /// The protocol generation that first carried this command. Commands
+    /// introduced after the installed service's frame schema decode on the
+    /// wire but fail to deserialize there — the client uses this to explain
+    /// a version skew instead of reporting a generic IPC failure.
+    pub fn min_protocol(&self) -> u16 {
+        match self {
+            Self::RepositoryUnregister { .. } => 4,
+            _ => 3,
+        }
+    }
+}
+
 impl Request {
     pub fn validate(&self) -> Result<(), mirage_types::MirageError> {
         if self.protocol_version != crate::PROTOCOL_VERSION {
