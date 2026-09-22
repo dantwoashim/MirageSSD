@@ -1453,6 +1453,7 @@ dependencies = [
  "mirage-ipc",
  "mirage-observability",
  "mirage-types",
+ "reqwest",
  "serde_json",
  "windows-sys 0.61.2",
 ]
