@@ -24,6 +24,7 @@ pub fn run(
     minimum_virtual_asset_bytes: u64,
     unencrypted: bool,
     pack_all: bool,
+    allow_empty: bool,
     json: bool,
 ) -> Result<(), MirageError> {
     if !local_only {
@@ -88,7 +89,7 @@ pub fn run(
             key: Arc::new(key),
         })
     };
-    let imported = import_local(&ImportPlan {
+    let plan = ImportPlan {
         repository_id,
         generation_id,
         source_root: source.to_path_buf(),
@@ -97,7 +98,12 @@ pub fn run(
         pack_target,
         output_staging_directory: destination.to_path_buf(),
         encryption,
-    })?;
+    };
+    let imported = if allow_empty {
+        mirage_pack::import_local_allow_empty(&plan)
+    } else {
+        import_local(&plan)
+    }?;
     if json {
         output::emit_success(&serde_json::json!({
             "report_version": 1,

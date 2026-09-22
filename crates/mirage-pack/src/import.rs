@@ -59,11 +59,26 @@ pub fn import_local(plan: &ImportPlan) -> Result<ImportedRepository, MirageError
     import_local_with_cancel(plan, || false)
 }
 
+/// Import an explicitly-empty source tree: produces a valid zero-file,
+/// zero-pack index/manifest. Only for orchestrated empty volumes — the
+/// interactive `repo import` path must keep refusing empty trees.
+pub fn import_local_allow_empty(plan: &ImportPlan) -> Result<ImportedRepository, MirageError> {
+    import_local_inner(plan, true, || false)
+}
+
 pub fn import_local_with_cancel(
     plan: &ImportPlan,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<ImportedRepository, MirageError> {
-    validate_plan(plan)?;
+    import_local_inner(plan, false, &mut cancelled)
+}
+
+fn import_local_inner(
+    plan: &ImportPlan,
+    allow_empty: bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<ImportedRepository, MirageError> {
+    validate_plan(plan, allow_empty)?;
     std::fs::create_dir_all(&plan.output_staging_directory).map_err(MirageError::from)?;
     let mut packs = load_verified_packs(&plan.output_staging_directory, plan.encryption.is_some())?;
     let mut locations: HashMap<PageHash, (usize, PackEntry)> = HashMap::new();
@@ -270,8 +285,8 @@ fn build_manifest_files(
         .collect()
 }
 
-fn validate_plan(plan: &ImportPlan) -> Result<(), MirageError> {
-    if plan.files.is_empty() {
+fn validate_plan(plan: &ImportPlan, allow_empty: bool) -> Result<(), MirageError> {
+    if !allow_empty && plan.files.is_empty() {
         return Err(MirageError::invalid_argument(
             "import plan contains no files",
         ));

@@ -19,7 +19,10 @@ pub use encrypted_frame::{
     EncryptedFrameAad, decode_encrypted_frame, encode_encrypted_frame, encrypted_frame_pack_id,
 };
 pub use frame::{DecodedFrame, decode_plain_frame, encode_plain_frame};
-pub use import::{ImportPlan, ImportReport, ImportedRepository, PlannedFile, import_local};
+pub use import::{
+    ImportPlan, ImportReport, ImportedRepository, PlannedFile, import_local,
+    import_local_allow_empty, import_local_with_cancel,
+};
 pub use index::PackEntry;
 pub use page::PlainPage;
 pub use pager::{PageIter, SourcePager, page_file, page_path, page_path_streaming};

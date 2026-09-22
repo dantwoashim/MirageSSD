@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mirage_manifest::InMemoryTestSigner;
+use mirage_manifest::{CommitSigner, InMemoryTestSigner};
 use mirage_types::{GenerationId, MirageError, RepositoryId};
 
 use super::{drive_live, repo_drive, repo_import_local, service};
@@ -219,6 +219,42 @@ fn volumes_root() -> Result<PathBuf, MirageError> {
     Ok(PathBuf::from(local).join("MirageSSD").join("volumes"))
 }
 
+/// The Drive-facing half of `create`: account identity, a usable access
+/// token, and generation publication. The live impl wraps
+/// `drive_live::connect` + `repo_drive::publish_with_signer`; tests inject
+/// a local stand-in so the whole orchestration runs without Drive.
+pub trait VolumeBackend {
+    fn account_id(&self) -> &str;
+    fn access_token(&self) -> &str;
+    fn publish(
+        &self,
+        import: &Path,
+        repository_id: RepositoryId,
+        signer: &dyn CommitSigner,
+    ) -> Result<(), MirageError>;
+}
+
+struct LiveVolumeBackend {
+    session: drive_live::LiveDriveSession,
+}
+
+impl VolumeBackend for LiveVolumeBackend {
+    fn account_id(&self) -> &str {
+        &self.session.account_id
+    }
+    fn access_token(&self) -> &str {
+        self.session.access_token.as_str()
+    }
+    fn publish(
+        &self,
+        import: &Path,
+        repository_id: RepositoryId,
+        signer: &dyn CommitSigner,
+    ) -> Result<(), MirageError> {
+        repo_drive::publish_with_signer(import, repository_id, &self.session, signer).map(|_| ())
+    }
+}
+
 /// Create and mount an empty managed Drive-backed volume.
 ///
 /// `progress` receives short human-readable step labels (never secrets).
@@ -226,6 +262,28 @@ pub fn create(
     spec: &VolumeSpec,
     client_credentials: &Path,
     token_store: Option<&Path>,
+    progress: &mut dyn FnMut(&str),
+    transport: Option<&dyn ServiceTransport>,
+) -> Result<VolumeCreated, MirageError> {
+    progress("Connecting to Google Drive");
+    let session = drive_live::connect(client_credentials, token_store)?;
+    create_with_backend(spec, &LiveVolumeBackend { session }, progress, transport)
+}
+
+/// `create` with an injectable Drive backend (the local test seam).
+pub fn create_with_backend(
+    spec: &VolumeSpec,
+    backend: &dyn VolumeBackend,
+    progress: &mut dyn FnMut(&str),
+    transport: Option<&dyn ServiceTransport>,
+) -> Result<VolumeCreated, MirageError> {
+    create_in(&volumes_root()?, spec, backend, progress, transport)
+}
+
+fn create_in(
+    volumes_root: &Path,
+    spec: &VolumeSpec,
+    backend: &dyn VolumeBackend,
     progress: &mut dyn FnMut(&str),
     transport: Option<&dyn ServiceTransport>,
 ) -> Result<VolumeCreated, MirageError> {
@@ -237,12 +295,9 @@ pub fn create(
         ));
     }
 
-    progress("Connecting to Google Drive");
-    let session = drive_live::connect(client_credentials, token_store)?;
-
     let repository_id = random_repository_id()?;
     let generation = GenerationId::ZERO;
-    let root = volumes_root()?.join(repository_id.to_string());
+    let root = volumes_root.join(repository_id.to_string());
     let import = root.join("import");
     let native = root.join("native");
     let empty = root.join("empty-source");
@@ -271,6 +326,7 @@ pub fn create(
         1_048_576,
         false,
         false,
+        true,
         false,
     )?;
     // A fresh volume publishes exactly one signed empty generation; the
@@ -284,9 +340,9 @@ pub fn create(
     let signer = InMemoryTestSigner::new(key_id, key);
 
     progress("Publishing to Google Drive");
-    repo_drive::publish_with_signer(&import, repository_id, &session, &signer)?;
+    backend.publish(&import, repository_id, &signer)?;
 
-    let token = mirage_ipc::SensitiveString::new(session.access_token.as_str().to_owned())?;
+    let token = mirage_ipc::SensitiveString::new(backend.access_token().to_owned())?;
     let mounted = onboard(
         repository_id,
         &name,
@@ -329,7 +385,7 @@ pub fn create(
         drive_letter: letter,
         budget_bytes: spec.budget_bytes,
         floor_bytes: applied_floor,
-        account_id: session.account_id,
+        account_id: backend.account_id().to_owned(),
         mount_point,
         state: mounted["state"]
             .as_str()
@@ -579,6 +635,83 @@ mod tests {
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["origin"], "drive");
         assert_eq!(volumes[0]["state"], "ready_mounted");
+    }
+
+    #[test]
+    fn create_end_to_end_against_the_local_backend_seam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct LocalBackend {
+            publishes: AtomicUsize,
+        }
+        impl VolumeBackend for LocalBackend {
+            fn account_id(&self) -> &str {
+                "test@example.com"
+            }
+            fn access_token(&self) -> &str {
+                "local-seam-token"
+            }
+            fn publish(
+                &self,
+                import: &Path,
+                _repository_id: RepositoryId,
+                _signer: &dyn CommitSigner,
+            ) -> Result<(), MirageError> {
+                self.publishes.fetch_add(1, Ordering::Relaxed);
+                // Mirror the real publisher's output shape without Drive.
+                std::fs::write(import.join("drive-manifest.cbor"), b"seam")
+                    .map_err(MirageError::from)
+            }
+        }
+
+        let transport = RecordingTransport {
+            requests: Mutex::new(Vec::new()),
+        };
+        let backend = LocalBackend {
+            publishes: AtomicUsize::new(0),
+        };
+        let root = tempfile::tempdir().expect("volumes root");
+        let mut steps = Vec::new();
+        let created = create_in(
+            root.path(),
+            &VolumeSpec {
+                name: "Test Drive".to_owned(),
+                drive_letter: "n:".to_owned(),
+                budget_bytes: 8 * GIB,
+                floor_bytes: None,
+            },
+            &backend,
+            &mut |step| steps.push(step.to_owned()),
+            Some(&transport),
+        )
+        .expect("create");
+
+        assert_eq!(backend.publishes.load(Ordering::Relaxed), 1);
+        let import = root
+            .path()
+            .join(created.repository_id.to_string())
+            .join("import");
+        assert!(import.join("base-manifest.cbor").is_file());
+        assert!(import.join("repository-key.dpapi").is_file());
+        assert!(import.join("drive-manifest.cbor").is_file());
+        assert_eq!(created.drive_letter, "N");
+        assert_eq!(created.account_id, "test@example.com");
+        assert_eq!(created.mount_point, PathBuf::from("Q:"));
+        assert_eq!(
+            steps,
+            [
+                "Creating the volume index",
+                "Publishing to Google Drive",
+                "Registering the volume",
+                "Mounting N:",
+            ]
+        );
+        // The empty index imported and published without seeding files.
+        let manifest_bytes = std::fs::read(import.join("base-manifest.cbor")).unwrap();
+        assert!(!manifest_bytes.is_empty());
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(matches!(requests[3], mirage_ipc::Command::Mount { .. }));
     }
 
     #[test]

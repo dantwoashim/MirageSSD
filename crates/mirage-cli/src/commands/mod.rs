@@ -1092,6 +1092,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 minimum_virtual_asset_bytes,
                 unencrypted,
                 pack_all,
+                false,
                 json,
             ),
             RepoCommand::CommitLocal {
