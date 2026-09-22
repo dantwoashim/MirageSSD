@@ -83,6 +83,10 @@ pub fn open_service_pipe_with_retry(
     let name: Vec<u16> = pipe_name.encode_utf16().chain([0]).collect();
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(total_timeout_ms as u64);
+    // Older service builds drop the listening instance briefly between
+    // requests, so a missing pipe object is also transient contention — give
+    // it a short grace window before declaring the service down.
+    let absent_deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
     loop {
         let handle = unsafe {
             CreateFileW(
@@ -112,6 +116,11 @@ pub fn open_service_pipe_with_retry(
                 return Err(MirageError::provider_unavailable(
                     "MirageSSD service pipe stayed busy; the service may be stuck serving another client",
                 ));
+            }
+            PipeOpenDisposition::ServiceNotRunning
+                if std::time::Instant::now() < absent_deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             PipeOpenDisposition::ServiceNotRunning => {
                 return Err(MirageError::provider_unavailable(
