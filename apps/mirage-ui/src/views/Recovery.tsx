@@ -18,7 +18,7 @@ export function Recovery({ busy, onRepair }: { busy: boolean; onRepair: () => vo
           <li>01  Stop launch activity</li>
           <li>02  Inspect journal state</li>
           <li>03  Resume or roll back</li>
-          <li>04  Verify active generation</li>
+          <li>04  Verify the current version</li>
           <li>05  Remount explicitly</li>
         </ol>
       </aside>

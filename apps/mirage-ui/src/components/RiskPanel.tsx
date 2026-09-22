@@ -11,7 +11,7 @@ export function RiskPanel({ value }: { value: Readiness }) {
       </div>
       <p className="mt-2 text-sm leading-relaxed text-zinc-400">
         {clean
-          ? 'No held-out violation is recorded for this capsule. That is evidence for this profile, not a universal score.'
+          ? 'No verification miss is recorded for this copy. That is evidence for this profile, not a universal score.'
           : `${value.heldOutViolations} held-out violation${value.heldOutViolations === 1 ? '' : 's'} remain in the selected profile.`}
       </p>
       {value.lastSealViolation && <p className="number mt-2 text-xs text-amber-100">Last: {value.lastSealViolation}</p>}

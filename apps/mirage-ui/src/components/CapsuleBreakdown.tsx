@@ -5,8 +5,8 @@ const fields: Array<[keyof Readiness, string, string]> = [
   ['envelopeBytes', 'Session envelope', 'Observed recurring working set'],
   ['scanMapBytes', 'Scan and map set', 'File-wide scans and mapped ranges'],
   ['frontierBytes', 'Safety frontier', 'Held-out protection around likely paths'],
-  ['updateReserveBytes', 'Update reserve', 'Space retained for safe generation changes'],
-  ['missingBytes', 'Missing locally', 'Bytes that still block sealed admission'],
+  ['updateReserveBytes', 'Update reserve', 'Space kept aside for safe version changes'],
+  ['missingBytes', 'Missing locally', 'Bytes that still block offline access'],
 ];
 
 export function CapsuleBreakdown({ value }: { value: Readiness }) {

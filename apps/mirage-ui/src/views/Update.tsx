@@ -12,14 +12,14 @@ export function UpdateView({ client, busy, onBegin, onRefresh, onCommit, onRollb
   const actions = [
     { label: 'Begin exclusive update', detail: 'Unmounts play state and opens a durable journal.', Icon: ArrowsClockwise, action: onBegin },
     { label: 'Refresh journal state', detail: 'Reads the service-owned recovery status.', Icon: CheckCircle, action: onRefresh },
-    { label: 'Commit verified generation', detail: 'Only succeeds after immutable upload verification.', Icon: CheckCircle, action: onCommit },
-    { label: 'Roll back safely', detail: 'Restores exactly the prior committed generation.', Icon: ArrowCounterClockwise, action: onRollback },
+    { label: 'Activate the verified version', detail: 'Only succeeds after immutable upload verification.', Icon: CheckCircle, action: onCommit },
+    { label: 'Roll back safely', detail: 'Restores exactly the previous version.', Icon: ArrowCounterClockwise, action: onRollback },
   ];
   return (
     <section className="surface rounded-[2rem] p-6 md:p-8" aria-labelledby="update-title">
       <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-300/70">Exclusive writer</p>
       <h2 id="update-title" className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-zinc-50">Update and recovery journal</h2>
-      <p className="mt-3 max-w-[65ch] text-sm leading-7 text-zinc-400">MirageSSD never presents a half-applied generation. Activation is an atomic pointer change after staged bytes verify.</p>
+      <p className="mt-3 max-w-[65ch] text-sm leading-7 text-zinc-400">MirageSSD never presents a half-applied version. Activation is an atomic switch after staged files verify.</p>
       {check?.checked && (
         <div className="app-update-card" role="status">
           <p className="text-xs text-zinc-500">

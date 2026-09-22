@@ -62,7 +62,7 @@ export function CapacityView({
               <div className="flex items-start gap-3">
                 {plan.grantable ? <CheckCircle className="mt-0.5 shrink-0" size={18} weight="fill" /> : <CloudSlash className="mt-0.5 shrink-0" size={18} weight="bold" />}
                 <div>
-                  <p className="font-semibold">{plan.grantable ? 'This lease can be prepared safely.' : `Free ${formatBytes(plan.shortfall_bytes)} more on the target volume.`}</p>
+                  <p className="font-semibold">{plan.grantable ? 'This reservation can be prepared safely.' : `Free ${formatBytes(plan.shortfall_bytes)} more on the target volume.`}</p>
                   <p className="mt-1 text-xs leading-5 opacity-70">
                     {plan.selected_native_backup_count > 0
                       ? `A fully verified cloud-clean native tree is in the Eviction Bank and can surrender its SSD blocks.`
@@ -77,7 +77,7 @@ export function CapacityView({
             </div>
             <div className="mt-5 flex flex-col gap-3 sm:flex-row">
               <button onClick={onAcquire} disabled={busy || !plan.grantable || Boolean(lease)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 text-sm font-semibold text-[#101713] transition hover:bg-emerald-400 disabled:bg-zinc-700 disabled:text-zinc-400">
-                <LockKey size={17} weight="bold" />Prepare six-hour lease
+                <LockKey size={17} weight="bold" />Reserve space for six hours
               </button>
             </div>
           </>
@@ -94,15 +94,15 @@ export function CapacityView({
         </div>
         {lease ? (
           <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/[0.05] p-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-emerald-200/70">Active lease</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-emerald-200/70">Active reservation</p>
             <p className="number mt-2 text-sm text-emerald-100">{formatBytes(lease.requested_bytes)}</p>
-            <p className="number mt-2 break-all text-[10px] text-emerald-100/45">{lease.lease_id}</p>
+            <details className="mt-2 text-[10px] text-emerald-100/45"><summary>Details</summary><span className="number break-all">{lease.lease_id}</span></details>
             <button onClick={onRelease} disabled={busy} className="mt-4 inline-flex items-center gap-2 text-xs font-semibold text-zinc-300 disabled:opacity-45">
               <Trash size={14} weight="bold" />Release promise
             </button>
           </div>
         ) : <p className="text-xs leading-6 text-zinc-600">No local-space promise is active in this UI session.</p>}
-        <p className="border-t border-white/8 pt-5 text-xs leading-6 text-zinc-600">A lease reserves physical headroom; it does not inflate Explorer capacity and it never treats remote quota as an SSD.</p>
+        <p className="border-t border-white/8 pt-5 text-xs leading-6 text-zinc-600">A reservation holds physical headroom; it never inflates Explorer capacity or treats Drive quota as local space.</p>
       </aside>
     </section>
   );

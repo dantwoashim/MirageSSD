@@ -14,7 +14,7 @@ export function UninstallPreparation({ mounted }: { mounted: boolean }) {
             <ShieldCheck size={18} weight="bold" className={mounted ? 'text-amber-200' : 'text-emerald-200'} aria-hidden="true" />
             <p className="text-sm font-semibold text-zinc-100">Uninstall guard</p>
           </div>
-          <p className="mt-3 text-sm leading-6 text-zinc-500">{mounted ? 'Blocked while this repository is mounted.' : 'No active mount is reported. Sessions and journals are checked again by the MSI.'}</p>
+          <p className="mt-3 text-sm leading-6 text-zinc-500">{mounted ? 'Blocked while this drive is connected.' : 'No active mount is reported. Sessions and journals are checked again by the MSI.'}</p>
         </div>
       </div>
     </section>

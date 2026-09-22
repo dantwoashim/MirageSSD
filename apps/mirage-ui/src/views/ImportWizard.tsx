@@ -17,7 +17,7 @@ export function ImportWizard() {
       <div className="surface rounded-[2rem] p-6 md:p-8">
         <FileMagnifyingGlass size={26} weight="duotone" className="text-emerald-200" aria-hidden="true" />
         <h2 id="import-title" className="mt-6 text-2xl font-semibold tracking-[-0.035em] text-zinc-50">Conversion starts read-only</h2>
-        <p className="mt-3 text-sm leading-7 text-zinc-400">The desktop preview exposes the safety contract. Source discovery remains a CLI operation until a repository is configured.</p>
+        <p className="mt-3 text-sm leading-7 text-zinc-400">The desktop preview exposes the safety contract. Source discovery remains a CLI operation until a drive is configured.</p>
         <div className="mt-6 rounded-2xl border border-white/8 bg-[#111513] p-4">
           <p className="text-xs font-medium text-zinc-400">Read-only scan command</p>
           <code className="number mt-2 block overflow-x-auto text-xs text-emerald-200">mirage repo scan &lt;game-root&gt; --report scan.json</code>

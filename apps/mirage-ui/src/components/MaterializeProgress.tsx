@@ -4,10 +4,10 @@ export function MaterializeProgress({ completed, total }: { completed: number; t
   return (
     <div className="space-y-2" aria-live="polite">
       <div className="flex justify-between text-xs text-zinc-400">
-        <span>Verifying local capsule</span>
+        <span>Verifying your offline copy</span>
         <span className="number">{percent}%</span>
       </div>
-      <progress className="h-1.5 w-full overflow-hidden rounded-full accent-emerald-500" value={completed} max={safeTotal} aria-label="Capsule materialization" />
+      <progress className="h-1.5 w-full overflow-hidden rounded-full accent-emerald-500" value={completed} max={safeTotal} aria-label="Offline copy progress" />
     </div>
   );
 }
