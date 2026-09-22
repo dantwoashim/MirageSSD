@@ -25,7 +25,7 @@ int wmain(int argc, wchar_t** argv) {
     // origin pack directory for --cache, the local pack mirror for --managed);
     // --drive-manifest + --repository-key enable the on-demand Drive provider
     // (managed only; the bearer token arrives on stdin as a TOKEN line).
-    std::wstring origin, drive_manifest, repository_key;
+    std::wstring origin, drive_manifest, repository_key, label;
     std::uint64_t disk_floor = 0;
     for (int i = 8; i < argc; i += 2) {
         const std::wstring_view flag = argv[i];
@@ -56,6 +56,7 @@ int wmain(int argc, wchar_t** argv) {
     // A managed mount is the local-first writable volume: same state root
     // and cache constructor as --cache, but mutation callbacks are live.
     const auto status = host.mount(mount.wstring(), argv[2], argv[3], argv[4], cache_mode || managed_mode, managed_mode, total_bytes, free_bytes, origin, drive_manifest, repository_key, disk_floor);
+    if (!label.empty()) host.set_volume_label(label);
     if (!NT_SUCCESS(status)) { std::wcerr << L"mount failed status=0x" << std::hex << static_cast<unsigned long>(status) << L"\n"; return 1; }
     std::thread control;
     if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE) {

@@ -54,6 +54,7 @@ fn spec() -> HostSpec {
         drive_manifest: None,
         repository_key: None,
         disk_floor: None,
+        label: None,
     }
 }
 

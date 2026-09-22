@@ -103,6 +103,7 @@ $arguments = @(
   'build',
   '-arch', 'x64',
   '-d', "BinDir=$bin",
+  '-d', "IconFile=$(Join-Path $PSScriptRoot 'assets\mirage-drive.ico')",
   '-d', "UiDir=$ui",
   '-d', "OAuthDesktop=$oauth",
   '-d', "ProductVersion=$Version",

@@ -52,6 +52,8 @@ pub struct HostSpec {
     pub repository_key: Option<PathBuf>,
     /// Write-admission free-space floor for the journal volume (`--floor`).
     pub disk_floor: Option<u64>,
+    /// WinFsp volume label — the repository's display name.
+    pub label: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExit {
@@ -311,6 +313,10 @@ fn host_args(spec: &HostSpec) -> Vec<std::ffi::OsString> {
         args.push("--floor".into());
         args.push(floor.to_string().into());
     }
+    if let Some(label) = &spec.label {
+        args.push("--label".into());
+        args.push(label.clone().into());
+    }
     if let (Some(manifest), Some(key)) = (&spec.drive_manifest, &spec.repository_key) {
         args.push("--drive-manifest".into());
         args.push(manifest.clone().into_os_string());
@@ -533,6 +539,7 @@ mod tests {
             disk_floor: None,
             drive_manifest: None,
             repository_key: None,
+            label: None,
         }
     }
 

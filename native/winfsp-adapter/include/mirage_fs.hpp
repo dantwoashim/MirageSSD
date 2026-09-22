@@ -33,6 +33,8 @@ public:
     ULONG security_size() const noexcept { return security_size_; }
     ULONG async_delay_ms() const noexcept { return async_delay_ms_; }
     std::uint64_t volume_total_bytes() const noexcept { return volume_total_bytes_; }
+    void set_volume_label(const std::wstring& label) { label_ = label.substr(0, 32); }
+    const std::wstring& volume_label() const noexcept { return label_; }
     std::uint64_t volume_free_bytes() const noexcept { return volume_free_bytes_; }
     void begin_pending() noexcept;
     void end_pending() noexcept;
@@ -50,6 +52,7 @@ private:
     bool writable_{};
     std::uint64_t volume_total_bytes_{1};
     std::uint64_t volume_free_bytes_{};
+    std::wstring label_{L"MirageSSD"};
 };
 void release_file_context(FileContext*) noexcept;
 }

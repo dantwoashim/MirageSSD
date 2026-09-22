@@ -26,6 +26,11 @@
         </ServiceInstall>
         <ServiceControl Id="MirageServiceControl" Name="MirageSSD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
+      <Component Id="DriveIconComponent" Guid="7F2E9C31-8A4B-4D2E-9C51-3B6A1E5D7F90" Bitness="always64">
+        <!-- Per-user Explorer drive icon for managed letter mounts; the
+             service writes HKU\<owner-sid>\...\Drives\<L>\DefaultIcon. -->
+        <File Id="MirageDriveIcon" Source="$(var.IconFile)" KeyPath="yes" />
+      </Component>
       <Component Id="FilesystemHostComponent" Guid="B4DD6030-12F7-4C33-85B2-C315DB9B0F66" Bitness="always64">
         <!-- mirage-fs.exe carries no version resource, so unversioned-file
              rules can leave a stale adapter on upgrades (observed: a 0.1.5-era

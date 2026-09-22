@@ -38,7 +38,7 @@ NTSTATUS get_volume(FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* info) {
     std::memset(info, 0, sizeof(*info)); info->TotalSize = host(fs)->volume_total_bytes(); info->FreeSize = host(fs)->volume_free_bytes();
     // Managed volumes advertise the live dirty-payload budget as free space.
     if(host(fs)->writable()&&host(fs)->engine()){std::uint64_t free_bytes=info->FreeSize;if(mirage_engine_dirty_free(host(fs)->engine(),&free_bytes)==MIRAGE_OK)info->FreeSize=free_bytes;}
-    constexpr wchar_t label[] = L"MirageSSD"; info->VolumeLabelLength = static_cast<UINT16>((std::size(label)-1)*sizeof(wchar_t)); std::copy_n(label, std::size(label), info->VolumeLabel); return STATUS_SUCCESS;
+    const auto& label = host(fs)->volume_label(); info->VolumeLabelLength = static_cast<UINT16>(label.size()*sizeof(wchar_t)); std::copy_n(label.data(), label.size(), info->VolumeLabel); return STATUS_SUCCESS;
 }
 NTSTATUS security_by_name(FSP_FILE_SYSTEM* fs, PWSTR name, PUINT32 attributes, PSECURITY_DESCRIPTOR output, SIZE_T* size) {
     MirageFileHandle* file{}; MirageFileInfo info{}; const auto status = lookup(fs, name, &file, &info); if (!NT_SUCCESS(status)) return status; mirage_file_close(file);

@@ -129,6 +129,7 @@ impl ControlPlaneHandler {
                     } else {
                         None
                     },
+                    &repository.display_name,
                 )?;
             restored += 1;
         }
@@ -855,6 +856,12 @@ impl ControlPlaneHandler {
             .database
             .load_repository_owner_sid(repository_id)?
             .ok_or_else(|| MirageError::integrity_mismatch("repository owner SID is missing"))?;
+        let display_name = self
+            .repositories()?
+            .into_iter()
+            .find(|item| item.repository_id == repository_id)
+            .map(|item| item.display_name)
+            .unwrap_or_else(|| "MirageSSD".to_owned());
         let (mut volume_total_bytes, mut volume_free_bytes) =
             runtime::volume_capacity(&self.database, repository_id, &index)?;
         let origin_root = local_origin_root(&self.database, repository_id)?;
@@ -898,6 +905,7 @@ impl ControlPlaneHandler {
                 } else {
                     None
                 },
+                &display_name,
             );
         if let Err(error) = mounted {
             let _ = runtime::clear_mount_record(&self.database, repository_id);
@@ -952,6 +960,11 @@ impl ControlPlaneHandler {
             let _ = runtime::clear_mount_record(&self.database, repository_id);
             self.recover_failed_mount(repository_id)?;
             return Err(error);
+        }
+        // Explorer letter mounts get the per-user MirageSSD drive icon so
+        // This PC shows a branded drive; failures are cosmetic only.
+        if explorer_visible {
+            explorer_drive_icon::register(&owner_sid, &mount_point);
         }
         Ok(ResponseBody::Json(json!({
             "repository_id": repository_id.to_string(),
@@ -1320,6 +1333,14 @@ impl ControlPlaneHandler {
                 "{} bytes have not been uploaded to Drive yet; retry with discard_unpublished to drop them",
                 publication.pending_bytes
             )));
+        }
+        // Drop any Explorer drive icon registered for this repository's
+        // mount letter before the rows disappear.
+        if let Ok(Some(record)) = runtime::load_mount_record(&self.database, repository_id)
+            && record.explorer_visible
+            && let Ok(Some(owner_sid)) = self.database.load_repository_owner_sid(repository_id)
+        {
+            explorer_drive_icon::unregister(&owner_sid, &record.mount_point);
         }
         // Payload ids that belonged to this volume — after the rows are gone
         // their journal files are pure orphans, so delete them now rather
@@ -1794,4 +1815,100 @@ fn error_response(error: MirageError) -> ResponseBody {
         code: error.code.into(),
         message: error.message,
     }
+}
+
+/// Per-user Explorer drive icon for letter mounts. The service runs as
+/// SYSTEM, so it writes under `HKEY_USERS\<owner-sid>`; a missing hive or
+/// denied write is cosmetic and never fails the mount.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod explorer_drive_icon {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_USERS, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
+        RegSetValueExW,
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain([0]).collect()
+    }
+
+    fn icon_path() -> String {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("mirage-drive.ico")))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| r"C:\Program Files\MirageSSD\mirage-drive.ico".to_owned())
+    }
+
+    fn letter_of(mount_point: &Path) -> Option<char> {
+        mount_point
+            .to_string_lossy()
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphabetic())
+    }
+
+    fn key_path(owner_sid: &str, letter: char) -> String {
+        format!(
+            r"{owner_sid}\Software\Classes\Applications\Explorer.exe\Drives\{letter}\DefaultIcon"
+        )
+    }
+
+    pub fn register(owner_sid: &str, mount_point: &Path) {
+        let Some(letter) = letter_of(mount_point) else {
+            return;
+        };
+        let path = wide(&key_path(owner_sid, letter));
+        let mut key: HKEY = std::ptr::null_mut();
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_USERS,
+                path.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS || key.is_null() {
+            return;
+        }
+        let icon = wide(&icon_path());
+        unsafe {
+            RegSetValueExW(
+                key,
+                std::ptr::null(),
+                0,
+                REG_SZ,
+                icon.as_ptr().cast(),
+                (icon.len() * 2) as u32,
+            );
+            RegCloseKey(key);
+        }
+    }
+
+    pub fn unregister(owner_sid: &str, mount_point: &Path) {
+        let Some(letter) = letter_of(mount_point) else {
+            return;
+        };
+        let path = wide(&key_path(owner_sid, letter));
+        unsafe {
+            RegDeleteTreeW(HKEY_USERS, path.as_ptr());
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod explorer_drive_icon {
+    use std::path::Path;
+    pub fn register(_: &str, _: &Path) {}
+    pub fn unregister(_: &str, _: &Path) {}
 }
