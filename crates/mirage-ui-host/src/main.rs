@@ -103,6 +103,14 @@ mod windows_host {
             handle
         };
 
+        log_event(
+            "ui.started",
+            if tray {
+                "tray companion"
+            } else {
+                "window launch"
+            },
+        );
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let address = listener.local_addr()?;
         let origin = format!("http://127.0.0.1:{}", address.port());
