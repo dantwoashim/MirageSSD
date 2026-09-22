@@ -29,6 +29,26 @@ describe('service client', () => {
     });
   });
 
+  it('rejects malformed status and unknown result kinds', async () => {
+    const bridge: LocalBridge = { invoke: async (request) => ({ ...response(request), body: { kind: 'json', value: { repositories: null } } }) };
+    await expect(new ServiceClient(bridge).snapshot()).rejects.toBeInstanceOf(ProtocolMismatch);
+    const unknown: LocalBridge = { invoke: async (request) => ({ ...response(request), body: { kind: 'future_kind', value: {} } } as unknown as Response) };
+    await expect(new ServiceClient(unknown).snapshot()).rejects.toBeInstanceOf(ProtocolMismatch);
+  });
+
+  it('keeps absent publication state unknown and preserves measured zero', async () => {
+    const bridge: LocalBridge = { invoke: async (request) => ({ ...response(request), body: { kind: 'json', value: {
+      service: 'running', configured: true, repositories: [
+        { repository_id: 'a', display_name: 'A', state: 'ready_mounted', active_generation: 0, active_commit: null, unpublished_payload_bytes: 0 },
+        { repository_id: 'b', display_name: 'B', state: 'ready_mounted', active_generation: 0, active_commit: null },
+      ],
+    } } }) };
+    const snapshot = await new ServiceClient(bridge).snapshot();
+    expect(snapshot.repositories[0].pendingBytes).toBe(0);
+    expect(snapshot.repositories[1].pendingBytes).toBeNull();
+    expect(snapshot.repositories[1].backendHealth).toBe('unknown');
+  });
+
   it('never sends an unsealed seamless launch', async () => {
     let calls = 0;
     const bridge: LocalBridge = {

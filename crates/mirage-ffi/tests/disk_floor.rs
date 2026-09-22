@@ -70,6 +70,15 @@ fn utf16(text: &str) -> Vec<u16> {
 }
 
 fn managed_local(index: &Path, state_root: &Path, provider_root: &Path) -> *mut MirageEngineHandle {
+    managed_with_budget(index, state_root, provider_root, BUDGET)
+}
+
+fn managed_with_budget(
+    index: &Path,
+    state_root: &Path,
+    provider_root: &Path,
+    budget: u64,
+) -> *mut MirageEngineHandle {
     let index16: Vec<u16> = index.to_string_lossy().encode_utf16().collect();
     let root16: Vec<u16> = state_root.to_string_lossy().encode_utf16().collect();
     let provider16: Vec<u16> = provider_root.to_string_lossy().encode_utf16().collect();
@@ -83,7 +92,7 @@ fn managed_local(index: &Path, state_root: &Path, provider_root: &Path) -> *mut 
                 root16.len(),
                 std::ptr::null(),
                 0,
-                BUDGET,
+                budget,
                 provider16.as_ptr(),
                 provider16.len(),
                 &mut engine,
@@ -466,18 +475,20 @@ fn evicted_payload_restages_on_read_within_budget() {
 fn restage_stays_transient_when_budget_cannot_admit() {
     let (_source, objects, index) = build_index();
     let state = provisioned_state();
-    let engine = managed_local(&index, state.path(), objects.path());
+    let engine = managed_with_budget(&index, state.path(), objects.path(), 64 * 1024);
     let journal = state.path().join("journal");
 
-    // A = 40 MiB published; B = 40 MiB unpublished pushes the 64 MiB budget
+    // A = 40 KiB published; B = 40 KiB unpublished pushes the 64 KiB budget.
+    // Keep the same pressure boundary without making debug encryption speed
+    // on a busy developer machine part of this correctness gate.
     // into admission-eviction so A is remote-only with the budget nearly full.
-    create_write(engine, "a.bin", &vec![0xAB; 40 * 1024 * 1024]);
+    create_write(engine, "a.bin", &vec![0xAB; 40 * 1024]);
     wait_for(engine, |s| s.published_payloads >= 1);
-    create_write(engine, "b.bin", &vec![0xCD; 40 * 1024 * 1024]);
+    create_write(engine, "b.bin", &vec![0xCD; 40 * 1024]);
     assert!(stats(engine).evicted_payloads >= 1);
     assert_eq!(payload_names(&journal).len(), 1);
 
-    // Reading A must not re-stage: the ledger cannot admit another 40 MiB.
+    // Reading A must not re-stage: the ledger cannot admit another 40 KiB.
     let (status, bytes) = read_path(engine, "a.bin", 4096);
     assert_eq!(status, MirageStatus::Ok);
     assert!(bytes.iter().all(|b| *b == 0xAB));
@@ -497,19 +508,119 @@ fn dead_extents_leave_the_unpublished_scan() {
     let (_source, objects, index) = build_index();
     let state = provisioned_state();
     let engine = managed_local(&index, state.path(), objects.path());
-    create_write(engine, "ghost.bin", &vec![0x44; 128 * 1024]);
     let db = control_db(state.path());
-    let pending = db.unpublished_payloads(volume_id()).expect("pending");
-    assert_eq!(pending.len(), 1);
-    let payload_id = pending[0].payload_id;
+    // The live publisher can claim a payload between write and scan, so keep
+    // writing ghosts until one is observed pending, then kill its extent.
+    let mut payload_id = None;
+    for attempt in 0..40_u32 {
+        create_write(
+            engine,
+            &format!("ghost-{attempt}.bin"),
+            &vec![0x44; 128 * 1024],
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while payload_id.is_none() && std::time::Instant::now() < deadline {
+            if let Some(pending) = db
+                .unpublished_payloads(volume_id())
+                .expect("pending")
+                .first()
+            {
+                payload_id = Some(pending.payload_id);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if payload_id.is_some() {
+            break;
+        }
+    }
+    let payload_id = payload_id.expect("a pending payload was never observed");
     db.writer()
         .physical_mark_extent_dead(payload_id, 1)
         .expect("mark dead");
     assert!(
         db.unpublished_payloads(volume_id())
             .expect("pending after dead")
-            .is_empty(),
+            .iter()
+            .all(|pending| pending.payload_id != payload_id),
         "dead-extent payload must leave the unpublished scan"
     );
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_file_deletion_keeps_payload_charged_and_retryable() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    create_write(engine, "locked.bin", &[0x71; 4096]);
+    wait_for(engine, |s| s.published_payloads == 1);
+    let journal = state.path().join("journal");
+    let payload = std::fs::read_dir(&journal)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "payload"))
+        .unwrap()
+        .path();
+    // Deny FILE_SHARE_DELETE while allowing readers and writers.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&payload)
+        .unwrap();
+    let before = unsafe { &*engine }
+        .dirty
+        .as_ref()
+        .unwrap()
+        .used
+        .load(Ordering::Acquire);
+    let (status, freed) = evict(engine, u64::MAX);
+    assert_eq!(status, MirageStatus::IoError);
+    assert_eq!(freed, 0);
+    assert_eq!(stats(engine).evicted_payloads, 0);
+    assert_eq!(
+        unsafe { &*engine }
+            .dirty
+            .as_ref()
+            .unwrap()
+            .used
+            .load(Ordering::Acquire),
+        before
+    );
+    assert!(payload.exists());
+    drop(held);
+    let (status, freed) = evict(engine, u64::MAX);
+    assert_eq!(status, MirageStatus::Ok);
+    assert_eq!(freed, 4096);
+    assert_eq!(stats(engine).evicted_payloads, 1);
+    let (status, bytes) = read_path(engine, "locked.bin", 4096);
+    assert_eq!(status, MirageStatus::Ok);
+    assert_eq!(bytes, vec![0x71; 4096]);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn deep_descendants_keep_their_ancestor_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = mirage_db::Database::open(&dir.path().join("control.db")).unwrap();
+    let volume = volume_id();
+    let root = db.namespace_create_volume(volume, 1).unwrap();
+    let mut parent = root;
+    for _ in 0..140 {
+        parent = db
+            .namespace_create(
+                volume,
+                parent,
+                "d",
+                mirage_db::NamespaceNodeKind::Directory,
+                1,
+            )
+            .unwrap()
+            .inode;
+    }
+    let pins = std::collections::HashSet::from([root]);
+    assert!(mirage_ffi::publisher::pin_held(&db, volume, parent, &pins));
 }

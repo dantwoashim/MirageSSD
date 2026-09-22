@@ -1,11 +1,7 @@
 import { HardDrive } from '@phosphor-icons/react';
 import { formatBytes } from './CapsuleBreakdown';
-
-export function validateBudget(bytes: number, mandatory: number, free: number): string | undefined {
-  if (!Number.isSafeInteger(bytes) || bytes < mandatory) return 'Below the mandatory local minimum.';
-  if (bytes > free) return 'Exceeds available NTFS space.';
-  return undefined;
-}
+import { validateBudget } from '../presentation';
+export { validateBudget } from '../presentation';
 
 export function CacheBudget({
   bytes,

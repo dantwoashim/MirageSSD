@@ -8,6 +8,7 @@ pub mod object;
 pub mod read_only;
 pub mod test_contract;
 pub mod traits;
+pub mod verify;
 
 pub use capabilities::{
     BackendCapabilities, MutationCapability, RecoveryCapability, RevisionIdentity,
@@ -19,3 +20,4 @@ pub use object::{
 };
 pub use read_only::ReadOnlyOrigin;
 pub use traits::ObjectBackend;
+pub use verify::verify_object_bytes;

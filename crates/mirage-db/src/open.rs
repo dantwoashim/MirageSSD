@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use mirage_types::{MirageError, MirageErrorKind};
@@ -85,7 +85,20 @@ const READ_POOL_CAPACITY: usize = 8;
 #[derive(Debug, Clone)]
 pub struct ReadPool {
     path: Arc<PathBuf>,
-    idle: Arc<std::sync::Mutex<Vec<Connection>>>,
+    shared: Arc<PoolShared>,
+}
+
+#[derive(Debug, Default)]
+struct PoolState {
+    idle: Vec<Connection>,
+    /// Includes connections being opened and checked out, not just idle ones.
+    total: usize,
+}
+
+#[derive(Debug, Default)]
+struct PoolShared {
+    state: Mutex<PoolState>,
+    available: Condvar,
 }
 
 struct PooledConnection<'pool> {
@@ -95,11 +108,15 @@ struct PooledConnection<'pool> {
 
 impl Drop for PooledConnection<'_> {
     fn drop(&mut self) {
-        if let Some(connection) = self.connection.take()
-            && let Ok(mut idle) = self.pool.idle.lock()
-            && idle.len() < READ_POOL_CAPACITY
-        {
-            idle.push(connection);
+        if let Some(connection) = self.connection.take() {
+            let mut state = self
+                .pool
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.idle.push(connection);
+            self.pool.shared.available.notify_one();
         }
     }
 }
@@ -108,7 +125,7 @@ impl ReadPool {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path: Arc::new(path),
-            idle: Arc::new(std::sync::Mutex::new(Vec::new())),
+            shared: Arc::new(PoolShared::default()),
         }
     }
 
@@ -116,14 +133,29 @@ impl ReadPool {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T, MirageError>,
     ) -> Result<T, MirageError> {
-        let connection = {
-            let mut idle = self.idle.lock().map_err(|_| {
+        let connection = loop {
+            let mut state = self.shared.state.lock().map_err(|_| {
                 MirageError::internal_invariant("read connection pool lock poisoned")
             })?;
-            match idle.pop() {
-                Some(connection) => connection,
-                None => read_connection(&self.path)?,
+            if let Some(connection) = state.idle.pop() {
+                break connection;
             }
+            if state.total < READ_POOL_CAPACITY {
+                state.total += 1;
+                drop(state);
+                match read_connection(&self.path) {
+                    Ok(connection) => break connection,
+                    Err(error) => {
+                        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.total -= 1;
+                        self.shared.available.notify_one();
+                        return Err(error);
+                    }
+                }
+            }
+            drop(self.shared.available.wait(state).map_err(|_| {
+                MirageError::internal_invariant("read connection pool wait poisoned")
+            })?);
         };
         let pooled = PooledConnection {
             pool: self,
@@ -135,5 +167,77 @@ impl ReadPool {
     #[must_use]
     pub fn database_path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn checked_out_connections_are_bounded_and_waiters_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.db");
+        let _writer = writer_connection(&path).unwrap();
+        let pool = ReadPool::new(path);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered, receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..READ_POOL_CAPACITY * 2 {
+            let (pool, release, active, peak, entered) = (
+                pool.clone(),
+                Arc::clone(&release),
+                Arc::clone(&active),
+                Arc::clone(&peak),
+                entered.clone(),
+            );
+            workers.push(std::thread::spawn(move || {
+                pool.with_connection(|connection| {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    let mut guard = release.0.lock().unwrap();
+                    while !*guard {
+                        guard = release.1.wait(guard).unwrap();
+                    }
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }));
+        }
+        for _ in 0..READ_POOL_CAPACITY {
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        let overflow = receiver.recv_timeout(Duration::from_millis(100)).is_ok();
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert!(!overflow, "a ninth read connection was admitted");
+        assert_eq!(peak.load(Ordering::SeqCst), READ_POOL_CAPACITY);
+        assert_eq!(pool.shared.state.lock().unwrap().total, READ_POOL_CAPACITY);
+    }
+
+    #[test]
+    fn failed_connection_open_releases_its_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ReadPool::new(dir.path().join("missing.db"));
+        for _ in 0..READ_POOL_CAPACITY * 2 {
+            assert!(pool.with_connection(|_| Ok(())).is_err());
+        }
+        assert_eq!(pool.shared.state.lock().unwrap().total, 0);
     }
 }

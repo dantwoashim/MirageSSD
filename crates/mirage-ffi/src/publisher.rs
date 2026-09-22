@@ -376,6 +376,28 @@ fn publish_one(
             return Err(PublishFailure::Backend);
         }
     };
+    if reference.content_hash.as_bytes() != &object_hash
+        || reference.byte_length.as_u64() != object_length
+        || reference.kind != ObjectKind::Payload
+    {
+        stats.record_error("published identity mismatch");
+        stats.integrity_refusals.fetch_add(1, Ordering::Relaxed);
+        return Err(PublishFailure::Integrity);
+    }
+    // Only independent readback makes a local payload eligible for eviction.
+    // A successful upload response or echoed appProperties hash is insufficient.
+    if let Err(error) = futures_executor::block_on(mirage_backend::verify_object_bytes(
+        provider.backend().as_ref(),
+        &reference,
+        CancellationToken::new(),
+    )) {
+        stats.record_error("publication readback failed");
+        if error.class == mirage_backend::BackendErrorClass::Integrity {
+            stats.integrity_refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(PublishFailure::Integrity);
+        }
+        return Err(PublishFailure::Backend);
+    }
     let record = mirage_db::payload_remote::PayloadRemoteObject {
         volume_id: volume,
         payload_id: payload.payload_id,
@@ -420,16 +442,25 @@ pub fn pin_held(
     pins: &std::collections::HashSet<mirage_types::InodeId>,
 ) -> bool {
     let mut current = inode;
-    for _ in 0..128 {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..4096 {
         if pins.contains(&current) {
             return true;
         }
+        if !seen.insert(current) {
+            return true; // A malformed ancestry is not evidence of evictability.
+        }
         match db.namespace_entry(volume, current) {
             Ok(Some((parent, _))) => current = parent,
-            _ => return false,
+            Ok(None) => {
+                return db
+                    .namespace_root(volume)
+                    .map_or(true, |root| root != Some(current));
+            }
+            Err(_) => return true,
         }
     }
-    false
+    true
 }
 
 /// Evicts published payload files until `target` plaintext bytes are freed.
@@ -466,21 +497,21 @@ pub fn evict_published(
         if inodes.iter().any(|inode| handles.is_open(*inode)) {
             continue;
         }
-        // Extent dead-mark requires alive + unpinned; a conflict means the
-        // payload was concurrently superseded or pinned — skip it.
-        if db
-            .writer()
-            .physical_mark_extent_dead(payload_id, now_ns_i64_pub())
-            .is_err()
-        {
-            continue;
-        }
         let mut name = String::with_capacity(40);
         for byte in payload_id {
             name.push_str(&format!("{byte:02x}"));
         }
         name.push_str(".payload");
-        let _ = std::fs::remove_file(journal_dir.join(name));
+        // Never release the physical charge before deletion succeeds. If a
+        // later ledger update fails, the missing, remotely recoverable file
+        // stays conservatively charged until another eviction pass finishes.
+        match std::fs::remove_file(journal_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MirageError::from(error)),
+        }
+        db.writer()
+            .physical_mark_extent_dead(payload_id, now_ns_i64_pub())?;
         let length = u64::try_from(plaintext_length).unwrap_or(0);
         let _ = dirty
             .used

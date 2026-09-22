@@ -195,9 +195,13 @@ fn request_eviction_parses_mirage_evicted_and_times_out() {
         .request_eviction(&id, 8192, Duration::from_secs(5))
         .expect("extended eviction reply");
     assert_eq!((freed, blocked), (2048, 1024));
-    assert_eq!(*lines.lock().unwrap(), vec!["EVICT 8192"]);
+    assert_eq!(*lines.lock().unwrap(), vec!["EVICT 8192", "EVICT 8192"]);
 
     // No reply queued → timeout error.
     let timeout = supervisor.request_eviction(&id, 1, Duration::from_millis(150));
     assert_eq!(timeout.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        *lines.lock().unwrap(),
+        vec!["EVICT 8192", "EVICT 8192", "EVICT 1"]
+    );
 }

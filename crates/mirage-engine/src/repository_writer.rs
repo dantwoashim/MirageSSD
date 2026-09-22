@@ -37,6 +37,7 @@ pub fn now_utc_ns() -> Result<i128, MirageError> {
 /// rather than minting a divergent one with a fresh timestamp.
 async fn find_committed(
     backend: &dyn ObjectBackend,
+    signer: &dyn CommitSigner,
     repository_id: mirage_types::RepositoryId,
     sequence: u64,
     parent: Option<CommitHash>,
@@ -54,6 +55,14 @@ async fn find_committed(
             && *decoded.body.manifest_hash.as_bytes() == manifest_hash
             && decoded.body.update_journal_id == update_journal_id
         {
+            // Both supported signature formats are deterministic. Re-signing
+            // the canonical body proves this retry candidate was authorized
+            // by the current publishing key, not merely shaped like a commit.
+            if sign_commit(decoded.body.clone(), signer)?.signature != decoded.signature {
+                return Err(MirageError::integrity_mismatch(
+                    "existing publication commit is not signed by the authorized writer",
+                ));
+            }
             let hash = commit_hash(&decoded)?;
             return Ok(Some((candidate, hash, decoded)));
         }
@@ -95,6 +104,7 @@ pub async fn publish_base_generation(
                 "published pack identity failed verification",
             ));
         }
+        mirage_backend::verify_object_bytes(backend, &uploaded, cancel.child_token()).await?;
         remote_packs.push(uploaded);
     }
 
@@ -127,11 +137,13 @@ pub async fn publish_base_generation(
             "published manifest identity failed verification",
         ));
     }
+    mirage_backend::verify_object_bytes(backend, &manifest_object, cancel.child_token()).await?;
 
     // Idempotent publication: a commit already covering this manifest at
     // sequence 0 is reused, so a retried publish converges to one object.
     if let Some(existing) = find_committed(
         backend,
+        signer,
         manifest.repository_id,
         0,
         None,
@@ -229,6 +241,7 @@ pub async fn publish_successor_generation(
                 "successor pack identity failed verification",
             ));
         }
+        mirage_backend::verify_object_bytes(backend, pack, CancellationToken::new()).await?;
     }
     let manifest_bytes = encode_manifest(manifest)?;
     let manifest_hash = manifest_hash(manifest)?;
@@ -248,8 +261,10 @@ pub async fn publish_successor_generation(
         .checked_add(1)
         .ok_or_else(|| MirageError::invalid_argument("commit sequence overflows"))?;
     let parent_hash = commit_hash(parent)?;
+    mirage_backend::verify_object_bytes(backend, &manifest_object, cancel.child_token()).await?;
     if let Some(existing) = find_committed(
         backend,
+        signer,
         manifest.repository_id,
         sequence,
         Some(parent_hash),

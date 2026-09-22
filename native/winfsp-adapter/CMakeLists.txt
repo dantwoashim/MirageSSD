@@ -8,10 +8,14 @@ if(NOT EXISTS "${WINFSP_SDK_ROOT}/inc/winfsp/winfsp.h")
   message(FATAL_ERROR "Set WINFSP_SDK_ROOT to the pinned WinFsp SDK root")
 endif()
 add_executable(mirage-fs src/main.cpp src/service.cpp src/volume.cpp src/ffi_bridge.cpp src/file_context.cpp src/directory_buffer.cpp src/status_map.cpp src/callbacks/get_volume_info.cpp src/callbacks/get_security.cpp src/callbacks/get_file_info.cpp src/callbacks/open.cpp src/callbacks/read_directory.cpp src/callbacks/mutation.cpp src/callbacks/read.cpp src/pending_read.cpp src/cancel.cpp src/security.cpp src/host_control.cpp)
+# Rust's MSVC target links the dynamic release CRT in both Rust profiles.
+# Use the same CRT for the adapter, retaining Debug symbols and /Od without
+# mixing MSVCRTD/MSVCRT allocators or suppressing LNK4098.
+set_property(TARGET mirage-fs PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
 if(MIRAGE_RUST_PROFILE STREQUAL "release")
   set(MIRAGE_CARGO_PROFILE_ARGS --release --locked)
 else()
-  set(MIRAGE_CARGO_PROFILE_ARGS)
+  set(MIRAGE_CARGO_PROFILE_ARGS --locked)
 endif()
 set(MIRAGE_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../target/${MIRAGE_RUST_PROFILE}/mirage_ffi.lib")
 add_custom_target(mirage-rust-ffi

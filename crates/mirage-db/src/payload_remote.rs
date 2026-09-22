@@ -255,7 +255,8 @@ pub fn published_payloads_evictable(
         .prepare(
             "SELECT r.payload_id, r.plaintext_length, r.published_ns
              FROM payload_remote_objects r
-             WHERE r.volume_id = ?1
+             JOIN physical_extents x ON x.extent_id = r.payload_id
+             WHERE r.volume_id = ?1 AND x.state = 'alive' AND x.pin_count = 0
                AND EXISTS (SELECT 1 FROM byte_extents e
                             WHERE e.volume_id = r.volume_id
                               AND e.payload_id = r.payload_id)
