@@ -34,6 +34,11 @@ pub struct VolumeCreated {
     pub drive_letter: String,
     pub budget_bytes: u64,
     pub floor_bytes: Option<u64>,
+    /// Set when the free-space floor could not be applied (for example the
+    /// installed service predates interactive-user floor permission or the
+    /// caller lacks rights) — the volume is still usable; set the floor
+    /// later with `mirage disk set-floor`.
+    pub floor_error: Option<String>,
     pub account_id: String,
     pub mount_point: PathBuf,
     pub state: String,
@@ -309,7 +314,7 @@ fn create_in(
         transport,
         progress,
     ) {
-        Ok((mounted, applied_floor)) => {
+        Ok((mounted, applied_floor, floor_error)) => {
             // Sign-in happened at volume creation, so ensure the per-user
             // agent is registered to keep the volume mounted and
             // authenticated after reboot.
@@ -324,6 +329,7 @@ fn create_in(
                 drive_letter: letter,
                 budget_bytes: spec.budget_bytes,
                 floor_bytes: applied_floor,
+                floor_error,
                 account_id: backend.account_id().to_owned(),
                 mount_point,
                 state: mounted["state"]
@@ -368,7 +374,7 @@ fn create_staged(
     backend: &dyn VolumeBackend,
     transport: Option<&dyn ServiceTransport>,
     progress: &mut dyn FnMut(&str),
-) -> Result<(serde_json::Value, Option<u64>), (String, bool, bool, MirageError)> {
+) -> Result<(serde_json::Value, Option<u64>, Option<String>), (String, bool, bool, MirageError)> {
     let import = root.join("import");
     let native = root.join("native");
     let empty = root.join("empty-source");
@@ -480,28 +486,38 @@ fn create_staged(
     })?;
 
     let mut applied_floor = None;
+    let mut floor_error = None;
     if let Some(floor) = spec.floor_bytes {
         let disk = state_volume()
             .map_err(|error| ("reading the state disk".to_owned(), published, true, error))?;
-        service_request(
+        match service_request(
             transport,
             mirage_ipc::Command::DiskFloorSet {
                 volume_root: disk.volume_root.to_string_lossy().into_owned(),
                 floor_bytes: floor,
                 hysteresis_bytes: None,
             },
-        )
-        .map_err(|error| {
-            (
-                "setting the free-space floor".to_owned(),
-                published,
-                true,
-                error,
-            )
-        })?;
-        applied_floor = Some(floor);
+        ) {
+            Ok(_) => applied_floor = Some(floor),
+            Err(error) if error.to_string().contains("PERMISSION_DENIED") => {
+                // Older installed services only allow the floor for elevated
+                // or service principals; do not undo the volume for that.
+                progress("Free-space floor not applied (permission denied)");
+                floor_error = Some(format!(
+                    "the service declined the free-space floor: {error}"
+                ));
+            }
+            Err(error) => {
+                return Err((
+                    "setting the free-space floor".to_owned(),
+                    published,
+                    true,
+                    error,
+                ));
+            }
+        }
     }
-    Ok((mounted, applied_floor))
+    Ok((mounted, applied_floor, floor_error))
 }
 
 fn service_request(
@@ -884,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_create_after_mount_unmounts_and_reports_registration() {
+    fn floor_permission_denial_keeps_the_volume_and_warns() {
         struct FloorFails {
             requests: Mutex<Vec<mirage_ipc::Command>>,
         }
@@ -930,7 +946,7 @@ mod tests {
         let transport = FloorFails {
             requests: Mutex::new(Vec::new()),
         };
-        let error = create_in(
+        let created = create_in(
             root.path(),
             &VolumeSpec {
                 name: "Test".to_owned(),
@@ -942,21 +958,17 @@ mod tests {
             &mut |_| {},
             Some(&transport),
         )
-        .expect_err("floor failure must surface");
-        let message = error.to_string();
-        assert!(
-            message.contains("setting the free-space floor"),
-            "{message}"
-        );
-        assert!(message.contains("still registered"), "{message}");
+        .expect("a permission-denied floor is a warning, not a rollback");
+        assert!(created.floor_bytes.is_none());
+        assert!(created.floor_error.unwrap().contains("denied"));
         let requests = transport.requests.lock().unwrap();
         assert!(
-            requests
+            !requests
                 .iter()
                 .any(|command| matches!(command, mirage_ipc::Command::Unmount { .. })),
-            "a mounted volume must be unmounted on rollback: {requests:?}"
+            "the volume stays mounted when only the floor was denied: {requests:?}"
         );
-        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_some());
     }
 
     #[test]

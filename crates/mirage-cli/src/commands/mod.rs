@@ -1527,6 +1527,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                         "drive_letter": created.drive_letter,
                         "budget_bytes": created.budget_bytes,
                         "floor_bytes": created.floor_bytes,
+                        "floor_error": created.floor_error,
                         "account_id": created.account_id,
                         "mount_point": created.mount_point,
                         "state": created.state,
