@@ -1034,30 +1034,32 @@ impl ControlPlaneHandler {
             let mut cache_pages = 0_u64;
             let mut shadow_packs = 0_u64;
             let mut published_payloads = 0_u64;
+            // Managed journal payloads physically live under the service
+            // state root — attribute them to that volume like reclaim does,
+            // not to each repository's native_root.
+            let state_root_volume = runtime::service_state_root(&self.database)
+                .ok()
+                .and_then(|root| disk_space::volume_root_of(&root).ok());
             for repository in self.repositories()? {
-                let Some(native_root) = self
+                if let Some(native_root) = self
                     .database
                     .load_repository_root(repository.repository_id)?
-                else {
-                    continue;
-                };
-                if disk_space::volume_root_of(&native_root).ok().as_deref()
-                    != Some(floor.volume_root.as_str())
-                {
-                    continue;
-                }
-                if let Ok(source) = capacity::RepositoryCapacitySource::open(
-                    &self.database,
-                    repository.repository_id,
-                    None,
-                ) && let Ok((pages, shadow)) = source.evictable_breakdown()
+                    && disk_space::volume_root_of(&native_root).ok().as_deref()
+                        == Some(floor.volume_root.as_str())
+                    && let Ok(source) = capacity::RepositoryCapacitySource::open(
+                        &self.database,
+                        repository.repository_id,
+                        None,
+                    )
+                    && let Ok((pages, shadow)) = source.evictable_breakdown()
                 {
                     cache_pages += pages;
                     shadow_packs += shadow;
                 }
-                if let Ok(evictable) = self
-                    .database
-                    .published_payloads_evictable(repository.repository_id)
+                if state_root_volume.as_deref() == Some(floor.volume_root.as_str())
+                    && let Ok(evictable) = self
+                        .database
+                        .published_payloads_evictable(repository.repository_id)
                 {
                     published_payloads += evictable
                         .iter()
