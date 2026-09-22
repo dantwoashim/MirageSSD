@@ -23,22 +23,24 @@ pub fn run(once: bool) -> Result<(), MirageError> {
     };
     let log = AgentLog::open();
     loop {
-        if let Err(error) = cycle(&log) {
+        if let Err(error) = cycle(&log, once) {
             log.line(&format!("cycle failed: {error}"));
         }
         if once {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(RETRY_SECONDS.min(REFRESH_SECONDS)));
+        std::thread::sleep(Duration::from_secs(REFRESH_SECONDS));
     }
 }
 
-fn cycle(log: &AgentLog) -> Result<(), MirageError> {
+fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
     let credentials = match backend_login::oauth_client_credentials(None) {
         Ok(credentials) => credentials,
         Err(_) => {
             log.line("oauth-desktop.json not found; waiting for sign-in");
-            std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            if !once {
+                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            }
             return Ok(());
         }
     };
@@ -46,7 +48,9 @@ fn cycle(log: &AgentLog) -> Result<(), MirageError> {
         Ok(session) => session,
         Err(error) => {
             log.line(&format!("Drive session refresh failed: {error}"));
-            std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            if !once {
+                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            }
             return Ok(());
         }
     };
@@ -54,7 +58,9 @@ fn cycle(log: &AgentLog) -> Result<(), MirageError> {
         Ok(status) => status,
         Err(error) => {
             log.line(&format!("service unreachable: {error}"));
-            std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            if !once {
+                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+            }
             return Ok(());
         }
     };
