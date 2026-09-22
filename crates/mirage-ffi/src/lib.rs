@@ -2999,6 +2999,22 @@ pub unsafe extern "C" fn mirage_namespace_rename(
             Ok(inode) => inode,
             Err(status) => return status,
         };
+        // Windows sharing semantics: renaming over a file that has live
+        // open handles must fail, not destroy the victim.
+        let source = match db.namespace_lookup(volume, from_parent, &from_name) {
+            Ok(source) => source,
+            Err(_) => return MirageStatus::IoError,
+        };
+        match db.namespace_lookup(volume, to_parent, &to_name) {
+            Ok(Some(victim))
+                if Some(victim.inode) != source.map(|entry| entry.inode)
+                    && engine.handles.is_open(victim.inode) =>
+            {
+                return MirageStatus::Conflict;
+            }
+            Ok(_) => {}
+            Err(_) => return MirageStatus::IoError,
+        }
         let now = now_ns_i64();
         match db.namespace_rename(volume, from_parent, &from_name, to_parent, &to_name, now) {
             Ok(()) => {}
@@ -3426,6 +3442,9 @@ pub unsafe extern "C" fn mirage_write(
         .is_err()
         {
             release_reservation(db);
+            // The staged .payload was never committed — remove it so a failed
+            // write cannot leak journal bytes.
+            let _ = std::fs::remove_file(journal_dir.join(&staged.path));
             return MirageStatus::IoError;
         }
         dirty.used.fetch_add(length, Ordering::AcqRel);

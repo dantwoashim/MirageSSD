@@ -10,7 +10,7 @@ use mirage_ffi::{
     MirageEngineHandle, MirageFileHandle, MirageFileInfo, MirageStatus,
     mirage_engine_create_managed_local_provider, mirage_engine_destroy, mirage_engine_mark_mounted,
     mirage_engine_set_drive_token, mirage_enumerate, mirage_flush, mirage_lookup,
-    mirage_namespace_create, mirage_read, mirage_write,
+    mirage_namespace_create, mirage_namespace_rename, mirage_read, mirage_write,
 };
 use mirage_pack::{ImportPlan, import_local_allow_empty};
 use mirage_types::{GenerationId, RepositoryId};
@@ -175,5 +175,62 @@ fn empty_managed_volume_accepts_writes_and_lists_the_root() {
 
     unsafe { mirage_ffi::mirage_file_close(file) };
     unsafe { mirage_ffi::mirage_file_close(root) };
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn rename_over_an_open_file_fails_with_conflict() {
+    let (_source, objects, index) = empty_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+
+    for name in ["victim.txt", "source.txt"] {
+        let path16 = utf16(name);
+        assert_eq!(
+            unsafe { mirage_namespace_create(engine, path16.as_ptr(), path16.len(), 0) },
+            MirageStatus::Ok
+        );
+    }
+    // An open handle on the victim must block the rename, not destroy it.
+    let victim16 = utf16("victim.txt");
+    let mut victim: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, victim16.as_ptr(), victim16.len(), &mut victim) },
+        MirageStatus::Ok
+    );
+    let from16 = utf16("source.txt");
+    assert_eq!(
+        unsafe {
+            mirage_namespace_rename(
+                engine,
+                from16.as_ptr(),
+                from16.len(),
+                victim16.as_ptr(),
+                victim16.len(),
+            )
+        },
+        MirageStatus::Conflict
+    );
+    // After the close, the rename succeeds and the victim's content binding
+    // is replaced — the surviving name resolves.
+    unsafe { mirage_ffi::mirage_file_close(victim) };
+    assert_eq!(
+        unsafe {
+            mirage_namespace_rename(
+                engine,
+                from16.as_ptr(),
+                from16.len(),
+                victim16.as_ptr(),
+                victim16.len(),
+            )
+        },
+        MirageStatus::Ok
+    );
+    let mut renamed: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, victim16.as_ptr(), victim16.len(), &mut renamed) },
+        MirageStatus::Ok
+    );
+    unsafe { mirage_ffi::mirage_file_close(renamed) };
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
