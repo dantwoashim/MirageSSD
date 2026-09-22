@@ -69,20 +69,22 @@ mod windows_host {
         let address = listener.local_addr()?;
         let origin = format!("http://127.0.0.1:{}", address.port());
         let token = random_token()?;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SharedState::default()));
         if !no_open {
             open_browser(&format!("{origin}/#{token}"))?;
         }
         for connection in listener.incoming() {
             match connection {
                 Ok(mut stream) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                     if let Err(error) = handle_connection(
                         &mut stream,
                         &ui_root,
                         &origin,
                         &token,
                         drive_token_store.as_deref(),
+                        &shared,
                     ) {
                         let _ = write_response(
                             &mut stream,
@@ -109,12 +111,199 @@ mod windows_host {
         Ok(())
     }
 
+    /// Long-running Drive operations are reported through shared state so
+    /// the HTTP handler returns promptly and the UI polls for progress.
+    #[derive(Default)]
+    struct SharedState {
+        login: LoginState,
+        create: serde_json::Value,
+    }
+
+    #[derive(Default)]
+    enum LoginState {
+        #[default]
+        Idle,
+        InFlight,
+        Done {
+            account_id: String,
+        },
+        Failed {
+            message: String,
+        },
+    }
+
+    fn authorize(request: &HttpRequest, origin: &str, token: &str) -> Result<(), Vec<u8>> {
+        let supplied_origin = request.headers.get("origin").map(String::as_str);
+        let supplied_token = request.headers.get("x-mirage-token").map(String::as_str);
+        if supplied_origin != Some(origin)
+            || !supplied_token.is_some_and(|value| constant_time_eq(value, token))
+        {
+            return Err(br#"{"error":"forbidden"}"#.to_vec());
+        }
+        Ok(())
+    }
+
+    fn drive_status(shared: &std::sync::Arc<std::sync::Mutex<SharedState>>) -> serde_json::Value {
+        let login = shared
+            .lock()
+            .map(|state| match &state.login {
+                LoginState::Idle => serde_json::json!("idle"),
+                LoginState::InFlight => serde_json::json!("in_flight"),
+                LoginState::Done { account_id } => {
+                    serde_json::json!({"done": account_id})
+                }
+                LoginState::Failed { message } => serde_json::json!({"failed": message}),
+            })
+            .unwrap_or(serde_json::json!("idle"));
+        let store = mirage_cli::commands::backend_login::default_token_store_path()
+            .map(mirage_backend_drive::token_store::TokenStore::new);
+        let metadata = store.ok().and_then(|store| store.metadata().ok());
+        serde_json::json!({
+            "authenticated": metadata.is_some(),
+            "account_id": metadata.as_ref().map(|m| m.account_id.clone()),
+            "issued_unix_seconds": metadata.as_ref().map(|m| m.issued_unix_seconds),
+            "login": login,
+        })
+    }
+
+    fn start_drive_login(
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+    ) -> serde_json::Value {
+        {
+            let mut state = match shared.lock() {
+                Ok(state) => state,
+                Err(_) => return serde_json::json!({"error": "state lock poisoned"}),
+            };
+            if matches!(state.login, LoginState::InFlight) {
+                return serde_json::json!({"started": false, "in_flight": true});
+            }
+            state.login = LoginState::InFlight;
+        }
+        std::thread::spawn({
+            // The handler thread is parked on a socket; spawn a worker for
+            // the blocking OAuth exchange.
+            let shared = shared.clone();
+            move || {
+                let result =
+                    mirage_cli::commands::backend_login::authenticate(None, None, None, 900);
+                if let Ok(mut state) = shared.lock() {
+                    state.login = match result {
+                        Ok(outcome) => LoginState::Done {
+                            account_id: outcome.account_id,
+                        },
+                        Err(error) => {
+                            let message = if error.to_string().contains("access_denied")
+                                || error.to_string().contains("permission_denied")
+                            {
+                                "Google declined access for this account. Try again or use a different account."
+                                    .to_owned()
+                            } else {
+                                error.to_string()
+                            };
+                            LoginState::Failed { message }
+                        }
+                    };
+                }
+            }
+        });
+        serde_json::json!({"started": true})
+    }
+
+    fn start_volume_create(
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, MirageError> {
+        {
+            let mut state = shared
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("state lock poisoned"))?;
+            if state.create["in_flight"].as_bool() == Some(true) {
+                return Ok(serde_json::json!({"started": false, "in_flight": true}));
+            }
+            state.create = serde_json::json!({"in_flight": true, "step": "starting"});
+        }
+        let spec = mirage_cli::commands::volume::VolumeSpec {
+            name: payload["name"]
+                .as_str()
+                .unwrap_or(mirage_cli::commands::volume::default_volume_name())
+                .to_owned(),
+            drive_letter: payload["letter"].as_str().unwrap_or("M").to_owned(),
+            budget_bytes: payload["budget_bytes"]
+                .as_u64()
+                .map(Ok)
+                .unwrap_or_else(mirage_cli::commands::volume::default_budget_bytes)
+                .unwrap_or(8 * (1 << 30)),
+            floor_bytes: payload["floor_bytes"].as_u64().or_else(|| {
+                mirage_cli::commands::volume::state_volume()
+                    .ok()
+                    .map(|disk| mirage_cli::commands::volume::default_floor_bytes(&disk))
+            }),
+        };
+        std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let progress_shared = shared.clone();
+                let mut progress = move |step: &str| {
+                    if let Ok(mut state) = progress_shared.lock() {
+                        state.create["step"] = serde_json::json!(step);
+                    }
+                };
+                let credentials =
+                    mirage_cli::commands::backend_login::oauth_client_credentials(None);
+                let result = credentials.and_then(|credentials| {
+                    mirage_cli::commands::volume::create(
+                        &spec,
+                        &credentials,
+                        None,
+                        &mut progress,
+                        None,
+                    )
+                });
+                if let Ok(mut state) = shared.lock() {
+                    state.create = match result {
+                        Ok(created) => serde_json::json!({
+                            "in_flight": false,
+                            "done": true,
+                            "repository_id": created.repository_id.to_string(),
+                            "drive_letter": created.drive_letter,
+                            "name": created.name,
+                            "budget_bytes": created.budget_bytes,
+                            "account_id": created.account_id,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "in_flight": false,
+                            "done": false,
+                            "error": error.to_string(),
+                        }),
+                    };
+                }
+            }
+        });
+        Ok(serde_json::json!({"started": true}))
+    }
+
+    /// Opens Explorer on a mounted drive letter (validated `X:` shape only).
+    fn open_explorer(letter: &str) -> Option<()> {
+        let letter = letter.trim().trim_end_matches(':').trim_end_matches('\\');
+        let bytes = letter.as_bytes();
+        if bytes.len() != 1 || !bytes[0].is_ascii_alphabetic() {
+            return None;
+        }
+        let target = format!("{}:\\", (bytes[0] as char).to_ascii_uppercase());
+        std::process::Command::new("explorer.exe")
+            .arg(&target)
+            .spawn()
+            .ok()?;
+        Some(())
+    }
+
     fn handle_connection(
         stream: &mut TcpStream,
         ui_root: &Path,
         origin: &str,
         token: &str,
         drive_token_store: Option<&Path>,
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let request = read_http_request(stream)?;
         match (request.method.as_str(), request.path.as_str()) {
@@ -136,6 +325,185 @@ mod windows_host {
                 "text/css; charset=utf-8",
                 true,
             )?,
+            ("GET", "/api/disks") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = serde_json::json!({
+                    "disks": mirage_cli::commands::volume::disks()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|disk| serde_json::json!({
+                            "volume_root": disk.volume_root,
+                            "total_bytes": disk.total_bytes,
+                            "free_bytes": disk.free_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "state_volume": mirage_cli::commands::volume::state_volume()
+                        .map(|disk| serde_json::json!({
+                            "volume_root": disk.volume_root,
+                            "total_bytes": disk.total_bytes,
+                            "free_bytes": disk.free_bytes,
+                        }))
+                        .unwrap_or(serde_json::Value::Null),
+                    "default_letter": mirage_cli::commands::volume::first_free_letter()
+                        .map(|letter| letter.to_string())
+                        .unwrap_or_default(),
+                    "default_budget_bytes": mirage_cli::commands::volume::default_budget_bytes()
+                        .unwrap_or(0),
+                });
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("GET", "/api/drive/status") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = drive_status(shared);
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/drive/login") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = start_drive_login(shared);
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/drive/logout") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let result = mirage_cli::commands::backend_login::default_token_store_path()
+                    .and_then(|path| {
+                        mirage_backend_drive::token_store::TokenStore::new(path).delete()
+                    });
+                let body = serde_json::json!({"signed_out": result.unwrap_or(false)});
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/volume/create") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = match serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|payload| start_volume_create(shared, &payload).ok())
+                {
+                    Some(body) => body,
+                    None => serde_json::json!({"error": "volume creation could not be started"}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("GET", "/api/volume/create-status") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = shared
+                    .lock()
+                    .map(|state| state.create.clone())
+                    .unwrap_or_default();
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/open-explorer") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let payload: serde_json::Value = serde_json::from_slice(&request.body)?;
+                let body = match payload["letter"].as_str().and_then(open_explorer) {
+                    Some(()) => serde_json::json!({"opened": true}),
+                    None => serde_json::json!({"error": "drive letter is invalid"}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
             ("POST", "/api/invoke") | ("POST", "/api/invoke-drive") => {
                 let supplied_origin = request.headers.get("origin").map(String::as_str);
                 let supplied_token = request.headers.get("x-mirage-token").map(String::as_str);
@@ -210,6 +578,9 @@ mod windows_host {
             }
             | Command::NativeActivate {
                 drive_access_token, ..
+            }
+            | Command::Mount {
+                drive_access_token, ..
             } if drive_access_token.is_none() => {}
             Command::Materialize {
                 drive_access_token,
@@ -244,6 +615,9 @@ mod windows_host {
                 drive_access_token, ..
             }
             | Command::NativeActivate {
+                drive_access_token, ..
+            }
+            | Command::Mount {
                 drive_access_token, ..
             } => *drive_access_token = Some(token),
             Command::Materialize {

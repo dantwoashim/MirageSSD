@@ -3,17 +3,23 @@ import {
   type IpcCommand,
   type CapacityLease,
   type CapacityPlan,
+  type DiskInfo,
+  type DisksPayload,
+  type DriveStatus,
   type Mode,
   type Request,
   type Response,
   type ServiceRepository,
   type ServiceSnapshot,
-  type StatusPayload,
+  type VolumeCreateStatus,
 } from '../models';
+import { record } from '../presentation';
 
 export interface LocalBridge {
   invoke(request: Request): Promise<Response>;
   invokeDrive?(request: Request): Promise<Response>;
+  apiGet?(path: string): Promise<unknown>;
+  apiPost?(path: string, body?: unknown): Promise<unknown>;
 }
 
 export class ProtocolMismatch extends Error {}
@@ -34,6 +40,40 @@ export class FetchBridge implements LocalBridge {
     return await this.post('/api/invoke-drive', request);
   }
 
+  async apiGet(path: string): Promise<unknown> {
+    if (!/^[0-9a-f]{64}$/.test(this.token)) {
+      throw new Error('The MirageSSD UI bridge token is missing or invalid. Reopen the app.');
+    }
+    const response = await fetch(path, {
+      cache: 'no-store',
+      credentials: 'omit',
+      headers: { 'X-Mirage-Token': this.token },
+      signal: AbortSignal.timeout(30_000),
+    }).catch(() => {
+      throw new Error('MirageSSD is not responding. Open the desktop app, then reconnect.');
+    });
+    if (!response.ok) throw new Error(`MirageSSD could not complete the request (${response.status}).`);
+    return await response.json();
+  }
+
+  async apiPost(path: string, body?: unknown): Promise<unknown> {
+    if (!/^[0-9a-f]{64}$/.test(this.token)) {
+      throw new Error('The MirageSSD UI bridge token is missing or invalid. Reopen the app.');
+    }
+    const response = await fetch(path, {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json', 'X-Mirage-Token': this.token },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(30_000),
+    }).catch(() => {
+      throw new Error('MirageSSD is not responding. Open the desktop app, then reconnect.');
+    });
+    if (!response.ok) throw new Error(`MirageSSD could not complete the request (${response.status}).`);
+    return await response.json();
+  }
+
   private async post(path: string, request: Request): Promise<Response> {
     if (!/^[0-9a-f]{64}$/.test(this.token)) {
       throw new Error('The MirageSSD UI bridge token is missing or invalid. Reopen the app.');
@@ -47,9 +87,17 @@ export class FetchBridge implements LocalBridge {
         'X-Mirage-Token': this.token,
       },
       body: JSON.stringify(request),
+      signal: AbortSignal.timeout(60_000),
+    }).catch((error: unknown) => {
+      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+        throw new Error('The connection timed out. Your operation may still be running. Refresh its status before trying again.');
+      }
+      throw new Error('MirageSSD is not responding. Open the desktop app, then reconnect.');
     });
     if (!response.ok) {
-      throw new Error(`The local MirageSSD bridge returned HTTP ${response.status}.`);
+      throw new Error(response.status === 403
+        ? 'This connection has expired. Reopen MirageSSD from the Start menu.'
+        : `MirageSSD could not complete the request (${response.status}). Refresh its status before retrying.`);
     }
     return await response.json() as Response;
   }
@@ -61,13 +109,23 @@ export class ServiceClient {
   constructor(private readonly bridge: LocalBridge) {}
 
   async snapshot(): Promise<ServiceSnapshot> {
-    const value = await this.invoke({ command: 'status' }) as StatusPayload;
+    const value = await this.invoke({ command: 'status' });
+    if (!record(value) || typeof value.service !== 'string' || typeof value.configured !== 'boolean' || !Array.isArray(value.repositories)) {
+      throw new ProtocolMismatch('The service returned an incomplete drive list. Reopen MirageSSD after updating it.');
+    }
     return {
       protocolVersion: PROTOCOL_VERSION,
       service: value.service,
       configured: value.configured,
       repositories: value.repositories.map(normalizeRepository),
     };
+  }
+
+  async detail(repositoryId: string) {
+    const value = await this.invoke({ command: 'repository_detail', body: { repository_id: repositoryId } });
+    const normalized = normalizeRepository(value);
+    if (normalized.id !== repositoryId) throw new ProtocolMismatch('The service returned a different drive. Refresh before continuing.');
+    return normalized;
   }
 
   async mount(repositoryId: string, generation: number): Promise<unknown> {
@@ -182,14 +240,15 @@ export class ServiceClient {
     const response = authenticateDrive
       ? await this.invokeDrive(request)
       : await this.bridge.invoke(request);
-    if (response.protocol_version !== PROTOCOL_VERSION || response.request_id !== request.request_id) {
+    if (!record(response) || response.protocol_version !== PROTOCOL_VERSION || response.request_id !== request.request_id || !record(response.body)) {
       throw new ProtocolMismatch('Service protocol version or response correlation mismatch.');
     }
     switch (response.body.kind) {
       case 'json': return response.body.value;
-      case 'accepted': return response.body.value;
+      case 'accepted': return { ...response.body.value, accepted: true };
       case 'progress': return response.body.value;
       case 'error': throw new ServiceError(response.body.value.code, response.body.value.message);
+      default: throw new ProtocolMismatch('The service returned an unrecognized result. Refresh before continuing.');
     }
   }
 
@@ -199,9 +258,87 @@ export class ServiceClient {
     }
     return await this.bridge.invokeDrive(request);
   }
+
+  private async apiGet(path: string): Promise<unknown> {
+    if (!this.bridge.apiGet) {
+      throw new Error('This MirageSSD UI host does not expose local setup endpoints. Reopen the installed app.');
+    }
+    return await this.bridge.apiGet(path);
+  }
+
+  private async apiPost(path: string, body?: unknown): Promise<unknown> {
+    if (!this.bridge.apiPost) {
+      throw new Error('This MirageSSD UI host does not expose local setup endpoints. Reopen the installed app.');
+    }
+    return await this.bridge.apiPost(path, body);
+  }
+
+  async disks(): Promise<DisksPayload> {
+    const value = await this.apiGet('/api/disks');
+    if (!record(value) || !Array.isArray(value.disks)) {
+      throw new ProtocolMismatch('The desktop returned incomplete disk information.');
+    }
+    return value as unknown as DisksPayload;
+  }
+
+  async driveStatus(): Promise<DriveStatus> {
+    return await this.apiGet('/api/drive/status') as DriveStatus;
+  }
+
+  async driveLogin(): Promise<void> {
+    const value = await this.apiPost('/api/drive/login');
+    if (record(value) && value.started === false && value.in_flight !== true) {
+      throw new Error(typeof value.error === 'string' ? value.error : 'Sign-in could not be started.');
+    }
+  }
+
+  async driveLogout(): Promise<void> {
+    await this.apiPost('/api/drive/logout');
+  }
+
+  async volumeCreate(payload: { name: string; letter: string; budget_bytes: number; floor_bytes?: number }): Promise<void> {
+    const value = await this.apiPost('/api/volume/create', payload);
+    if (record(value) && typeof value.error === 'string') throw new Error(value.error);
+  }
+
+  async volumeCreateStatus(): Promise<VolumeCreateStatus> {
+    return await this.apiGet('/api/volume/create-status') as VolumeCreateStatus;
+  }
+
+  async openExplorer(letter: string): Promise<void> {
+    const value = await this.apiPost('/api/open-explorer', { letter });
+    if (record(value) && typeof value.error === 'string') throw new Error(value.error);
+  }
+
+  async pins(repositoryId: string): Promise<unknown> {
+    return await this.invoke({ command: 'namespace_pins', body: { repository_id: repositoryId } });
+  }
+
+  async pin(repositoryId: string, path: string): Promise<unknown> {
+    return await this.invoke({ command: 'namespace_pin', body: { repository_id: repositoryId, path } });
+  }
+
+  async unpin(repositoryId: string, path: string): Promise<unknown> {
+    return await this.invoke({ command: 'namespace_unpin', body: { repository_id: repositoryId, path } });
+  }
+
+  async diskStatus(): Promise<unknown> {
+    return await this.invoke({ command: 'disk_status' });
+  }
+
+  async diskReclaimNow(): Promise<unknown> {
+    return await this.invoke({ command: 'disk_reclaim_now' });
+  }
 }
 
-function normalizeRepository(repository: ServiceRepository) {
+function normalizeRepository(value: unknown) {
+  if (!record(value) || typeof value.repository_id !== 'string' || typeof value.display_name !== 'string' || typeof value.state !== 'string'
+      || !(value.active_generation === null || (typeof value.active_generation === 'number' && Number.isSafeInteger(value.active_generation) && value.active_generation >= 0))
+      || !(value.active_commit === null || typeof value.active_commit === 'string')) {
+    throw new ProtocolMismatch('The service returned incomplete drive information. Refresh before continuing.');
+  }
+  const repository = value as ServiceRepository;
+  const size = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
   return {
     id: repository.repository_id,
     name: repository.display_name,
@@ -209,9 +346,16 @@ function normalizeRepository(repository: ServiceRepository) {
     commit: repository.active_commit,
     state: repository.state,
     mounted: repository.state === 'ready_mounted',
-    physicalBytes: repository.physical_bytes ?? null,
-    logicalBytes: repository.logical_bytes ?? null,
-    backendHealth: repository.backend_health ?? 'not_configured',
-    lastSealViolations: repository.last_seal_violations ?? 0,
+    physicalBytes: size(repository.physical_bytes),
+    logicalBytes: size(repository.logical_bytes),
+    backendHealth: repository.backend_health ?? 'unknown',
+    lastSealViolations: size(repository.last_seal_violations) ?? 0,
+    pendingBytes: size(repository.unpublished_payload_bytes),
+    publishedBytes: size(repository.published_payload_bytes),
+    pendingOperations: size(repository.pending_local_operations),
+    diverged: typeof repository.diverged === 'boolean' ? repository.diverged : null,
+    volumeMode: repository.volume_mode,
+    origin: repository.origin,
+    mountPath: repository.mount_path,
   };
 }

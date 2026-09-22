@@ -14,6 +14,13 @@ export type RepositoryState = {
   logicalBytes: number | null;
   backendHealth: string;
   lastSealViolations: number;
+  pendingBytes?: number | null;
+  publishedBytes?: number | null;
+  pendingOperations?: number | null;
+  diverged?: boolean | null;
+  volumeMode?: string;
+  origin?: string;
+  mountPath?: string;
 };
 
 export type Readiness = {
@@ -27,6 +34,38 @@ export type Readiness = {
   missingBytes: number;
   heldOutViolations: number;
   lastSealViolation?: string;
+};
+
+export type DiskInfo = {
+  volume_root: string;
+  total_bytes: number;
+  free_bytes: number;
+};
+
+export type DisksPayload = {
+  disks: DiskInfo[];
+  state_volume: DiskInfo | null;
+  default_letter: string;
+  default_budget_bytes: number;
+};
+
+export type DriveStatus = {
+  authenticated: boolean;
+  account_id: string | null;
+  issued_unix_seconds: number | null;
+  login: 'idle' | 'in_flight' | { done: string } | { failed: string };
+};
+
+export type VolumeCreateStatus = {
+  in_flight?: boolean;
+  step?: string;
+  done?: boolean;
+  error?: string;
+  repository_id?: string;
+  drive_letter?: string;
+  name?: string;
+  budget_bytes?: number;
+  account_id?: string;
 };
 
 export type ServiceSnapshot = {
@@ -46,6 +85,13 @@ export type ServiceRepository = {
   logical_bytes?: number;
   backend_health?: string;
   last_seal_violations?: number;
+  unpublished_payload_bytes?: number;
+  published_payload_bytes?: number;
+  pending_local_operations?: number;
+  diverged?: boolean;
+  volume_mode?: string;
+  origin?: string;
+  mount_path?: string;
 };
 
 export type StatusPayload = {
@@ -123,7 +169,12 @@ export type IpcCommand =
   | { command: 'update_status'; body: { repository_id: string } }
   | { command: 'update_commit'; body: { repository_id: string } }
   | { command: 'update_rollback'; body: { repository_id: string } }
-  | { command: 'repair'; body: { repository_id: string } };
+  | { command: 'repair'; body: { repository_id: string } }
+  | { command: 'namespace_pin'; body: { repository_id: string; path: string } }
+  | { command: 'namespace_unpin'; body: { repository_id: string; path: string } }
+  | { command: 'namespace_pins'; body: { repository_id: string } }
+  | { command: 'disk_status' }
+  | { command: 'disk_reclaim_now' };
 
 export type Request = {
   protocol_version: typeof PROTOCOL_VERSION;
