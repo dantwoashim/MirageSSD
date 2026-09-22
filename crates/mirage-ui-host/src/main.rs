@@ -15,18 +15,11 @@ mod windows_host {
         ffi::OsStr,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+        os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
         time::Duration,
     };
-    use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
-        Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-        },
-        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
-    };
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
     const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
     const MAX_HTTP_BODY_BYTES: usize = MAX_FRAME_BYTES;
@@ -846,25 +839,10 @@ mod windows_host {
     }
 
     fn open_pipe() -> Result<std::fs::File, MirageError> {
-        use std::os::windows::io::RawHandle;
-        let name: Vec<u16> = r"\\.\pipe\MirageSSD.v1".encode_utf16().chain([0]).collect();
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(MirageError::provider_unavailable(
-                "MirageSSD service pipe is unavailable",
-            ));
-        }
-        Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+        mirage_cli::client::open_service_pipe_with_retry(
+            mirage_cli::client::SERVICE_PIPE_NAME,
+            15_000,
+        )
     }
 
     fn random_token() -> Result<String, MirageError> {

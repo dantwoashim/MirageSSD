@@ -37,8 +37,40 @@ impl ServiceTransport for NamedPipeTransport {
     }
 }
 
+/// Pipe name shared by every MirageSSD IPC client.
 #[cfg(windows)]
-fn open_pipe() -> Result<std::fs::File, MirageError> {
+pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MirageSSD.v1";
+
+/// How a failed `CreateFileW` on the service pipe is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeOpenDisposition {
+    /// `ERROR_PIPE_BUSY`: an instance exists but is held — wait and retry.
+    WaitAndRetry,
+    /// `ERROR_FILE_NOT_FOUND`: no pipe object at all — the service is down.
+    ServiceNotRunning,
+    /// Anything else: surface the raw I/O error.
+    Fail,
+}
+
+pub(crate) fn pipe_open_disposition(raw_os_error: Option<i32>) -> PipeOpenDisposition {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    match raw_os_error {
+        Some(ERROR_PIPE_BUSY) => PipeOpenDisposition::WaitAndRetry,
+        Some(ERROR_FILE_NOT_FOUND) => PipeOpenDisposition::ServiceNotRunning,
+        _ => PipeOpenDisposition::Fail,
+    }
+}
+
+/// Opens the service pipe, waiting through `ERROR_PIPE_BUSY` contention for
+/// up to `total_timeout_ms`. The service keeps a pending instance listening
+/// between requests, but a brief busy window remains while one request is
+/// being served; `WaitNamedPipeW` + retry covers it.
+#[cfg(windows)]
+pub fn open_service_pipe_with_retry(
+    pipe_name: &str,
+    total_timeout_ms: u32,
+) -> Result<std::fs::File, MirageError> {
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use windows_sys::Win32::{
         Foundation::INVALID_HANDLE_VALUE,
@@ -46,25 +78,58 @@ fn open_pipe() -> Result<std::fs::File, MirageError> {
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
             OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
         },
+        System::Pipes::WaitNamedPipeW,
     };
-    let name: Vec<u16> = r"\\.\pipe\MirageSSD.v1".encode_utf16().chain([0]).collect();
-    let handle = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            0,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(MirageError::provider_unavailable(
-            "MirageSSD service pipe is unavailable",
-        ));
+    let name: Vec<u16> = pipe_name.encode_utf16().chain([0]).collect();
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(total_timeout_ms as u64);
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            return Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) });
+        }
+        match pipe_open_disposition(std::io::Error::last_os_error().raw_os_error()) {
+            PipeOpenDisposition::WaitAndRetry if std::time::Instant::now() < deadline => {
+                if unsafe { WaitNamedPipeW(name.as_ptr(), 5_000) } == 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(231)
+                {
+                    // Timeout or pipe vanished between the failure and the
+                    // wait — retry once more within the overall deadline.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            PipeOpenDisposition::WaitAndRetry => {
+                return Err(MirageError::provider_unavailable(
+                    "MirageSSD service pipe stayed busy; the service may be stuck serving another client",
+                ));
+            }
+            PipeOpenDisposition::ServiceNotRunning => {
+                return Err(MirageError::provider_unavailable(
+                    "MirageSSD service pipe is unavailable; the MirageSSD service is not running",
+                ));
+            }
+            PipeOpenDisposition::Fail => {
+                return Err(MirageError::provider_unavailable(
+                    "MirageSSD service pipe is unavailable",
+                ));
+            }
+        }
     }
-    Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+}
+
+#[cfg(windows)]
+fn open_pipe() -> Result<std::fs::File, MirageError> {
+    open_service_pipe_with_retry(SERVICE_PIPE_NAME, 15_000)
 }
 #[cfg(not(windows))]
 fn open_pipe() -> Result<std::fs::File, MirageError> {
@@ -79,4 +144,23 @@ fn io(error: std::io::Error) -> MirageError {
         "service IPC failed",
     )
     .with_source(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_busy_retries_while_absent_fails_fast() {
+        assert_eq!(
+            pipe_open_disposition(Some(231)),
+            PipeOpenDisposition::WaitAndRetry
+        );
+        assert_eq!(
+            pipe_open_disposition(Some(2)),
+            PipeOpenDisposition::ServiceNotRunning
+        );
+        assert_eq!(pipe_open_disposition(Some(5)), PipeOpenDisposition::Fail);
+        assert_eq!(pipe_open_disposition(None), PipeOpenDisposition::Fail);
+    }
 }

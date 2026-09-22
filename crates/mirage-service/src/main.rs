@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 mod windows_service_host {
-    use mirage_service::{ControlPlaneHandler, NativeMountControl, serve_one, wake_server};
+    use mirage_service::{ControlPlaneHandler, NativeMountControl, serve, wake_server};
     use std::{
         ffi::OsString,
         sync::{
@@ -118,8 +118,8 @@ mod windows_service_host {
                 }
             }
         });
-        while !stopping.load(Ordering::Acquire) {
-            let _ = serve_one(handler.as_ref());
+        if let Err(error) = serve(handler.as_ref(), r"\.\pipe\MirageSSD.v1", &stopping) {
+            eprintln!("MirageSSD IPC server stopped: {error}");
         }
         let _ = mount_watchdog.join();
         let _ = floor_watchdog.join();

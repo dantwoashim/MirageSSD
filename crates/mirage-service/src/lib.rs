@@ -35,7 +35,7 @@ pub use credential_broker::{
     AccessCapability, CredentialBroker, TokenBroker, with_retryable_authentication,
 };
 #[cfg(windows)]
-pub use ipc_server::{serve_one, serve_one_named, wake_server};
+pub use ipc_server::{serve, serve_one, serve_one_named, wake_server};
 pub use launch::{LaunchMode, LaunchPolicy, LaunchReadiness, NativeLaunch, launch_native};
 pub use mount_control::{MountControl, NativeMountControl};
 pub use process_tree::{ProcessIdentity, ProcessTracker, TrackedRole};
