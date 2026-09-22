@@ -1,6 +1,8 @@
 import { ArrowClockwise, ArrowRight, CheckCircle, CloudSlash, Database, DownloadSimple, Gauge, HardDrives, House, Info, ShieldCheck, SignOut, Wrench, X } from '@phosphor-icons/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createDriveAccount } from './api/account';
 import type { ServiceClient } from './api/client';
+import { AccountChip } from './components/AccountChip';
 import { EMPTY_READINESS, type CapacityLease, type CapacityPlan, type Readiness, type RepositoryState, type ServiceSnapshot } from './models';
 import { operationMessage, readinessFromPlan, record, repositoryScope } from './presentation';
 import { CapacityView } from './views/Capacity';
@@ -54,6 +56,7 @@ export function App({ client }: { client: ServiceClient }) {
   const [actionError, setActionError] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [lastChecked, setLastChecked] = useState<Date>();
+  const driveAccount = useMemo(() => createDriveAccount(client), [client]);
 
   const loadDetail = useCallback(async (id: string) => {
     const sequence = ++detailSequence.current;
@@ -212,6 +215,7 @@ export function App({ client }: { client: ServiceClient }) {
           <button className="nav-item" aria-current={view === 'exit' ? 'page' : undefined} onClick={() => setView('exit')}><SignOut size={18} />Restore & leave</button>
         </details>
         <div className="sidebar-note"><ShieldCheck size={19} aria-hidden="true" /><div>Your storage. Your control.<p>Keep files close. Keep your options open.</p></div></div>
+        <AccountChip account={driveAccount} onChanged={() => void refresh()} />
         <div className="service-indicator" role="status"><span className={unavailable ? 'status-dot status-muted' : 'status-dot'} />{snapshot ? connectionError ? 'Connection interrupted' : 'Desktop service connected' : connectionError ? 'Desktop service unavailable' : 'Connecting to your desktop…'}</div>
       </aside>
 
@@ -225,7 +229,7 @@ export function App({ client }: { client: ServiceClient }) {
         {busy && <div className="working-banner" role="status"><span className="working-indicator" /><span>{busy} in progress. You can keep this window open while MirageSSD works.</span></div>}
 
         {!snapshot ? connectionError ? <section className="disconnected-state"><HardDrives size={40} weight="duotone" /><h2>Your files haven’t been changed.</h2><p>Open MirageSSD from the Windows Start menu. When its desktop service is ready, this window will reconnect automatically.</p><button className="primary-button" onClick={() => void refresh()} disabled={refreshing}>Try reconnecting <ArrowRight size={17} /></button></section> : <LoadingState /> : <div className="view-content">
-          {view === 'setup' && <SetupWizard client={client} onDone={() => { setView('overview'); void refresh(); }} />}
+          {view === 'setup' && <SetupWizard client={client} account={driveAccount} onDone={() => { setView('overview'); void refresh(); }} />}
           {view === 'overview' && <>
             <Dashboard repositories={snapshot.repositories} selectedId={selectedId} onSelect={select} onRefresh={() => void refresh()} busy={Boolean(busy)} onSetup={() => setView('setup')} />
             {selected && selected.origin === 'drive' && selected.volumeMode === 'managed' && (

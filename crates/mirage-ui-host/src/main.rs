@@ -128,6 +128,7 @@ mod windows_host {
     #[derive(Default)]
     struct SharedState {
         login: LoginState,
+        login_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         create: serde_json::Value,
     }
 
@@ -190,16 +191,26 @@ mod windows_host {
                 return serde_json::json!({"started": false, "in_flight": true});
             }
             state.login = LoginState::InFlight;
+            state.login_cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )));
         }
+        let cancel = shared.lock().ok().and_then(|s| s.login_cancel.clone());
         std::thread::spawn({
             // The handler thread is parked on a socket; spawn a worker for
             // the blocking OAuth exchange.
             let shared = shared.clone();
             move || {
-                let result =
-                    mirage_cli::commands::backend_login::authenticate(None, None, None, 900);
+                let flag = cancel.clone();
+                let result = mirage_cli::commands::backend_login::authenticate_cancellable(
+                    None, None, None, 600, cancel,
+                );
                 if let Ok(mut state) = shared.lock() {
+                    let cancelled =
+                        flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+                    state.login_cancel = None;
                     state.login = match result {
+                        _ if cancelled => LoginState::Idle,
                         Ok(outcome) => LoginState::Done {
                             account_id: outcome.account_id,
                         },
@@ -418,6 +429,37 @@ mod windows_host {
                     200,
                     "application/json; charset=utf-8",
                     &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/drive/login/cancel") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let cancelled = shared
+                    .lock()
+                    .map(|mut state| {
+                        if let Some(flag) = &state.login_cancel {
+                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            state.login = LoginState::Idle;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&serde_json::json!({"cancelled": cancelled}))?,
                     false,
                 )?;
             }

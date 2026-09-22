@@ -292,6 +292,10 @@ export class ServiceClient {
     }
   }
 
+  async driveLoginCancel(): Promise<void> {
+    await this.apiPost('/api/drive/login/cancel');
+  }
+
   async driveLogout(): Promise<void> {
     await this.apiPost('/api/drive/logout');
   }

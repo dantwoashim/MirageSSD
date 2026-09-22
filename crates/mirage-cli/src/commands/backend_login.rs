@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mirage_backend_drive::NativeHttpTransport;
@@ -61,6 +63,24 @@ pub fn authenticate(
     token_path: Option<&Path>,
     timeout_seconds: u64,
 ) -> Result<AuthOutcome, MirageError> {
+    authenticate_cancellable(
+        client_id,
+        client_credentials,
+        token_path,
+        timeout_seconds,
+        None,
+    )
+}
+
+/// `authenticate` with a cooperative cancel flag polled while the loopback
+/// listener waits for the browser callback (used by the UI's Cancel button).
+pub fn authenticate_cancellable(
+    client_id: Option<&str>,
+    client_credentials: Option<&Path>,
+    token_path: Option<&Path>,
+    timeout_seconds: u64,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<AuthOutcome, MirageError> {
     if !(30..=900).contains(&timeout_seconds) {
         return Err(MirageError::invalid_argument(
             "OAuth timeout must be between 30 and 900 seconds",
@@ -78,7 +98,12 @@ pub fn authenticate(
         .map_err(MirageError::from)?;
 
     open_browser(&authorization_url)?;
-    let code = wait_for_callback(&listener, &attempt, Duration::from_secs(timeout_seconds))?;
+    let code = wait_for_callback(
+        &listener,
+        &attempt,
+        Duration::from_secs(timeout_seconds),
+        cancel.as_deref(),
+    )?;
 
     let transport = NativeHttpTransport::new().map_err(MirageError::from)?;
     let mut grant = futures_executor::block_on(exchange_code(
@@ -377,9 +402,15 @@ fn wait_for_callback(
     listener: &TcpListener,
     attempt: &OAuthAttempt,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<String, MirageError> {
     let deadline = Instant::now() + timeout;
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(MirageError::backend_unavailable(
+                "sign-in cancelled before Google returned",
+            ));
+        }
         match listener.accept() {
             Ok((mut stream, _)) => match parse_stream(&mut stream, attempt) {
                 Ok(Some(code)) => {

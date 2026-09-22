@@ -233,3 +233,17 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .pin-list { list-style: none; margin: 10px 0 0; padding: 0; }
 .pin-list li { align-items: center; border-top: 1px solid #ffffff0a; display: flex; font-size: 12px; justify-content: space-between; padding: 7px 2px; }
 .button-row { display: flex; flex-wrap: wrap; gap: 10px; }
+
+/* Sidebar Google account chip */
+.account-chip { border-top: 1px solid var(--line); padding: 14px 4px 10px; }
+.account-chip-row { align-items: center; display: flex; gap: 10px; }
+.account-chip-icon { border: 1px solid var(--line); border-radius: 8px; color: #a8bcc0; display: grid; flex-shrink: 0; min-height: 30px; min-width: 30px; place-items: center; }
+.account-chip-icon.is-signed-in { color: #a8dcc1; }
+.account-chip-text { min-width: 0; }
+.account-chip-email { color: #e5eee7; display: block; font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-chip-text small { color: #8fa898; display: block; font-size: 10.5px; margin-top: 2px; }
+.account-chip-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.account-chip-button { font-size: 11px; min-height: 32px; padding: 6px 10px; }
+.account-chip-error { align-items: flex-start; color: #e8b4a8; display: flex; font-size: 11px; gap: 6px; line-height: 1.6; margin-top: 10px; }
+.account-chip-confirm { border: 1px solid var(--line); border-radius: 8px; margin-top: 10px; padding: 10px 12px; }
+.account-chip-confirm p { color: #b2c5b8; font-size: 11px; line-height: 1.7; margin: 0; }

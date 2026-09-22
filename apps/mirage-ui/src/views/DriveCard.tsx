@@ -1,4 +1,4 @@
-import { ArrowSquareOut, Broom, FolderOpen, Info, PushPin, SignOut } from '@phosphor-icons/react';
+import { ArrowSquareOut, Broom, FolderOpen, Info, PushPin } from '@phosphor-icons/react';
 import { useState } from 'react';
 import type { ServiceClient } from '../api/client';
 import type { RepositoryState } from '../models';
@@ -99,10 +99,6 @@ export function DriveCard({
             <button className="quiet-button" disabled={busy || Boolean(working)}
               onClick={() => void act('Free space', () => client.diskReclaimNow(), 'MirageSSD freed the space it safely could.')}>
               <Broom size={15} />Free up space
-            </button>
-            <button className="quiet-button" disabled={busy || Boolean(working)}
-              onClick={() => void act('Sign out', () => client.driveLogout(), 'Signed out of Google Drive.')}>
-              <SignOut size={15} />Sign out
             </button>
           </div>
           {pins && pins.length > 0 && (

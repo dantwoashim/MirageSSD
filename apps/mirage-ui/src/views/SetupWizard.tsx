@@ -1,26 +1,18 @@
 import { CaretRight, CheckCircle, FolderOpen, GoogleLogo, HardDrives, Info, SpinnerGap } from '@phosphor-icons/react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { DriveAccount } from '../api/account';
+import { useDriveAccount } from '../api/account';
 import type { ServiceClient } from '../api/client';
-import type { DisksPayload, DriveStatus, VolumeCreateStatus } from '../models';
+import type { DisksPayload, VolumeCreateStatus } from '../models';
 import { formatBytes } from '../components/CapsuleBreakdown';
 
 type Step = 'signin' | 'create' | 'done';
 
 const GIB = 1 << 30;
 
-function loginPhase(status: DriveStatus | undefined): 'idle' | 'in_flight' | 'failed' | 'done' {
-  if (!status) return 'idle';
-  if (status.login === 'in_flight') return 'in_flight';
-  if (typeof status.login === 'object' && status.login !== null) {
-    if ('failed' in status.login) return 'failed';
-    if ('done' in status.login) return 'done';
-  }
-  return status.authenticated ? 'done' : 'idle';
-}
-
-export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone: () => void }) {
+export function SetupWizard({ client, account, onDone }: { client: ServiceClient; account: DriveAccount; onDone: () => void }) {
+  const acct = useDriveAccount(account);
   const [step, setStep] = useState<Step>('signin');
-  const [status, setStatus] = useState<DriveStatus>();
   const [disks, setDisks] = useState<DisksPayload>();
   const [letter, setLetter] = useState('');
   const [name, setName] = useState('MirageSSD');
@@ -30,30 +22,23 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
   const [error, setError] = useState<string>();
   const polling = useRef(true);
 
-  const pollStatus = useCallback(async () => {
-    try {
-      const next = await client.driveStatus();
-      setStatus(next);
-      return next;
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
-      return undefined;
-    }
-  }, [client]);
-
-  // Poll sign-in progress while on step 1.
+  // Poll sign-in progress while on step 1; the shared account store holds
+  // the authoritative state.
   useEffect(() => {
     if (step !== 'signin') return;
     polling.current = true;
     const tick = async () => {
-      const next = await pollStatus();
+      await account.refresh();
       if (!polling.current) return;
-      if (next?.authenticated) { setStep('create'); return; }
       window.setTimeout(() => void tick(), 1500);
     };
     void tick();
     return () => { polling.current = false; };
-  }, [step, pollStatus]);
+  }, [step, account]);
+
+  useEffect(() => {
+    if (step === 'signin' && acct.phase === 'signed_in') setStep('create');
+  }, [step, acct.phase]);
 
   // Load disk defaults once we reach step 2.
   useEffect(() => {
@@ -92,7 +77,7 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
 
   const startLogin = async () => {
     setError(undefined);
-    try { await client.driveLogin(); } catch (failure) {
+    try { await account.signIn(); } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     }
   };
@@ -114,8 +99,8 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
     }
   };
 
-  const phase = loginPhase(status);
-  const failed = typeof status?.login === 'object' && status.login !== null && 'failed' in status.login ? status.login.failed : undefined;
+  const phase = acct.phase === 'signing_in' ? 'in_flight' : acct.phase === 'error' ? 'failed' : 'idle';
+  const failed = acct.phase === 'error' ? acct.error : undefined;
   const creating = Boolean(createStatus?.in_flight);
 
   return (
@@ -144,15 +129,14 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
 
         {step === 'create' && <>
           <p className="mt-3 max-w-[58ch] text-sm leading-7 text-zinc-400">
-            Signed in{status?.account_id ? ` as ${status.account_id}` : ''}. Choose a letter and how much local space MirageSSD may use for speed.{' '}
+            Signed in{acct.email ? ` as ${acct.email}` : ''}. Choose a letter and how much local space MirageSSD may use for speed.{' '}
             <button
               className="quiet-button inline min-h-0 p-0 text-xs underline"
               disabled={creating}
               onClick={() => {
                 setError(undefined);
-                setStatus(undefined);
-                void client.driveLogout().then(() => { setStep('signin'); return client.driveLogin(); }).catch((failure) => {
-                  setStep('signin');
+                setStep('signin');
+                void account.switchAccount().catch((failure) => {
                   setError(failure instanceof Error ? failure.message : String(failure));
                 });
               }}
