@@ -249,3 +249,7 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .account-chip-confirm p { color: #b2c5b8; font-size: 11px; line-height: 1.7; margin: 0; }
 
 .diagnostics-link { font-size: 11px; margin-top: 8px; min-height: 30px; padding: 4px 10px; }
+
+.confirm-panel { background: var(--surface-muted, #fafaf9); border: 1px solid var(--border, #e7e5e4); border-radius: 12px; padding: 14px 16px; max-width: 460px; }
+.confirm-panel p { margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
+.confirm-check { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 12px; cursor: pointer; }

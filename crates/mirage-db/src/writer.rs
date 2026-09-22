@@ -47,6 +47,7 @@ enum Command {
     FinishCacheDeallocation(CacheSlotRecord, Reply<()>),
     MarkCacheDeallocationRetry(CacheSlotRecord, Reply<()>),
     CreateRepository(NewRepository, Reply<()>),
+    UnregisterRepository(mirage_types::RepositoryId, Reply<bool>),
     SetRepositoryOwnerSid(mirage_types::RepositoryId, String, String, Reply<()>),
     SetRepositoryState(RepositoryStateChange, Reply<RepositoryState>),
     SetRepositoryVolumeMode(
@@ -276,6 +277,15 @@ impl DbWriter {
                         }
                         Command::MarkCacheDeallocationRetry(value, reply) => {
                             respond(reply, cache::mark_retry(&mut connection, value));
+                        }
+                        Command::UnregisterRepository(repository_id, reply) => {
+                            respond(
+                                reply,
+                                crate::repository::unregister_repository(
+                                    &mut connection,
+                                    repository_id,
+                                ),
+                            );
                         }
                         Command::CreateRepository(value, reply) => {
                             respond(reply, repository::create(&mut connection, value));
@@ -861,6 +871,13 @@ impl DbWriter {
 
     pub fn create_repository(&self, value: NewRepository) -> Result<(), MirageError> {
         self.request(|reply| Command::CreateRepository(value, reply))
+    }
+
+    pub fn unregister_repository(
+        &self,
+        repository_id: mirage_types::RepositoryId,
+    ) -> Result<bool, MirageError> {
+        self.request(|reply| Command::UnregisterRepository(repository_id, reply))
     }
 
     pub fn set_repository_owner_sid(

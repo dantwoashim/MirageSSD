@@ -999,3 +999,34 @@ mod tests {
         assert_eq!(default_floor_bytes(&small), 20 * GIB);
     }
 }
+
+/// Removes a volume's local registration via the service, then deletes this
+/// run's local `%LOCALAPPDATA%\MirageSSD\volumes\<id>` directory. Remote
+/// Drive content is never touched.
+pub fn remove(
+    repository_id: RepositoryId,
+    force_unmount: bool,
+    discard_unpublished: bool,
+) -> Result<serde_json::Value, MirageError> {
+    let result = service_request(
+        None,
+        mirage_ipc::Command::RepositoryUnregister {
+            repository_id,
+            force_unmount,
+            discard_unpublished,
+        },
+    )?;
+    // The local working directory lives under the user's LOCALAPPDATA — the
+    // service cannot see it, so the CLI removes it here. Only the exact
+    // volume directory is ever touched.
+    let volumes_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("MirageSSD")
+        .join("volumes")
+        .join(repository_id.to_string());
+    let local_removed = volumes_dir.is_dir() && std::fs::remove_dir_all(&volumes_dir).is_ok();
+    let mut result = result;
+    result["local_state_removed"] = serde_json::json!(local_removed);
+    Ok(result)
+}

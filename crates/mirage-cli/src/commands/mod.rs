@@ -709,6 +709,17 @@ pub enum VolumeCommand {
     },
     /// List this user's managed Drive-backed volumes.
     List,
+    /// Remove a volume's local state; Drive content is kept unless
+    /// --discard-unpublished is given (only pending uploads are dropped).
+    Remove {
+        repository_id: mirage_types::RepositoryId,
+        /// Unmount first if the volume is still mounted.
+        #[arg(long)]
+        force_unmount: bool,
+        /// Drop local payload bytes that have not finished uploading.
+        #[arg(long)]
+        discard_unpublished: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1537,6 +1548,14 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             }
             VolumeCommand::List => {
                 service::emit(serde_json::json!({"volumes": volume::list(None)?}), json)
+            }
+            VolumeCommand::Remove {
+                repository_id,
+                force_unmount,
+                discard_unpublished,
+            } => {
+                let result = volume::remove(repository_id, force_unmount, discard_unpublished)?;
+                service::emit(serde_json::json!(result), json)
             }
         },
         Command::Diagnostics { command } => match command {

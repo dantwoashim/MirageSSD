@@ -195,6 +195,12 @@ impl Database {
         self.writer.create_repository(repository)
     }
 
+    /// Removes the repository and every volume-scoped row. Returns false when
+    /// the repository is unknown. Remote Drive objects are never touched.
+    pub fn unregister_repository(&self, repository_id: RepositoryId) -> Result<bool, MirageError> {
+        self.writer.unregister_repository(repository_id)
+    }
+
     pub fn set_repository_owner_sid(
         &self,
         repository_id: RepositoryId,
@@ -372,4 +378,56 @@ pub(crate) fn set_state(
         return Err(conflict("repository state changed concurrently"));
     }
     Ok(next)
+}
+
+/// Deletes a repository and every volume-scoped row. Callers must have
+/// already stopped mounts and decided what to do with unpublished payloads —
+/// this only removes local metadata; remote Drive objects are untouched.
+pub fn unregister_repository(
+    connection: &mut Connection,
+    repository_id: RepositoryId,
+) -> Result<bool, MirageError> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT 1 FROM repositories WHERE repository_id = ?1",
+            [repository_id.as_bytes().as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| sqlite(error, "failed to load repository for unregister"))?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| sqlite(error, "failed to begin unregister transaction"))?;
+    for statement in [
+        "DELETE FROM operation_payloads WHERE operation_id IN (
+             SELECT operation_id FROM local_operations WHERE volume_id = ?1)",
+        "DELETE FROM local_operations WHERE volume_id = ?1",
+        "DELETE FROM dirents WHERE volume_id = ?1",
+        "DELETE FROM inodes WHERE volume_id = ?1",
+        "DELETE FROM legacy_inode_map WHERE volume_id = ?1",
+        "DELETE FROM namespace_pins WHERE volume_id = ?1",
+        "DELETE FROM namespace_deltas WHERE volume_id = ?1",
+        "DELETE FROM namespace_checkpoints WHERE volume_id = ?1",
+        "DELETE FROM namespace_volumes WHERE volume_id = ?1",
+        "DELETE FROM managed_namespace_seeds WHERE volume_id = ?1",
+        "DELETE FROM byte_extents WHERE volume_id = ?1",
+        "DELETE FROM byte_extent_heads WHERE volume_id = ?1",
+        "DELETE FROM publication_sessions WHERE volume_id = ?1",
+        "DELETE FROM payload_remote_objects WHERE volume_id = ?1",
+        "DELETE FROM space_leases WHERE repository_id = ?1",
+        "DELETE FROM generations WHERE repository_id = ?1",
+        "DELETE FROM repositories WHERE repository_id = ?1",
+    ] {
+        transaction
+            .execute(statement, [repository_id.as_bytes().as_slice()])
+            .map_err(|error| sqlite(error, "failed to delete repository rows"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| sqlite(error, "failed to commit unregister"))?;
+    Ok(true)
 }

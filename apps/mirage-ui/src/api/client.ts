@@ -139,6 +139,13 @@ export class ServiceClient {
     return await this.invoke({ command: 'unmount', body: { repository_id: repositoryId } });
   }
 
+  async repositoryUnregister(repositoryId: string, forceUnmount: boolean, discardUnpublished: boolean): Promise<unknown> {
+    return await this.invoke({
+      command: 'repository_unregister',
+      body: { repository_id: repositoryId, force_unmount: forceUnmount, discard_unpublished: discardUnpublished },
+    });
+  }
+
   async plan(repositoryId: string): Promise<unknown> {
     return await this.invoke({
       command: 'plan',

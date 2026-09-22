@@ -22,6 +22,8 @@ export function DriveCard({
   const [pinPath, setPinPath] = useState('');
   const [pins, setPins] = useState<string[]>();
   const [working, setWorking] = useState<string>();
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [discard, setDiscard] = useState(false);
   const letter = repository.mountPath?.replace(/[:\\].*$/, '') ?? repository.mountPath;
 
   const act = async (label: string, run: () => Promise<unknown>, notice: string) => {
@@ -116,6 +118,42 @@ export function DriveCard({
           )}
         </div>
       )}
+      <div className="button-row">
+        {!confirmingRemove ? (
+          <button className="quiet-button" disabled={busy || Boolean(working)} onClick={() => setConfirmingRemove(true)}>
+            Remove from this PC
+          </button>
+        ) : (
+          <div className="confirm-panel" role="alertdialog" aria-label={`Remove ${repository.name} from this PC`}>
+            <p>
+              Remove <strong>{repository.name}</strong> from this PC?
+              Everything already on Google Drive stays there — nothing on Drive is deleted.
+              {(repository.pendingBytes ?? 0) > 0
+                ? ` ${formatBytes(repository.pendingBytes ?? 0)} have not finished uploading and would be discarded from this PC.`
+                : ' All uploads have finished.'}
+            </p>
+            {(repository.pendingBytes ?? 0) > 0 && (
+              <label className="confirm-check">
+                <input type="checkbox" checked={discard} onChange={(event) => setDiscard(event.target.checked)} />
+                Discard the {formatBytes(repository.pendingBytes ?? 0)} that haven't uploaded
+              </label>
+            )}
+            <div className="button-row">
+              <button className="quiet-button" disabled={busy || Boolean(working)} onClick={() => { setConfirmingRemove(false); setDiscard(false); }}>
+                Keep this drive
+              </button>
+              <button className="secondary-button" disabled={busy || Boolean(working) || ((repository.pendingBytes ?? 0) > 0 && !discard)}
+                onClick={() => void act('Remove', async () => {
+                  await client.repositoryUnregister(repository.id, repository.mounted, discard);
+                  setConfirmingRemove(false);
+                  setDiscard(false);
+                }, `${repository.name} was removed from this PC. Its files stay in your Drive.`)}>
+                Remove from this PC
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
       {working && <p className="text-xs text-zinc-500" role="status"><Info size={14} /> {working}…</p>}
     </section>
   );

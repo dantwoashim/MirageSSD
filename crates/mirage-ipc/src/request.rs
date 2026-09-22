@@ -98,6 +98,15 @@ pub enum Command {
     RepositoryAdopt {
         repository_id: RepositoryId,
     },
+    /// Remove a repository's local registration and state. Drive objects are
+    /// never touched; local payload files become orphans for the next sweep.
+    RepositoryUnregister {
+        repository_id: RepositoryId,
+        #[serde(default)]
+        force_unmount: bool,
+        #[serde(default)]
+        discard_unpublished: bool,
+    },
     RepositoryConvert {
         repository_id: RepositoryId,
         apply: bool,
@@ -261,6 +270,7 @@ impl Command {
             self,
             Self::RepositoryRegister { .. }
                 | Self::RepositoryAdopt { .. }
+                | Self::RepositoryUnregister { .. }
                 | Self::RepositoryConvert { .. }
                 | Self::RepositoryRestoreNative { .. }
                 | Self::RepositorySetDriveOrigin { .. }

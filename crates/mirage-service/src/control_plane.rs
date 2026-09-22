@@ -640,6 +640,11 @@ impl RequestHandler for ControlPlaneHandler {
                 drive_access_token,
             } => self.supply_drive_token(repository_id, drive_access_token.expose()),
             Command::Unmount { repository_id } => self.unmount(repository_id),
+            Command::RepositoryUnregister {
+                repository_id,
+                force_unmount,
+                discard_unpublished,
+            } => self.repository_unregister(repository_id, force_unmount, discard_unpublished),
             Command::DiskFloorSet {
                 volume_root,
                 floor_bytes,
@@ -1283,6 +1288,75 @@ impl ControlPlaneHandler {
         Ok(())
     }
 
+    /// Removes a repository's local registration: optionally unmounts first,
+    /// refuses to silently drop unpublished payload bytes, then deletes every
+    /// local row plus this volume's journal payload files. Remote Drive
+    /// objects are never touched.
+    fn repository_unregister(
+        &self,
+        repository_id: RepositoryId,
+        force_unmount: bool,
+        discard_unpublished: bool,
+    ) -> Result<ResponseBody, MirageError> {
+        let state = self
+            .database
+            .load_repository_state(repository_id)?
+            .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
+        let was_mounted = state == RepositoryState::ReadyMounted;
+        if was_mounted && !force_unmount {
+            return Err(MirageError::repository_conflict(
+                "repository is still mounted; retry with force_unmount to unmount it first",
+            ));
+        }
+        if was_mounted {
+            self.unmount(repository_id)?;
+        }
+        let publication = self.database.payload_publication_stats(
+            repository_id,
+            &mirage_db::payload_remote::MANAGED_JOURNAL_FILE_ID,
+        )?;
+        if publication.pending_bytes > 0 && !discard_unpublished {
+            return Err(MirageError::repository_conflict(format!(
+                "{} bytes have not been uploaded to Drive yet; retry with discard_unpublished to drop them",
+                publication.pending_bytes
+            )));
+        }
+        // Payload ids that belonged to this volume — after the rows are gone
+        // their journal files are pure orphans, so delete them now rather
+        // than waiting for the next startup sweep.
+        let owned_payloads = self
+            .database
+            .referenced_payload_ids(repository_id)
+            .unwrap_or_default();
+        let removed = self.database.unregister_repository(repository_id)?;
+        let mut journal_files_removed = 0_u64;
+        if let Ok(state_root) = runtime::service_state_root(&self.database) {
+            let journal = state_root.join("journal");
+            for payload in owned_payloads {
+                let mut name = String::with_capacity(40);
+                for byte in payload {
+                    name.push_str(&format!("{byte:02x}"));
+                }
+                name.push_str(".payload");
+                if journal.join(&name).is_file()
+                    && std::fs::remove_file(journal.join(&name)).is_ok()
+                {
+                    journal_files_removed += 1;
+                }
+            }
+        }
+        crate::logging::log_event(
+            "repository.unregistered",
+            &format!("{repository_id} journal_files={journal_files_removed}"),
+        );
+        Ok(ResponseBody::Json(json!({
+            "unregistered": removed,
+            "was_mounted": was_mounted,
+            "discarded_pending_bytes": if discard_unpublished { publication.pending_bytes } else { 0 },
+            "journal_files_removed": journal_files_removed,
+        })))
+    }
+
     fn unmount(&self, repository_id: RepositoryId) -> Result<ResponseBody, MirageError> {
         let _lifecycle = self
             .mount_lifecycle
@@ -1629,6 +1703,7 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::Mount { repository_id, .. }
         | Command::DriveTokenSupply { repository_id, .. }
         | Command::Unmount { repository_id }
+        | Command::RepositoryUnregister { repository_id, .. }
         | Command::Profile { repository_id, .. }
         | Command::ProfileConfigure { repository_id, .. }
         | Command::Simulate { repository_id }

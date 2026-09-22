@@ -152,6 +152,7 @@ export type IpcCommand =
   | { command: 'repository_detail'; body: { repository_id: string } }
   | { command: 'mount'; body: { repository_id: string; generation: number } }
   | { command: 'unmount'; body: { repository_id: string } }
+  | { command: 'repository_unregister'; body: { repository_id: string; force_unmount: boolean; discard_unpublished: boolean } }
   | { command: 'profile'; body: { repository_id: string; maximum_duration_seconds: number } }
   | { command: 'simulate'; body: { repository_id: string } }
   | { command: 'capacity_plan'; body: { repository_id: string; requested_bytes: number } }
