@@ -1,4 +1,4 @@
-import { CaretRight, CheckCircle, FolderOpen, GoogleLogo, HardDrives, Info, SpinnerGap } from '@phosphor-icons/react';
+import { CaretRight, Check, CheckCircle, Copy, FolderOpen, GoogleLogo, HardDrives, Info, PushPin, SpinnerGap } from '@phosphor-icons/react';
 import { useEffect, useRef, useState } from 'react';
 import type { DriveAccount } from '../api/account';
 import { useDriveAccount } from '../api/account';
@@ -9,18 +9,74 @@ import { formatBytes } from '../components/CapsuleBreakdown';
 type Step = 'signin' | 'create' | 'done';
 
 const GIB = 1 << 30;
+const MIB = 1 << 20;
+type Unit = 'GiB' | 'MiB';
+
+function unitFactor(unit: Unit): number {
+  return unit === 'GiB' ? GIB : MIB;
+}
+
+function Stepper({ step }: { step: Step }) {
+  const items = [
+    { id: 'signin', label: 'Sign in' },
+    { id: 'create', label: 'Create' },
+    { id: 'done', label: 'Done' },
+  ] as const;
+  const active = items.findIndex((item) => item.id === step);
+  return (
+    <ol className="stepper" aria-label="Setup progress">
+      {items.map((item, index) => (
+        <li key={item.id} className={index < active ? 'done' : index === active ? 'active' : ''}>
+          <span className="step-dot" aria-hidden="true">{index < active ? <Check size={12} weight="bold" /> : index + 1}</span>
+          {item.label}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function ErrorCard({ message }: { message: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="feedback feedback-error error-card" role="alert">
+      <Info size={20} />
+      <div>
+        <strong>Something needs attention</strong>
+        <p>{message}</p>
+        <button
+          className="quiet-button error-copy"
+          onClick={() => {
+            void navigator.clipboard?.writeText(message).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            }).catch(() => {});
+          }}
+        >
+          <Copy size={14} />{copied ? 'Copied' : 'Copy details'}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function SetupWizard({ client, account, onDone }: { client: ServiceClient; account: DriveAccount; onDone: () => void }) {
   const acct = useDriveAccount(account);
   const [step, setStep] = useState<Step>('signin');
   const [disks, setDisks] = useState<DisksPayload>();
+  const [disksLoading, setDisksLoading] = useState(true);
   const [letter, setLetter] = useState('');
   const [name, setName] = useState('MirageSSD');
-  const [budgetGiB, setBudgetGiB] = useState(0);
-  const [floorGiB, setFloorGiB] = useState(0);
+  const [budgetValue, setBudgetValue] = useState(0);
+  const [budgetUnit, setBudgetUnit] = useState<Unit>('GiB');
+  const [floorValue, setFloorValue] = useState(0);
+  const [floorUnit, setFloorUnit] = useState<Unit>('GiB');
   const [createStatus, setCreateStatus] = useState<VolumeCreateStatus>();
   const [error, setError] = useState<string>();
+  const [pinState, setPinState] = useState<'idle' | 'done' | 'failed'>('idle');
   const polling = useRef(true);
+
+  const budgetBytes = budgetValue * unitFactor(budgetUnit);
+  const floorBytes = floorValue * unitFactor(floorUnit);
 
   // Poll sign-in progress while on step 1; the shared account store holds
   // the authoritative state.
@@ -43,13 +99,18 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
   // Load disk defaults once we reach step 2.
   useEffect(() => {
     if (step !== 'create') return;
+    setDisksLoading(true);
     void client.disks().then((next) => {
       setDisks(next);
       setLetter(next.default_letter || 'M');
-      setBudgetGiB(Math.max(1, Math.round(next.default_budget_bytes / GIB)));
+      setBudgetValue(Math.max(1, Math.round(next.default_budget_bytes / GIB)));
       const state = next.state_volume;
-      setFloorGiB(state ? Math.max(1, Math.round(Math.max(state.total_bytes / 10, 20 * GIB) / GIB)) : 20);
-    }).catch((failure) => setError(failure instanceof Error ? failure.message : String(failure)));
+      setFloorValue(state ? Math.max(1, Math.round(Math.max(state.total_bytes / 10, 20 * GIB) / GIB)) : 20);
+      setDisksLoading(false);
+    }).catch((failure) => {
+      setDisksLoading(false);
+      setError(failure instanceof Error ? failure.message : String(failure));
+    });
   }, [step, client]);
 
   // Poll volume creation progress while in flight.
@@ -90,8 +151,8 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
       await client.volumeCreate({
         name: name.trim(),
         letter: letter.trim().replace(/:$/, ''),
-        budget_bytes: budgetGiB * GIB,
-        floor_bytes: floorGiB > 0 ? floorGiB * GIB : undefined,
+        budget_bytes: budgetBytes,
+        floor_bytes: floorBytes > 0 ? floorBytes : undefined,
       });
       setCreateStatus({ in_flight: true, step: 'starting' });
     } catch (failure) {
@@ -99,13 +160,25 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
     }
   };
 
+  const pinToQuickAccess = async (driveLetter: string) => {
+    try {
+      await client.pinQuickAccess(driveLetter);
+      setPinState('done');
+    } catch {
+      setPinState('failed');
+    }
+  };
+
   const phase = acct.phase === 'signing_in' ? 'in_flight' : acct.phase === 'error' ? 'failed' : 'idle';
   const failed = acct.phase === 'error' ? acct.error : undefined;
   const creating = Boolean(createStatus?.in_flight);
+  const stateVolume = disks?.state_volume;
+  const leavesFree = stateVolume ? Math.max(0, stateVolume.free_bytes - floorBytes) : undefined;
 
   return (
     <section className="surface fine-grid min-h-96 rounded-[2rem] p-7 md:p-10" aria-labelledby="setup-title">
       <div className="max-w-xl pt-8 md:ml-[10%]">
+        <Stepper step={step} />
         <span className="grid size-12 place-items-center rounded-2xl border border-white/10 bg-white/4 text-emerald-200">
           <HardDrives size={24} weight="duotone" aria-hidden="true" />
         </span>
@@ -119,7 +192,7 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
           <p className="mt-3 max-w-[58ch] text-sm leading-7 text-zinc-400">
             MirageSSD keeps a drive letter in Windows backed by your Google Drive. Sign in once — it reconnects automatically at every sign-in.
           </p>
-          {(error || failed) && <div className="feedback feedback-error" role="alert"><Info size={20} /><p>{error ?? failed}</p></div>}
+          {(error || failed) && <ErrorCard message={error ?? failed ?? 'Sign-in failed.'} />}
           <button className="primary-button mt-6" onClick={() => void startLogin()} disabled={phase === 'in_flight'}>
             {phase === 'in_flight' ? <SpinnerGap size={16} className="refreshing" /> : <GoogleLogo size={16} weight="bold" />}
             {phase === 'in_flight' ? 'Waiting for Google…' : 'Sign in with Google'}
@@ -142,6 +215,13 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
               }}
             >Use a different account</button>
           </p>
+          {disksLoading && !disks ? (
+            <div className="mt-6 grid gap-4" aria-busy="true" aria-label="Loading disk options">
+              <div className="skeleton-field" />
+              <div className="skeleton-field" />
+              <div className="skeleton-field" />
+            </div>
+          ) : (
           <div className="mt-6 grid gap-4">
             <label className="field"><span>Drive letter</span>
               <select aria-label="Drive letter" value={letter} onChange={(event) => setLetter(event.target.value)} disabled={creating}>
@@ -155,36 +235,58 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
             </label>
             <label className="field"><span>Local SSD budget</span>
               <div className="flex items-center gap-3">
-                <input type="range" min={1} max={256} value={budgetGiB} onChange={(event) => setBudgetGiB(Number(event.target.value))} disabled={creating} aria-label="Local SSD budget in GiB" />
-                <span className="number text-sm text-zinc-300">{budgetGiB} GiB</span>
+                <input type="number" min={1} max={4096} value={budgetValue} onChange={(event) => setBudgetValue(Math.max(1, Number(event.target.value)))} disabled={creating} aria-label="Local SSD budget" />
+                <select aria-label="Budget unit" value={budgetUnit} onChange={(event) => setBudgetUnit(event.target.value as Unit)} disabled={creating}>
+                  <option value="GiB">GiB</option>
+                  <option value="MiB">MiB</option>
+                </select>
               </div>
-              {disks?.state_volume && <small className="text-xs text-zinc-500">On {disks.state_volume.volume_root} — {formatBytes(disks.state_volume.free_bytes)} free of {formatBytes(disks.state_volume.total_bytes)}</small>}
+              {stateVolume && <small className="text-xs text-zinc-500">On {stateVolume.volume_root} — {formatBytes(stateVolume.free_bytes)} free of {formatBytes(stateVolume.total_bytes)}</small>}
             </label>
             <label className="field"><span>Always keep free</span>
               <div className="flex items-center gap-3">
-                <input type="range" min={1} max={128} value={floorGiB} onChange={(event) => setFloorGiB(Number(event.target.value))} disabled={creating} aria-label="Free-space floor in GiB" />
-                <span className="number text-sm text-zinc-300">{floorGiB} GiB</span>
+                <input type="number" min={1} max={4096} value={floorValue} onChange={(event) => setFloorValue(Math.max(1, Number(event.target.value)))} disabled={creating} aria-label="Free-space floor" />
+                <select aria-label="Floor unit" value={floorUnit} onChange={(event) => setFloorUnit(event.target.value as Unit)} disabled={creating}>
+                  <option value="GiB">GiB</option>
+                  <option value="MiB">MiB</option>
+                </select>
               </div>
-              <small className="text-xs text-zinc-500">MirageSSD evicts cloud-backed data before your disk fills past this point.</small>
+              <small className="text-xs text-zinc-500">
+                MirageSSD evicts cloud-backed data before your disk fills past this point.
+                {leavesFree !== undefined && ` That leaves ~${formatBytes(leavesFree)} for everything else on ${stateVolume?.volume_root}.`}
+              </small>
             </label>
           </div>
-          {error && <div className="feedback feedback-error" role="alert"><Info size={20} /><p>{error}</p></div>}
-          <button className="primary-button mt-6" onClick={() => void startCreate()} disabled={creating}>
+          )}
+          {error && <ErrorCard message={error} />}
+          <button className="primary-button mt-6" onClick={() => void startCreate()} disabled={creating || (disksLoading && !disks)}>
             {creating ? <SpinnerGap size={16} className="refreshing" /> : <CaretRight size={16} />}
             {creating ? (createStatus?.step ?? 'Working…') : 'Create drive'}
           </button>
         </>}
 
         {step === 'done' && <>
+          {createStatus?.drive_letter && (
+            <div className="drive-ready-card" role="status">
+              <span className="drive-ready-letter">{createStatus.drive_letter}:</span>
+              <span className="drive-ready-name">{createStatus.name ?? name}</span>
+            </div>
+          )}
           <p className="mt-3 max-w-[58ch] text-sm leading-7 text-zinc-400">
-            {createStatus?.drive_letter ? `${createStatus.drive_letter}: is` : 'Your drive is'} live in File Explorer. Everything you save syncs to your Google Drive automatically.
+            Live in File Explorer. Everything you save syncs to your Google Drive automatically.
           </p>
-          <div className="mt-6 flex items-center gap-3">
+          <div className="mt-6 flex flex-wrap items-center gap-3">
             {createStatus?.drive_letter && (
               <button className="primary-button" onClick={() => void client.openExplorer(createStatus.drive_letter!).catch(() => {})}>
                 <FolderOpen size={16} />Open {createStatus.drive_letter}: in Explorer
               </button>
             )}
+            {createStatus?.drive_letter && pinState !== 'done' && (
+              <button className="secondary-button" onClick={() => void pinToQuickAccess(createStatus.drive_letter!)}>
+                <PushPin size={16} />{pinState === 'failed' ? 'Try pinning again' : 'Pin to Quick Access'}
+              </button>
+            )}
+            {pinState === 'done' && <span className="text-xs text-emerald-300" role="status">Pinned to Quick Access</span>}
             <button className="quiet-button" onClick={onDone}><CheckCircle size={16} />Done</button>
           </div>
         </>}

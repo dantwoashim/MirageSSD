@@ -1,5 +1,5 @@
-import { ArrowSquareOut, Broom, FolderOpen, Info, PushPin } from '@phosphor-icons/react';
-import { useState } from 'react';
+import { ArrowSquareOut, Broom, FolderOpen, Info, PushPin, SpinnerGap } from '@phosphor-icons/react';
+import { useEffect, useState } from 'react';
 import type { ServiceClient } from '../api/client';
 import type { RepositoryState } from '../models';
 import { formatBytes } from '../components/CapsuleBreakdown';
@@ -57,6 +57,25 @@ export function DriveCard({
               ? `${formatBytes(repository.physicalBytes ?? 0)} staged locally · ${formatBytes(repository.pendingBytes ?? 0)} waiting to sync`
               : 'Not connected. Connect to browse it in File Explorer.'}
           </p>
+          {(repository.pendingBytes ?? 0) > 0 && (
+            <p className="upload-live" role="status">
+              <SpinnerGap size={13} className="refreshing" /> Uploading · {formatBytes(repository.pendingBytes ?? 0)} remaining
+            </p>
+          )}
+          {repository.mounted && (() => {
+            const staged = repository.physicalBytes ?? 0;
+            const pending = repository.pendingBytes ?? 0;
+            const published = repository.publishedBytes ?? 0;
+            const total = Math.max(1, staged + pending + published);
+            return (
+              <div className="usage-bar" role="img"
+                aria-label={`${formatBytes(staged)} on this device, ${formatBytes(pending)} waiting to upload`}>
+                <span className="usage-seg usage-local" style={{ width: `${(staged / total) * 100}%` }} />
+                <span className="usage-seg usage-pending" style={{ width: `${(pending / total) * 100}%` }} />
+              </div>
+            );
+          })()}
+          <FloorSentence client={client} />
         </div>
         <div className="button-row">
           {letter && repository.mounted && (
@@ -165,4 +184,23 @@ export function DriveCard({
       : [];
     setPins(list);
   }
+}
+
+/** One-line floor status under the drive card: which disk is protected and
+ * how much is always kept free (fetched once per card mount). */
+function FloorSentence({ client }: { client: ServiceClient }) {
+  const [text, setText] = useState<string>();
+  useEffect(() => {
+    void client.diskStatus().then((status) => {
+      const floors = (status as { floors?: { volume_root: string; floor_bytes: number }[] }).floors ?? [];
+      if (floors.length === 0) {
+        setText('No free-space floor set — add one with mirage disk set-floor.');
+      } else {
+        const [first] = floors;
+        setText(`Free-space protection: always keeps ${formatBytes(first.floor_bytes)} free on ${first.volume_root}.`);
+      }
+    }).catch(() => setText('Free-space floor status unavailable.'));
+  });
+  if (!text) return null;
+  return <p className="floor-sentence">{text}</p>;
 }

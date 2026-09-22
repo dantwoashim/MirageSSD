@@ -299,6 +299,11 @@ export class ServiceClient {
     }
   }
 
+  async pinQuickAccess(letter: string): Promise<void> {
+    const payload = await this.apiPost('/api/pin-quick-access', { letter }) as { ok?: boolean; error?: string };
+    if (!payload?.ok) throw new Error(payload?.error ?? 'could not pin to Quick Access');
+  }
+
   async diagnosticsCollect(): Promise<string> {
     const payload = await this.apiPost('/api/diagnostics/collect') as { path?: string; error?: string };
     const path = payload?.path;

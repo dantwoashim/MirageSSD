@@ -5,6 +5,8 @@
 
 #[cfg(windows)]
 #[cfg(windows)]
+mod pin_quick_access;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]
@@ -583,6 +585,38 @@ mod windows_host {
                     200,
                     "application/json; charset=utf-8",
                     &serde_json::to_vec(&serde_json::json!({"cancelled": cancelled}))?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/pin-quick-access") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let letter = payload["letter"]
+                    .as_str()
+                    .and_then(|s| s.chars().next())
+                    .filter(|c| c.is_ascii_alphabetic());
+                let body = match letter {
+                    Some(letter) => match crate::pin_quick_access::pin_to_quick_access(letter) {
+                        Ok(()) => serde_json::json!({"ok": true}),
+                        Err(error) => serde_json::json!({"ok": false, "error": error}),
+                    },
+                    None => serde_json::json!({"ok": false, "error": "a drive letter is required"}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
                     false,
                 )?;
             }
