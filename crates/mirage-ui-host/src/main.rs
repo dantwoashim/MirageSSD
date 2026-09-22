@@ -356,6 +356,8 @@ mod windows_host {
                     "default_letter": mirage_cli::commands::volume::first_free_letter()
                         .map(|letter| letter.to_string())
                         .unwrap_or_default(),
+                    "free_letters": mirage_cli::commands::volume::free_letters()
+                        .unwrap_or_default(),
                     "default_budget_bytes": mirage_cli::commands::volume::default_budget_bytes()
                         .unwrap_or(0),
                 });

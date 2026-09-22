@@ -159,6 +159,15 @@ fn state_volume_root() -> Result<PathBuf, MirageError> {
     Ok(PathBuf::from(format!("{}\\", root.to_string_lossy())))
 }
 
+/// Every free drive letter from D: through Z: (mounted letters excluded).
+pub fn free_letters() -> Result<Vec<String>, MirageError> {
+    let used = used_drive_mask()?;
+    Ok(('D'..='Z')
+        .filter(|letter| used & (1 << (*letter as u8 - b'A')) == 0)
+        .map(|letter| letter.to_string())
+        .collect())
+}
+
 /// Default local SSD budget: min(25% of free space on the disk with the
 /// most free space, 64 GiB), as specified for the first-run wizard.
 pub fn default_budget_bytes() -> Result<u64, MirageError> {

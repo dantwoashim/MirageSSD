@@ -47,6 +47,7 @@ export type DisksPayload = {
   state_volume: DiskInfo | null;
   default_letter: string;
   default_budget_bytes: number;
+  free_letters?: string[];
 };
 
 export type DriveStatus = {

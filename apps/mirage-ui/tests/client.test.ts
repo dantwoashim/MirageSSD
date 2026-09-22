@@ -88,4 +88,33 @@ describe('service client', () => {
     expect(driveRequest?.command.command).toBe('materialize');
     expect(JSON.stringify(driveRequest)).not.toContain('drive_access_token');
   });
+
+  it('returns the free drive letters and disk defaults for the wizard', async () => {
+    let path = '';
+    const bridge: LocalBridge = {
+      invoke: async (request) => response(request),
+      apiGet: async (requested) => {
+        path = requested;
+        return {
+          disks: [{ volume_root: 'C:\\', total_bytes: 1000, free_bytes: 500 }],
+          state_volume: { volume_root: 'C:\\', total_bytes: 1000, free_bytes: 500 },
+          default_letter: 'M',
+          default_budget_bytes: 64 * 1024 ** 3,
+          free_letters: ['D', 'E', 'M', 'N'],
+        };
+      },
+    };
+    const disks = await new ServiceClient(bridge).disks();
+    expect(path).toBe('/api/disks');
+    expect(disks.free_letters).toEqual(['D', 'E', 'M', 'N']);
+    expect(disks.default_letter).toBe('M');
+  });
+
+  it('surfaces volume creation failures from the local bridge', async () => {
+    const bridge: LocalBridge = {
+      invoke: async (request) => response(request),
+      apiPost: async () => ({ accepted: false, error: 'Drive letter M: is already in use.' }),
+    };
+    await expect(new ServiceClient(bridge).volumeCreate({ name: 'MirageSSD', letter: 'M', budget_bytes: 1024 })).rejects.toThrow('already in use');
+  });
 });

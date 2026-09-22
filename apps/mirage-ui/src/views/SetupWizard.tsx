@@ -148,8 +148,10 @@ export function SetupWizard({ client, onDone }: { client: ServiceClient; onDone:
           </p>
           <div className="mt-6 grid gap-4">
             <label className="field"><span>Drive letter</span>
-              <select value={letter} onChange={(event) => setLetter(event.target.value)} disabled={creating}>
-                {letter && <option value={letter}>{letter}:</option>}
+              <select aria-label="Drive letter" value={letter} onChange={(event) => setLetter(event.target.value)} disabled={creating}>
+                {(disks?.free_letters?.length ? disks.free_letters : [letter || 'M']).map((free) => (
+                  <option key={free} value={free}>{free}:</option>
+                ))}
               </select>
             </label>
             <label className="field"><span>Name</span>
