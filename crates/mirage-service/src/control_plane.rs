@@ -1457,6 +1457,14 @@ impl ControlPlaneHandler {
             now_ns(),
         )?;
         runtime::clear_mount_record(&self.database, repository_id)?;
+        // The letter is free again: drop its icon and shell verbs so whatever
+        // takes the letter next is not branded as a MirageSSD drive.
+        if let Some(record) = record.as_ref()
+            && let Ok(Some(owner_sid)) = self.database.load_repository_owner_sid(repository_id)
+        {
+            explorer_drive_icon::unregister(&owner_sid, &record.mount_point);
+            explorer_drive_icon::unregister_verbs(&owner_sid, &record.mount_point);
+        }
         Ok(ResponseBody::Json(json!({
             "repository_id": repository_id.to_string(),
             "state": "ready_unmounted",
