@@ -1,7 +1,7 @@
 import { ArrowSquareOut, Broom, FolderOpen, HardDrives, Info, PushPin, SpinnerGap } from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
 import type { ServiceClient } from '../api/client';
-import type { DiskInfo, RepositoryState, VolumeSetCacheStatus } from '../models';
+import type { DiskInfo, RepositoryState, VolumeOffloadStatus, VolumeSetCacheStatus } from '../models';
 import { formatBytes } from '../components/CapsuleBreakdown';
 
 /** Card shown for a managed Drive-backed volume: letter, staged/pending
@@ -126,6 +126,7 @@ export function DriveCard({
               <Broom size={15} />Free up space
             </button>
           </div>
+          <OffloadPanel client={client} repository={repository} busy={busy || Boolean(working)} onChanged={onChanged} />
           {pins && pins.length > 0 && (
             <ul className="pin-list" aria-label="Pinned folders">
               {pins.map((path) => (
@@ -191,6 +192,88 @@ export function DriveCard({
 }
 
 const GIB = 1 << 30;
+
+/** Move a folder from a local disk into this drive: every file is copied,
+ * read back through the drive and hash-compared, Drive publication is
+ * awaited, and only then is the local copy deleted (if asked). */
+function OffloadPanel({ client, repository, busy, onChanged }: {
+  client: ServiceClient;
+  repository: RepositoryState;
+  busy: boolean;
+  onChanged: (notice?: string, error?: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [source, setSource] = useState('');
+  const [deleteSource, setDeleteSource] = useState(false);
+  const [status, setStatus] = useState<VolumeOffloadStatus>();
+
+  useEffect(() => {
+    if (!status?.in_flight) return;
+    const tick = async () => {
+      try {
+        const next = await client.volumeOffloadStatus();
+        setStatus(next);
+        if (next.in_flight) { window.setTimeout(() => void tick(), 1500); return; }
+        if (next.done && (next.failures?.length ?? 0) === 0) {
+          onChanged(next.source_deleted
+            ? `Moved ${next.files ?? 0} files (${formatBytes(next.bytes ?? 0)}) into the drive, verified in Google Drive, and freed the local copy.`
+            : `Copied and verified ${next.verified ?? 0} of ${next.files ?? 0} files into the drive${next.published ? ' — all published to Google Drive.' : ' — still uploading to Google Drive.'}`);
+        } else {
+          onChanged(undefined, next.error ?? `Offload finished with ${next.failures?.length ?? 0} file(s) that could not be verified; the source folder was left untouched.`);
+        }
+      } catch (failure) {
+        setStatus({ in_flight: false, error: failure instanceof Error ? failure.message : String(failure) });
+      }
+    };
+    window.setTimeout(() => void tick(), 1500);
+  }, [status?.in_flight, client, onChanged]);
+
+  const start = async () => {
+    if (!source.trim()) return;
+    try {
+      await client.volumeOffload({ repository_id: repository.id, source: source.trim(), delete_source: deleteSource });
+      setStatus({ in_flight: true, step: 'starting' });
+    } catch (failure) {
+      onChanged(undefined, failure instanceof Error ? failure.message : String(failure));
+    }
+  };
+
+  const running = Boolean(status?.in_flight);
+  return (
+    <div className="offload-panel">
+      {!open ? (
+        <button className="quiet-button" disabled={busy || running} onClick={() => setOpen(true)}>
+          <HardDrives size={15} />Offload a folder into this drive…
+        </button>
+      ) : (
+        <form className="confirm-panel" role="dialog" aria-label="Offload a folder" onSubmit={(event) => { event.preventDefault(); void start(); }}>
+          <p>
+            Move a folder from a local disk into this drive. Every file is copied, read back through the drive and compared, and the drive
+            uploads it to Google Drive. Nothing local is deleted unless you tick the box — and then only after every file is verified and uploaded.
+          </p>
+          <label>
+            <span className="sr-only">Folder to offload</span>
+            <input value={source} onChange={(event) => setSource(event.target.value)} placeholder="Folder to move, e.g. D:\Videos\2023" disabled={running} />
+          </label>
+          <label className="confirm-check">
+            <input type="checkbox" checked={deleteSource} onChange={(event) => setDeleteSource(event.target.checked)} disabled={running} />
+            Delete the local copy once everything is verified in Google Drive
+          </label>
+          <div className="button-row">
+            <button type="button" className="quiet-button" disabled={running} onClick={() => setOpen(false)}>Close</button>
+            <button type="submit" className="secondary-button" disabled={running || !source.trim()}>Offload</button>
+          </div>
+        </form>
+      )}
+      {running && <p className="upload-live" role="status"><SpinnerGap size={13} className="refreshing" /> {status?.step ?? 'Working'}…</p>}
+      {status && !status.in_flight && (status.failures?.length ?? 0) > 0 && (
+        <ul className="pin-list" aria-label="Files that could not be verified">
+          {status.failures!.slice(0, 8).map((failure) => <li key={failure}><span>{failure}</span></li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 /** Where this drive keeps its local cache, how much room that disk has, the
  * floor guarding it — with the controls to move the cache to another disk

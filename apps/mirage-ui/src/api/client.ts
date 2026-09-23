@@ -13,6 +13,7 @@ import {
   type ServiceSnapshot,
   type UpdateCheck,
   type VolumeCreateStatus,
+  type VolumeOffloadStatus,
   type VolumeSetCacheStatus,
 } from '../models';
 import { record } from '../presentation';
@@ -349,6 +350,18 @@ export class ServiceClient {
 
   async volumeSetCacheStatus(): Promise<VolumeSetCacheStatus> {
     return await this.apiGet('/api/volume/set-cache-status') as VolumeSetCacheStatus;
+  }
+
+  /// Move a local folder into the drive: copy, verify back through the
+  /// drive, wait for Drive publication, then (optionally) delete the source.
+  async volumeOffload(payload: { repository_id: string; source: string; delete_source: boolean }): Promise<void> {
+    const value = await this.apiPost('/api/volume/offload', payload);
+    if (record(value) && typeof value.error === 'string') throw new Error(value.error);
+    if (record(value) && value.in_flight === true && value.started !== true) throw new Error('Another offload is already running.');
+  }
+
+  async volumeOffloadStatus(): Promise<VolumeOffloadStatus> {
+    return await this.apiGet('/api/volume/offload-status') as VolumeOffloadStatus;
   }
 
   async openExplorer(letter: string): Promise<void> {

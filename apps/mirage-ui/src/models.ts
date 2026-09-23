@@ -88,6 +88,25 @@ export type VolumeCreateStatus = {
   cache_root?: string | null;
 };
 
+export type VolumeOffloadStatus = {
+  in_flight?: boolean;
+  step?: string;
+  done?: boolean;
+  error?: string;
+  repository_id?: string;
+  source?: string;
+  destination?: string;
+  files?: number;
+  bytes?: number;
+  copied?: number;
+  skipped_identical?: number;
+  verified?: number;
+  published?: boolean;
+  unpublished_bytes_remaining?: number;
+  source_deleted?: boolean;
+  failures?: string[];
+};
+
 export type VolumeSetCacheStatus = {
   in_flight?: boolean;
   step?: string;

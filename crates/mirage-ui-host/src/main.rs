@@ -232,6 +232,7 @@ mod windows_host {
         login_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         create: serde_json::Value,
         set_cache: serde_json::Value,
+        offload: serde_json::Value,
     }
 
     #[derive(Default)]
@@ -364,6 +365,85 @@ mod windows_host {
             }
         });
         serde_json::json!({"started": true})
+    }
+
+    /// Offloads a local folder into a drive on a worker thread; progress and
+    /// the final report are polled through offload.
+    fn start_volume_offload(
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, MirageError> {
+        let repository_id = payload["repository_id"]
+            .as_str()
+            .ok_or_else(|| MirageError::invalid_argument("repository_id is required"))?
+            .parse::<mirage_types::RepositoryId>()?;
+        let source = payload["source"]
+            .as_str()
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| MirageError::invalid_argument("source folder is required"))?;
+        let delete_source = payload["delete_source"].as_bool().unwrap_or(false);
+        {
+            let mut state = shared
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("state lock poisoned"))?;
+            if state.offload["in_flight"].as_bool() == Some(true) {
+                return Ok(serde_json::json!({"started": false, "in_flight": true}));
+            }
+            state.offload = serde_json::json!({
+                "in_flight": true,
+                "step": "starting",
+                "repository_id": repository_id.to_string(),
+                "source": source.to_string_lossy(),
+            });
+        }
+        std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let progress_shared = shared.clone();
+                let mut progress = move |step: &str| {
+                    if let Ok(mut state) = progress_shared.lock() {
+                        state.offload["step"] = serde_json::json!(step);
+                    }
+                };
+                let result = mirage_cli::commands::offload::run(
+                    &mirage_cli::commands::offload::OffloadSpec {
+                        repository_id,
+                        source: source.clone(),
+                        destination: None,
+                        delete_source,
+                        // The UI keeps polling; a day bounds a very large folder.
+                        wait_publish: std::time::Duration::from_secs(86_400),
+                    },
+                    None,
+                    &mut progress,
+                );
+                if let Ok(mut state) = shared.lock() {
+                    state.offload = match result.and_then(|report| {
+                        serde_json::to_value(report).map_err(|error| {
+                            MirageError::internal_invariant(format!("offload report: {error}"))
+                        })
+                    }) {
+                        Ok(mut value) => {
+                            value["in_flight"] = serde_json::json!(false);
+                            value["done"] = serde_json::json!(true);
+                            value["repository_id"] = serde_json::json!(repository_id.to_string());
+                            value["source"] = serde_json::json!(source.to_string_lossy());
+                            value
+                        }
+                        Err(error) => serde_json::json!({
+                            "in_flight": false,
+                            "done": false,
+                            "repository_id": repository_id.to_string(),
+                            "source": source.to_string_lossy(),
+                            "error": error.to_string(),
+                        }),
+                    };
+                }
+            }
+        });
+        Ok(serde_json::json!({"started": true}))
     }
 
     /// Moves a volume's local cache to another disk on a worker thread;
@@ -873,6 +953,56 @@ mod windows_host {
                     Some(body) => body,
                     None => serde_json::json!({"error": "cache move could not be started"}),
                 };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/volume/offload") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = match serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .map(|payload| start_volume_offload(shared, &payload))
+                {
+                    Some(Ok(body)) => body,
+                    Some(Err(error)) => serde_json::json!({"error": error.to_string()}),
+                    None => serde_json::json!({"error": "offload could not be started"}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("GET", "/api/volume/offload-status") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = shared
+                    .lock()
+                    .map(|state| state.offload.clone())
+                    .unwrap_or_default();
                 write_response(
                     stream,
                     200,
