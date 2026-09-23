@@ -9,8 +9,9 @@ use crate::{BackendError, BackendErrorClass, FetchClass, ObjectBackend, RemoteOb
 /// Bytes requested per readback GET. The body is hashed as it streams, so
 /// memory stays at one transport chunk regardless of this size; what the
 /// window controls is the number of sequential round trips (a 32 MiB
-/// payload took 32 serial Drive requests at 1 MiB).
-const VERIFY_WINDOW: u64 = 16 * 1024 * 1024;
+/// payload took 32 serial Drive requests at 1 MiB); 4 MiB keeps each GET short
+/// on a slow link so it never approaches the transport timeout.
+const VERIFY_WINDOW: u64 = 4 * 1024 * 1024;
 
 pub async fn verify_object_bytes(
     backend: &dyn ObjectBackend,

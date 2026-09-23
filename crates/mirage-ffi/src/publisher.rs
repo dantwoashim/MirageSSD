@@ -28,9 +28,11 @@ pub const PAYLOAD_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 /// round trips (dedup lookup, session start, upload, metadata + readback
 /// verify), so small payloads are latency-bound and need many in flight.
 pub const PUBLISH_PARALLELISM: usize = 16;
-/// Plaintext bytes in flight per batch: each upload holds plaintext and
-/// ciphertext in memory, so 32 MiB segments batch fewer at a time.
-pub const PUBLISH_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// Plaintext bytes in flight per batch. Home uplinks are ~1-10 MB/s: with
+/// 256 MiB in flight each request's share of the link pushed uploads and
+/// readbacks past the 5-minute transport timeout, and the resulting errors
+/// backed the whole publisher off. 64 MiB keeps every request well inside it.
+pub const PUBLISH_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Splits the pending list into batches of at most PUBLISH_PARALLELISM``n/// payloads and PUBLISH_BATCH_BYTES plaintext (a single larger payload
 /// still forms its own batch).
@@ -420,7 +422,7 @@ fn publish_one(
         Err(error) => {
             let class = format!("{:?}", error.class);
             stats.record_error(&class);
-            eprintln!("payload publish backend error: {class}");
+            eprintln!("payload publish backend error: {class}: {error}");
             return Err(PublishFailure::Backend);
         }
     };
@@ -949,7 +951,7 @@ mod batch_tests {
         assert_eq!(sizes, vec![16, 16, 8]);
         let large: Vec<_> = (0..20).map(|_| payload(32 << 20)).collect();
         let sizes: Vec<usize> = publish_batches(&large).iter().map(|b| b.len()).collect();
-        assert_eq!(sizes, vec![8, 8, 4]);
+        assert_eq!(sizes, vec![2; 10]);
         let huge = vec![payload(1 << 30)];
         assert_eq!(
             publish_batches(&huge).len(),

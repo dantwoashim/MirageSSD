@@ -13,7 +13,7 @@ mod device_drive;
 pub mod diagnostics;
 mod disk;
 mod drive_gate;
-mod drive_live;
+pub mod drive_live;
 pub mod offload;
 mod recovery;
 mod repo_drive;
