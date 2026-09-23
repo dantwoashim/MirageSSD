@@ -6,7 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BackendError, BackendErrorClass, FetchClass, ObjectBackend, RemoteObjectRef};
 
-const VERIFY_WINDOW: u64 = 1024 * 1024;
+/// Bytes requested per readback GET. The body is hashed as it streams, so
+/// memory stays at one transport chunk regardless of this size; what the
+/// window controls is the number of sequential round trips (a 32 MiB
+/// payload took 32 serial Drive requests at 1 MiB).
+const VERIFY_WINDOW: u64 = 16 * 1024 * 1024;
 
 pub async fn verify_object_bytes(
     backend: &dyn ObjectBackend,

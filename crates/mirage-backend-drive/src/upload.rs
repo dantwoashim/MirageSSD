@@ -8,7 +8,9 @@ use mirage_backend::{BackendError, UploadSource};
 use mirage_types::ContentHash;
 use std::collections::BTreeMap;
 
-const UPLOAD_CHUNK_BYTES: u64 = CHUNK_ALIGNMENT * 32;
+// 32 MiB: a managed payload segment (<= 32 MiB) uploads in one PUT instead
+// of four serial ones; memory per in-flight upload stays one chunk.
+const UPLOAD_CHUNK_BYTES: u64 = CHUNK_ALIGNMENT * 128;
 
 /// Streams an upload body through a resumable session in aligned chunks so
 /// peak memory stays proportional to one chunk, not the object. The content
