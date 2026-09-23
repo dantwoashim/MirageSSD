@@ -2367,30 +2367,6 @@ pub fn validate_explorer_mount_ready(
         }
     }
     let index = MountIndex::open(index_path)?;
-    let shards = database.load_cache_shards()?;
-    let [spec] = shards.as_slice() else {
-        return Err(MirageError::unsupported_layout(
-            "Explorer volume requires exactly one local cache shard",
-        ));
-    };
-    if spec.shard_id != 0 {
-        return Err(MirageError::unsupported_layout(
-            "Explorer volume requires cache shard zero",
-        ));
-    }
-    let layout = CacheLayout {
-        page_size: spec.page_size,
-        slot_count: spec.slot_count,
-        db_journal_allowance: ByteCount::ZERO,
-        filesystem_reserve: ByteCount::ZERO,
-    };
-    let shard = Arc::new(ArenaShard::open(
-        &service_state_root(database)?
-            .join("cache")
-            .join(&spec.relative_path),
-        layout,
-    )?);
-    let resident = ResidentIndex::rebuild(database, shard)?;
     let mut hashes = BTreeSet::new();
     for ordinal in 0..index.page_count() {
         let ordinal = u32::try_from(ordinal)
@@ -2400,13 +2376,39 @@ pub fn validate_explorer_mount_ready(
     let config = load_config(database, repository_id)?;
     // A managed Drive volume fetches non-resident pages on demand, so the
     // Explorer gate only needs the provider inputs (manifest + key), not
-    // upfront residency. Legacy mounts still require full verification.
+    // upfront residency or a provisioned cache shard — a fresh PC has
+    // neither, and the engine is correct without resident pages. Legacy
+    // mounts still require the shard and full verification.
     let on_demand = database.load_repository_volume_mode(repository_id)?
         == Some(mirage_db::VolumeMode::Managed)
         && config.origin == RuntimeOrigin::Drive
         && config.import_root.join(DRIVE_MANIFEST).is_file()
         && config.import_root.join("repository-key.dpapi").is_file();
     if !on_demand {
+        let shards = database.load_cache_shards()?;
+        let [spec] = shards.as_slice() else {
+            return Err(MirageError::unsupported_layout(
+                "Explorer volume requires exactly one local cache shard",
+            ));
+        };
+        if spec.shard_id != 0 {
+            return Err(MirageError::unsupported_layout(
+                "Explorer volume requires cache shard zero",
+            ));
+        }
+        let layout = CacheLayout {
+            page_size: spec.page_size,
+            slot_count: spec.slot_count,
+            db_journal_allowance: ByteCount::ZERO,
+            filesystem_reserve: ByteCount::ZERO,
+        };
+        let shard = Arc::new(ArenaShard::open(
+            &service_state_root(database)?
+                .join("cache")
+                .join(&spec.relative_path),
+            layout,
+        )?);
+        let resident = ResidentIndex::rebuild(database, shard)?;
         for hash in &hashes {
             if verify_page(&resident, database, *hash, IntegrityClass::Clean)?
                 != VerifyOutcome::Verified

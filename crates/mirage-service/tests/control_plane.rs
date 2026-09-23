@@ -855,3 +855,125 @@ fn cache_root_move_copies_verifies_records_and_is_refused_while_mounted() {
     );
     assert!(target.join("journal").join(&payload_name).exists());
 }
+
+/// A fresh PC has no provisioned cache shard. A managed Drive volume mounts
+/// on demand and must not require one — this was the "Explorer volume
+/// requires exactly one local cache shard" failure on first-run create.
+#[test]
+fn managed_drive_volume_mounts_on_a_letter_without_any_cache_shard() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x62; 16]);
+    let generation = GenerationId::from_u64(0);
+    let commit = CommitHash::from_bytes([7; 32]);
+    let root = directory.path().join("native");
+    let import = directory.path().join("import");
+    let manifest = import.join("active.manifest");
+    let index = import.join("active.midx");
+    std::fs::create_dir_all(&import).expect("import");
+    std::fs::create_dir_all(&root).expect("native root");
+    std::fs::write(&manifest, b"manifest fixture").expect("manifest");
+    std::fs::write(
+        import.join("drive-manifest.cbor"),
+        b"drive manifest fixture",
+    )
+    .expect("drive manifest");
+    std::fs::write(import.join("repository-key.dpapi"), b"key fixture").expect("key");
+    let fixture = decode_manifest_bounded(
+        include_bytes!("../../mirage-manifest/tests/fixtures/manifest-v2-complex.cbor"),
+        DecodeLimits::default(),
+    )
+    .expect("manifest fixture");
+    std::fs::write(&index, compile_to_bytes(&fixture).expect("compile index")).expect("index");
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "fresh pc drive".into(),
+            local_root: root.clone(),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    database
+        .insert_verified_generation(VerifiedGeneration {
+            repository_id,
+            generation_id: generation,
+            commit_hash: commit,
+            manifest_hash: ManifestHash::from_bytes([8; 32]),
+            manifest_local_path: manifest.clone(),
+            mount_index_path: Some(index.clone()),
+            created_at_ns: 2,
+        })
+        .expect("generation");
+    database
+        .activate_generation(repository_id, generation, commit, None, 3)
+        .expect("activate");
+    let runtime_root = directory
+        .path()
+        .join("repositories")
+        .join(repository_id.to_string());
+    std::fs::create_dir_all(&runtime_root).expect("runtime root");
+    std::fs::write(
+        runtime_root.join("runtime.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": 1,
+            "native_root": root.canonicalize().unwrap(),
+            "mount_subtree": ".",
+            "import_root": import,
+            "launcher_relative": "volume.mirage",
+            "arguments": [],
+            "version_label": "0",
+            "configuration_label": "managed",
+            "cache_bytes": 8 * 1024 * 1024 * 1024u64,
+            "drain_ms": 0,
+            "origin": "drive"
+        }))
+        .unwrap(),
+    )
+    .expect("runtime config");
+    assert!(
+        database.load_cache_shards().unwrap().is_empty(),
+        "fixture must have no shard"
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let handler = ControlPlaneHandler::with_mount_control(
+        database.clone(),
+        FakeMountControl {
+            calls: Arc::clone(&calls),
+        },
+    );
+    let managed = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::RepositorySetVolumeMode {
+                repository_id,
+                managed: true,
+            },
+        ),
+    );
+    assert!(matches!(managed, ResponseBody::Json(_)), "{managed:?}");
+    let letter = ('R'..='Z')
+        .rev()
+        .find(|letter| std::fs::metadata(format!("{letter}:\\")).is_err())
+        .expect("free letter");
+    let mounted = handler.handle(
+        &principal(),
+        request(
+            2,
+            Command::Mount {
+                repository_id,
+                generation,
+                drive_letter: Some(letter.to_string()),
+                drive_access_token: None,
+            },
+        ),
+    );
+    assert!(
+        matches!(mounted, ResponseBody::Json(_)),
+        "fresh-PC mount must succeed: {mounted:?}"
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["mount"]);
+}

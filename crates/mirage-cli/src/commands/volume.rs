@@ -433,11 +433,21 @@ fn create_in(
             })
         }
         Err((step, published, onboarded, error)) => {
-            if onboarded {
-                // The repository stays registered (there is no unregister
-                // command), but it must not stay mounted over deleted files.
-                let _ = service_request(transport, mirage_ipc::Command::Unmount { repository_id });
-            }
+            // A half-created volume must not linger as a dead "Not connected"
+            // drive (it would also stop the first-run auto-create from running
+            // again): unregister it. Nothing of the user's is lost — the
+            // volume was empty and never published a payload. Drive objects
+            // are never touched by unregister.
+            let unregistered = onboarded
+                && service_request(
+                    transport,
+                    mirage_ipc::Command::RepositoryUnregister {
+                        repository_id,
+                        force_unmount: true,
+                        discard_unpublished: true,
+                    },
+                )
+                .is_ok();
             // Only this run's directory — never anything else under volumes/.
             let _ = std::fs::remove_dir_all(&root);
             let remote_note = if published {
@@ -445,8 +455,8 @@ fn create_in(
             } else {
                 ""
             };
-            let registered_note = if onboarded {
-                " The repository is still registered with the service; its native/import files were removed."
+            let registered_note = if onboarded && !unregistered {
+                " The repository is still registered with the service; remove it from the drive card."
             } else {
                 ""
             };
