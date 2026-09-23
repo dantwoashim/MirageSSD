@@ -101,6 +101,7 @@ enum Command {
         i64,
         Reply<()>,
     ),
+    NamespaceSetTimes(RepositoryId, InodeId, Option<i64>, Option<i64>, Reply<()>),
     NamespaceRecordLegacy(RepositoryId, String, InodeId, Reply<()>),
     NamespaceSeed(RepositoryId, Vec<NamespaceSeedNode>, i64, Reply<usize>),
     NamespaceSeedManaged(
@@ -415,6 +416,24 @@ impl DbWriter {
                                     parent,
                                     &name,
                                     now_ns,
+                                ),
+                            );
+                        }
+                        Command::NamespaceSetTimes(
+                            volume_id,
+                            inode,
+                            created_ns,
+                            modified_ns,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                namespace::set_times(
+                                    &connection,
+                                    volume_id,
+                                    inode,
+                                    created_ns,
+                                    modified_ns,
                                 ),
                             );
                         }
@@ -1075,6 +1094,19 @@ impl DbWriter {
                 now_ns,
                 reply,
             )
+        })
+    }
+
+    /// Sets explicit created/modified timestamps; `None` keeps the column.
+    pub fn namespace_set_times(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        created_ns: Option<i64>,
+        modified_ns: Option<i64>,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::NamespaceSetTimes(volume_id, inode, created_ns, modified_ns, reply)
         })
     }
 

@@ -143,6 +143,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0026_namespace_pins.sql",
         sql: include_str!("../../../migrations/0026_namespace_pins.sql"),
     },
+    Migration {
+        version: 27,
+        name: "0027_byte_extents_payload_index.sql",
+        sql: include_str!("../../../migrations/0027_byte_extents_payload_index.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

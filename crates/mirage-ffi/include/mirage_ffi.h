@@ -51,8 +51,9 @@ MirageStatus mirage_engine_mark_mounted(const MirageEngineHandle *engine);
 MirageStatus mirage_engine_quiesce(const MirageEngineHandle *engine,uint32_t timeout_ms);
 MirageStatus mirage_lookup(const MirageEngineHandle *engine,const uint16_t *path,size_t path_len,MirageFileHandle **output);
 MirageStatus mirage_file_close(MirageFileHandle *handle);
-typedef struct MirageFileInfo { uint64_t stable_index; uint64_t size; uint8_t directory; uint8_t reserved[7]; } MirageFileInfo;
+typedef struct MirageFileInfo { uint64_t stable_index; uint64_t size; uint8_t directory; uint8_t reserved[7]; int64_t created_ns; int64_t modified_ns; } MirageFileInfo;
 MirageStatus mirage_file_stat(const MirageFileHandle *handle,MirageFileInfo *output);
+MirageStatus mirage_set_times(MirageFileHandle *handle,int64_t created_ns,int64_t modified_ns);
 MirageStatus mirage_read(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred);
 /* Same as mirage_read but records the calling process id in seal-violation records. */
 MirageStatus mirage_read_ex(const MirageFileHandle *handle,uint64_t offset,uint8_t *output,size_t output_len,size_t *transferred,uint32_t caller_pid);

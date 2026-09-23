@@ -3,6 +3,7 @@ pub mod directory_backend;
 pub mod handles;
 pub mod namespace;
 pub mod publisher;
+mod segments;
 pub mod status;
 use handles::{DecodedPageCache, Entry, ViolationLog};
 pub use handles::{MirageEngineHandle, MirageFileHandle};
@@ -12,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use mirage_cache::{ArenaShard, CacheLayout, ResidentIndex};
 use mirage_index::{FileView, MountIndex, NodeIndex, PageView, ResolvedSpan};
@@ -131,6 +132,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             state_root: None,
             managed: false,
             dirty: None,
+            segments: None,
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
@@ -220,6 +222,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             state_root: None,
             managed: false,
             dirty: None,
+            segments: None,
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
@@ -423,6 +426,7 @@ unsafe fn create_cache_impl(
             state_root: Some(state_root.clone()),
             managed: false,
             dirty: None,
+            segments: None,
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
@@ -957,6 +961,19 @@ fn create_managed_impl(
                 volume,
             ))
         });
+        let extents: Arc<std::sync::Mutex<HashMap<InodeId, mirage_engine::extent_map::ExtentMap>>> =
+            Arc::new(std::sync::Mutex::new(Default::default()));
+        let segments = dirty.as_ref().map(|dirty| {
+            segments::SegmentWriter::new(
+                db.clone(),
+                volume,
+                state_root.join("journal"),
+                Arc::clone(dirty),
+                Arc::clone(&extents),
+                Some(Arc::clone(&coordinator)),
+                publisher.clone(),
+            )
+        });
         let handle = MirageEngineHandle {
             entries: Default::default(),
             index: Some(Arc::new(index)),
@@ -987,13 +1004,14 @@ fn create_managed_impl(
             )),
             db: Some(db),
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
-            extents: Arc::new(std::sync::Mutex::new(Default::default())),
+            extents,
             state_root: Some(state_root),
             managed: true,
             dirty,
             managed_provider,
             publisher,
             remote_payloads,
+            segments,
             disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -1300,6 +1318,35 @@ fn seed_nodes_from_index(index: &MountIndex) -> Vec<mirage_db::NamespaceSeedNode
     }
     nodes
 }
+/// Test-only crash simulation: stops the sealer WITHOUT draining and leaks
+/// the engine so the owner record stays live — the next mount adopts it as
+/// Recovering. Any unsealed segment payload must be swept at the next mount.
+///
+/// # Safety
+/// `handle` must be null or a live engine handle.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_abandon_for_tests(
+    handle: *mut MirageEngineHandle,
+) -> MirageStatus {
+    contained(|| {
+        if handle.is_null() {
+            return MirageStatus::Ok;
+        }
+        let mut engine = unsafe { Box::from_raw(handle) };
+        if let Some(segments) = engine.segments.take() {
+            segments.abandon();
+        }
+        if let Some(coordinator) = &engine.coordinator {
+            coordinator.force_release_owner_lock_for_tests();
+        }
+        // Crash simulation: leak the engine so the owner record stays in its
+        // live state — the next mount must adopt it as Recovering.
+        std::mem::forget(engine);
+        MirageStatus::Ok
+    })
+}
+
 /// # Safety
 /// `handle` must be null or a pointer returned by an engine constructor and not
 /// previously destroyed.
@@ -1308,6 +1355,10 @@ pub unsafe extern "C" fn mirage_engine_destroy(handle: *mut MirageEngineHandle) 
     contained(|| {
         if !handle.is_null() {
             let engine = unsafe { Box::from_raw(handle) };
+            if let Some(segments) = &engine.segments {
+                segments.drain_all();
+                segments.stop();
+            }
             if let Some(publisher) = &engine.publisher {
                 publisher.stop();
                 let stats = engine_publication_stats(engine.as_ref());
@@ -1579,6 +1630,10 @@ pub unsafe extern "C" fn mirage_engine_quiesce(
             return MirageStatus::InvalidArgument;
         }
         let engine_ref = unsafe { &*engine };
+        if let Some(segments) = &engine_ref.segments {
+            segments.drain_all();
+            segments.stop();
+        }
         if let Some(publisher) = &engine_ref.publisher {
             publisher.drain();
         }
@@ -1738,6 +1793,14 @@ pub unsafe extern "C" fn mirage_lookup(
                     directory: false,
                 }
             };
+            let namespace_times = namespace_inode
+                .and_then(|inode| {
+                    engine
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.namespace_stat(volume, inode).ok().flatten())
+                })
+                .map(|stat| (stat.created_ns, stat.modified_ns));
             unsafe {
                 ptr::write(
                     output,
@@ -1785,6 +1848,12 @@ pub unsafe extern "C" fn mirage_lookup(
                         share_access: mirage_engine::handles::ShareAccess::ALL,
                         managed: engine.managed,
                         dirty: engine.dirty.clone(),
+                        segments: engine.segments.clone(),
+                        created_ns: namespace_times.map(|(created, _)| created).unwrap_or(0),
+                        modified_ns: AtomicI64::new(
+                            namespace_times.map(|(_, modified)| modified).unwrap_or(0),
+                        ),
+                        explicit_mtime: AtomicBool::new(false),
                     })),
                 )
             };
@@ -1840,6 +1909,10 @@ pub unsafe extern "C" fn mirage_lookup(
                     share_access: mirage_engine::handles::ShareAccess::ALL,
                     managed: engine.managed,
                     dirty: engine.dirty.clone(),
+                    segments: engine.segments.clone(),
+                    created_ns: 0,
+                    modified_ns: AtomicI64::new(0),
+                    explicit_mtime: AtomicBool::new(false),
                 })),
             )
         };
@@ -2566,6 +2639,10 @@ pub struct MirageFileInfo {
     pub size: u64,
     pub directory: u8,
     pub reserved: [u8; 7],
+    /// Unix-ns creation time; 0 = unknown.
+    pub created_ns: i64,
+    /// Unix-ns last-modified time; 0 = unknown.
+    pub modified_ns: i64,
 }
 /// # Safety
 /// `handle` and `output` must be live readable/writable pointers.
@@ -2580,20 +2657,44 @@ pub unsafe extern "C" fn mirage_file_stat(
         }
         let handle = unsafe { &*handle };
         let entry = &handle.entry;
-        // Report the mutable logical EOF when the inode carries extent
-        // history — the committed index size is the base, not the file.
+        // Report the live logical EOF: the in-memory extent map is cheapest
+        // (it already reflects unsealed writes), then the durable extent
+        // head, then the committed index size.
         let size = match handle.inode.and_then(|inode| {
+            let maps = handle.extents.lock().ok()?;
+            if let Some(map) = maps.get(&inode) {
+                return Some(map.file_size());
+            }
+            drop(maps);
             handle.db.as_ref().and_then(|db| {
                 let volume = handle
                     .index
                     .as_ref()
                     .map(|index| index.header().repository_id)?;
-                db.extent_head(volume, inode).ok().flatten()
+                db.extent_head(volume, inode)
+                    .ok()
+                    .flatten()
+                    .map(|(_, eof)| eof)
             })
         }) {
-            Some((_, eof)) => eof,
+            Some(size) => size,
             None => entry.size,
         };
+        let (created_ns, modified_ns) = handle
+            .inode
+            .and_then(|inode| handle.segments.as_ref().and_then(|s| s.times(inode)))
+            .map(|(created, modified)| {
+                let created = if created == 0 {
+                    handle.created_ns
+                } else {
+                    created
+                };
+                (created, modified)
+            })
+            .unwrap_or((
+                handle.created_ns,
+                handle.modified_ns.load(Ordering::Acquire),
+            ));
         unsafe {
             ptr::write(
                 output,
@@ -2602,9 +2703,64 @@ pub unsafe extern "C" fn mirage_file_stat(
                     size,
                     directory: u8::from(entry.directory),
                     reserved: [0; 7],
+                    created_ns,
+                    modified_ns,
                 },
             )
         };
+        MirageStatus::Ok
+    })
+}
+
+/// Sets explicit file times (unix ns; 0 = leave unchanged). Durable via the
+/// namespace, live in the segment writer's mtime table, and marks the
+/// inode's mtime explicit so the sealer stops overwriting it.
+///
+/// # Safety
+/// `handle` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_set_times(
+    handle: *mut MirageFileHandle,
+    created_ns: i64,
+    modified_ns: i64,
+) -> MirageStatus {
+    contained(|| {
+        if handle.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        let handle = unsafe { &*handle };
+        if created_ns == 0 && modified_ns == 0 {
+            return MirageStatus::Ok;
+        }
+        let Some(inode) = handle.inode else {
+            return MirageStatus::AccessDenied;
+        };
+        let Some(db) = &handle.db else {
+            return MirageStatus::BackendUnavailable;
+        };
+        let Some(volume) = handle
+            .index
+            .as_ref()
+            .map(|index| index.header().repository_id)
+        else {
+            return MirageStatus::IntegrityFailure;
+        };
+        let created = (created_ns != 0).then_some(created_ns);
+        let modified = (modified_ns != 0).then_some(modified_ns);
+        if db
+            .writer()
+            .namespace_set_times(volume, inode, created, modified)
+            .is_err()
+        {
+            return MirageStatus::IoError;
+        }
+        if let Some(segments) = &handle.segments {
+            segments.set_times(inode, created, modified);
+        }
+        if let Some(modified) = modified {
+            handle.modified_ns.store(modified, Ordering::Release);
+            handle.explicit_mtime.store(true, Ordering::Release);
+        }
         MirageStatus::Ok
     })
 }
@@ -2656,22 +2812,37 @@ pub unsafe extern "C" fn mirage_enumerate(
                 Ok(children) => children,
                 Err(_) => return MirageStatus::IoError,
             };
+            let live_maps = handle.extents.lock().ok();
             for child in children {
                 let name = child.display_name.encode_utf16().collect::<Vec<_>>();
                 let size = if child.kind == mirage_db::NamespaceNodeKind::File {
-                    db.extent_head(volume, child.inode)
-                        .ok()
-                        .flatten()
-                        .map(|(_, eof)| eof)
+                    live_maps
+                        .as_ref()
+                        .and_then(|maps| maps.get(&child.inode).map(|map| map.file_size()))
+                        .or_else(|| {
+                            db.extent_head(volume, child.inode)
+                                .ok()
+                                .flatten()
+                                .map(|(_, eof)| eof)
+                        })
                         .unwrap_or(child.size)
                 } else {
                     0
                 };
+                let live = handle.segments.as_ref().and_then(|s| s.times(child.inode));
                 let info = MirageFileInfo {
                     stable_index: inode_stable_index(child.inode),
                     size,
                     directory: u8::from(child.kind == mirage_db::NamespaceNodeKind::Directory),
                     reserved: [0; 7],
+                    created_ns: live
+                        .map(|(c, _)| c)
+                        .filter(|c| *c != 0)
+                        .unwrap_or(child.created_ns),
+                    modified_ns: live
+                        .map(|(_, m)| m)
+                        .filter(|m| *m != 0)
+                        .unwrap_or(child.modified_ns),
                 };
                 if unsafe { callback(context, name.as_ptr(), name.len(), info) } == 0 {
                     break;
@@ -2699,6 +2870,8 @@ pub unsafe extern "C" fn mirage_enumerate(
                     size: 0,
                     directory: 1,
                     reserved: [0; 7],
+                    created_ns: 0,
+                    modified_ns: 0,
                 }
             } else {
                 let file = match index.file_by_index(child.index()) {
@@ -2710,6 +2883,8 @@ pub unsafe extern "C" fn mirage_enumerate(
                     size: file.logical_size(),
                     directory: 0,
                     reserved: [0; 7],
+                    created_ns: 0,
+                    modified_ns: 0,
                 }
             };
             if unsafe { callback(context, name.as_ptr(), name.len(), info) } == 0 {
@@ -2728,6 +2903,16 @@ pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> Mir
             return MirageStatus::Ok;
         }
         let file = unsafe { Box::from_raw(handle) };
+        // Close is a durability boundary: a write-capable handle seals its
+        // pending segment before share accounting releases the inode.
+        if let (Some(inode), Some(segments)) = (file.inode, &file.segments) {
+            if file.desired_access.write && segments.drain_inode(inode).is_err() {
+                eprintln!("close-time seal failed for inode {inode:?}");
+            }
+            if file.explicit_mtime.load(Ordering::Acquire) {
+                segments.clear_explicit(inode);
+            }
+        }
         // Release share-mode accounting; the last close of a delete-pending
         // tombstone finalizes the durable delete.
         if let Some(publisher) = &file.publisher {
@@ -2738,6 +2923,9 @@ pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> Mir
                 .handles
                 .close(inode, file.desired_access, file.share_access)
         {
+            if let Some(segments) = &file.segments {
+                segments.discard_inode(inode);
+            }
             let volume = index.header().repository_id;
             // Finalize by inode identity: the open-time path may be stale
             // after a rename, and a delete-without-read never populated it.
@@ -3076,6 +3264,9 @@ pub unsafe extern "C" fn mirage_namespace_delete(
             Ok(None) => return MirageStatus::NotFound,
             Err(_) => return MirageStatus::IoError,
         };
+        if let Some(segments) = &engine.segments {
+            segments.discard_inode(inode);
+        }
         // Delete-pending semantics: the name unlinks now (the open-handle
         // tombstone keeps identity for existing readers), and the last close
         // finalizes — re-issuing the delete is then a harmless no-op.
@@ -3197,6 +3388,37 @@ fn commit_extent_mutation(
         .as_ref()
         .map(|index| index.header().repository_id)
         .ok_or(MirageStatus::IntegrityFailure)?;
+    commit_extent_mutation_parts(
+        db,
+        volume,
+        inode,
+        map,
+        kind,
+        payload_id,
+        payload_path,
+        payload_bytes,
+        payload_checksum,
+        physical,
+        now_ns,
+    )
+}
+
+/// The transaction body of `commit_extent_mutation` without a file handle —
+/// the segment sealer commits closed payloads from its own thread.
+#[allow(clippy::too_many_arguments)]
+fn commit_extent_mutation_parts(
+    db: &mirage_db::Database,
+    volume: RepositoryId,
+    inode: InodeId,
+    map: &mirage_engine::extent_map::ExtentMap,
+    kind: mirage_db::OperationKind,
+    payload_id: [u8; 16],
+    payload_path: String,
+    payload_bytes: u64,
+    payload_checksum: Option<[u8; 32]>,
+    physical: Option<mirage_db::PhysicalCommit>,
+    now_ns: i64,
+) -> Result<(), MirageStatus> {
     let extents = map.to_extents(volume, inode, map.version(), now_ns, || {
         let mut id = [0u8; 16];
         let _ = getrandom::fill(&mut id);
@@ -3287,7 +3509,6 @@ pub unsafe extern "C" fn mirage_write(
         else {
             return MirageStatus::IntegrityFailure;
         };
-        let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
         let journal_dir = state_root.join("journal");
         if std::fs::create_dir_all(&journal_dir).is_err() {
             return MirageStatus::IoError;
@@ -3299,8 +3520,8 @@ pub unsafe extern "C" fn mirage_write(
             Ok(maps) => maps,
             Err(status) => return status,
         };
-        // The dirty mutex serializes budget check + reservation + staging +
-        // ledger commit across writers; the maps lock it is taken under
+        // Lock order is extents → dirty.mutex → open → state; the dirty mutex
+        // serializes the budget check while the maps guard (held first)
         // serializes extent mutations for the whole engine.
         let mut _dirty_guard = match dirty.mutex.lock() {
             Ok(guard) => guard,
@@ -3344,9 +3565,14 @@ pub unsafe extern "C" fn mirage_write(
                 return MirageStatus::DiskFull;
             }
             drop(_dirty_guard);
+            drop(maps);
             publisher.notify();
             std::thread::sleep(WRITE_BACKPRESSURE_STEP);
             waited += WRITE_BACKPRESSURE_STEP;
+            maps = match extent_map_for(handle, inode) {
+                Ok(maps) => maps,
+                Err(status) => return status,
+            };
             _dirty_guard = match dirty.mutex.lock() {
                 Ok(guard) => guard,
                 Err(_) => return MirageStatus::Internal,
@@ -3381,101 +3607,20 @@ pub unsafe extern "C" fn mirage_write(
                 }
             }
         }
-        let mut payload_id = [0_u8; 16];
-        if getrandom::fill(&mut payload_id).is_err() {
+        // Write-behind: the chunk joins the inode's open segment (or rolls it
+        // and starts a new one); the sealer thread performs the durable
+        // commit. `dirty.used` grows now so the budget counts unsealed bytes —
+        // they are never evictable because they have no rows yet.
+        let Some(segments) = &handle.segments else {
             return MirageStatus::Internal;
-        }
-        let slot_index = dirty.next_slot.fetch_add(1, Ordering::AcqRel);
-        let mut owner_epoch = [0_u8; 16];
-        owner_epoch[..8].copy_from_slice(
-            &handle
-                .coordinator
-                .as_ref()
-                .map(|coordinator| coordinator.epoch())
-                .unwrap_or(0)
-                .to_le_bytes(),
-        );
-        let release_reservation = |db: &mirage_db::Database| {
-            let _ = db.writer().physical_release_extent(payload_id, now);
         };
-        if db
-            .writer()
-            .physical_reserve_extent(
-                mirage_db::PhysicalExtentRecord {
-                    extent_id: payload_id,
-                    file_id: dirty.file_id,
-                    slot_index,
-                    length_bytes: i64::try_from(length).unwrap_or(i64::MAX),
-                    state: mirage_db::PhysicalExtentState::Reserved,
-                    page_hash: None,
-                    checksum: None,
-                    pin_count: 0,
-                    generation: 0,
-                    updated_ns: now,
-                },
-                mirage_db::PhysicalReservationRecord {
-                    extent_id: payload_id,
-                    owner_epoch,
-                    expires_ns: now.saturating_add(60_000_000_000),
-                },
-            )
-            .is_err()
-        {
-            return MirageStatus::IoError;
-        }
-        let staged = match journal.stage_payload_as(&journal_dir, data, payload_id) {
-            Ok(staged) => staged,
-            Err(_) => {
-                release_reservation(db);
-                return MirageStatus::IoError;
-            }
-        };
-        // Mutate a scratch copy: the live map only publishes after the
-        // durable commit lands, so a failed write can never poison reads.
-        let mut next_map = maps.get(&inode).expect("map just inserted").clone();
-        if next_map
-            .write(offset, staged.bytes, staged.payload_id)
-            .is_err()
-        {
-            release_reservation(db);
-            let _ = std::fs::remove_file(journal_dir.join(&staged.path));
-            return MirageStatus::InvalidArgument;
-        }
-        // The payload's content hash doubles as its ledger page hash — the
-        // physical commit lands inside the same transaction as the extent
-        // mutation, so the ledger and the journal always agree.
-        if commit_extent_mutation(
-            handle,
-            inode,
-            &next_map,
-            mirage_db::OperationKind::Write,
-            staged.payload_id,
-            staged.path.clone(),
-            staged.bytes,
-            Some(staged.checksum),
-            Some(mirage_db::PhysicalCommit {
-                extent_id: payload_id,
-                page_hash: mirage_types::PageHash::from_bytes(staged.checksum),
-                checksum: staged.checksum,
-            }),
-            now,
-        )
-        .is_err()
-        {
-            release_reservation(db);
-            // The staged .payload was never committed — remove it so a failed
-            // write cannot leak journal bytes.
-            let _ = std::fs::remove_file(journal_dir.join(&staged.path));
-            return MirageStatus::IoError;
+        match segments.append(inode, offset, data, now, &mut maps) {
+            Ok(()) => {}
+            Err(status) => return status,
         }
         dirty.used.fetch_add(length, Ordering::AcqRel);
-        maps.insert(inode, next_map);
         drop(maps);
         unsafe { *transferred = bytes_len };
-        // A committed payload is publishable: wake the publisher.
-        if let Some(publisher) = &handle.publisher {
-            publisher.notify();
-        }
         MirageStatus::Ok
     })
 }
@@ -3498,6 +3643,13 @@ pub unsafe extern "C" fn mirage_truncate(
         let Some(inode) = handle.inode else {
             return MirageStatus::AccessDenied;
         };
+        // A truncate must commit over only sealed payloads — seal the inode's
+        // open segment before mutating the map.
+        if let Some(segments) = &handle.segments
+            && segments.drain_inode(inode).is_err()
+        {
+            return MirageStatus::IoError;
+        }
         let now = now_ns_i64();
         let mut maps = match extent_map_for(handle, inode) {
             Ok(maps) => maps,
@@ -3542,6 +3694,13 @@ pub unsafe extern "C" fn mirage_flush(handle: *mut MirageFileHandle) -> MirageSt
             return MirageStatus::InvalidArgument;
         }
         let handle = unsafe { &*handle };
+        // Seal any unsealed writes first: a successful flush must leave the
+        // file's bytes durable.
+        if let (Some(inode), Some(segments)) = (handle.inode, &handle.segments)
+            && segments.drain_inode(inode).is_err()
+        {
+            return MirageStatus::IoError;
+        }
         let Some(db) = &handle.db else {
             return MirageStatus::Ok; // nothing durable to fence
         };

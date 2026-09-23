@@ -193,6 +193,21 @@ impl ExtentMap {
         length: u64,
         payload_id: [u8; 16],
     ) -> Result<(), MirageError> {
+        self.write_at(start, length, payload_id, 0)
+    }
+
+    /// Like `write`, but the interval points at `payload_offset` inside the
+    /// payload — used when several logical ranges share one staged payload.
+    /// Contiguous writes into the same payload coalesce with the existing
+    /// interval, so a sequential copy stays a single extent instead of one
+    /// row per write chunk.
+    pub fn write_at(
+        &mut self,
+        start: u64,
+        length: u64,
+        payload_id: [u8; 16],
+        payload_offset: u64,
+    ) -> Result<(), MirageError> {
         if length == 0 {
             return Ok(());
         }
@@ -207,13 +222,48 @@ impl ExtentMap {
                 length,
                 source: ExtentSource::Dirty {
                     payload_id,
-                    payload_offset: 0,
+                    payload_offset,
                 },
             },
         );
+        self.coalesce();
         self.file_size = self.file_size.max(end);
         self.version += 1;
         Ok(())
+    }
+
+    /// Merges every adjacent pair of dirty intervals that describe one
+    /// contiguous run inside the same payload (logical contiguity AND
+    /// payload-offset contiguity). Runs until no pair merges.
+    fn coalesce(&mut self) {
+        loop {
+            let mut merged = false;
+            for idx in 0..self.intervals.len().saturating_sub(1) {
+                let (left, right) = (self.intervals[idx].clone(), self.intervals[idx + 1].clone());
+                if let (
+                    ExtentSource::Dirty {
+                        payload_id: left_id,
+                        payload_offset: left_off,
+                    },
+                    ExtentSource::Dirty {
+                        payload_id: right_id,
+                        payload_offset: right_off,
+                    },
+                ) = (left.source, right.source)
+                    && left_id == right_id
+                    && left.start + left.length == right.start
+                    && left_off + left.length == right_off
+                {
+                    self.intervals[idx].length += right.length;
+                    self.intervals.remove(idx + 1);
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                break;
+            }
+        }
     }
 
     /// Truncates at `length`: extents beyond the end are dropped, the last
@@ -555,5 +605,94 @@ mod tests {
             ExtentSlice::Base { base_offset, .. } => assert_eq!(*base_offset, 10),
             other => panic!("expected base slice, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+    use mirage_types::{InodeId, RepositoryId};
+
+    fn page() -> PageHash {
+        PageHash::from_bytes([3; 32])
+    }
+
+    #[test]
+    fn contiguous_same_payload_writes_collapse_to_one_interval() {
+        let mut map = ExtentMap::default();
+        map.seed_base(100, page());
+        let payload = [9; 16];
+        map.write_at(0, 64, payload, 0).unwrap();
+        map.write_at(64, 64, payload, 64).unwrap();
+        map.write_at(128, 32, payload, 128).unwrap();
+        let dirty: Vec<_> = map
+            .read(0, 160)
+            .unwrap()
+            .into_iter()
+            .filter(|s| matches!(s, ExtentSlice::Dirty { .. }))
+            .collect();
+        assert_eq!(dirty.len(), 1);
+        match dirty[0] {
+            ExtentSlice::Dirty {
+                start,
+                length,
+                payload_offset,
+                ..
+            } => {
+                assert_eq!((start, length, payload_offset), (0, 160, 0));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn different_payload_or_offset_gap_stays_split() {
+        let mut map = ExtentMap::default();
+        map.seed_base(100, page());
+        map.write_at(0, 32, [1; 16], 0).unwrap();
+        map.write_at(32, 32, [2; 16], 0).unwrap();
+        map.write_at(64, 32, [1; 16], 96).unwrap(); // same payload, wrong offset
+        let dirty: Vec<_> = map
+            .read(0, 96)
+            .unwrap()
+            .into_iter()
+            .filter(|s| matches!(s, ExtentSlice::Dirty { .. }))
+            .collect();
+        assert_eq!(dirty.len(), 3);
+    }
+
+    #[test]
+    fn coalesced_map_reads_and_serializes_identically() {
+        let mut merged = ExtentMap::default();
+        merged.seed_base(200, page());
+        merged.write_at(10, 20, [7; 16], 0).unwrap();
+        merged.write_at(30, 20, [7; 16], 20).unwrap();
+        let mut unmerged = ExtentMap::default();
+        unmerged.seed_base(200, page());
+        unmerged.write_at(10, 40, [7; 16], 0).unwrap();
+        assert_eq!(merged.read(0, 200).unwrap(), unmerged.read(0, 200).unwrap());
+        let mut next_id = || [9; 16];
+        let a = merged.to_extents(
+            RepositoryId::from_bytes([1; 16]),
+            InodeId::from_bytes([9; 16]),
+            1,
+            0,
+            &mut next_id,
+        );
+        let b = unmerged.to_extents(
+            RepositoryId::from_bytes([1; 16]),
+            InodeId::from_bytes([9; 16]),
+            1,
+            0,
+            &mut next_id,
+        );
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(
+                (x.start, x.length, x.payload_id, x.payload_offset),
+                (y.start, y.length, y.payload_id, y.payload_offset)
+            );
+        }
+        assert_eq!(merged.file_size(), unmerged.file_size());
     }
 }

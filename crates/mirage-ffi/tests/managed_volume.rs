@@ -215,13 +215,15 @@ fn dirty_budget_bounds_writes_and_survives_restart() {
     // An orphan payload file (no ledger extent, no extent reference) must be
     // swept at engine creation while referenced payloads survive.
     let journal_dir = state_root.path().join("journal");
-    assert_eq!(payload_files(&journal_dir).len(), 2);
+    // Two contiguous 4 KiB writes coalesce into one sealed segment payload.
+    assert_eq!(payload_files(&journal_dir).len(), 1);
     let orphan = journal_dir.join(format!("{}.payload", "00".repeat(16)));
     std::fs::write(&orphan, b"orphan").expect("plant orphan");
 
     let engine = managed_engine(&index, state_root.path(), 8192);
     assert!(!orphan.exists(), "orphan payload was not swept");
-    assert_eq!(payload_files(&journal_dir).len(), 2);
+    // Two contiguous 4 KiB writes coalesce into one sealed segment payload.
+    assert_eq!(payload_files(&journal_dir).len(), 1);
     // The ledger replay still enforces the budget.
     assert_eq!(
         unsafe { mirage_engine_mark_mounted(engine) },

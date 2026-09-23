@@ -335,3 +335,39 @@ fn pin_held_covers_descendants_and_unpin_releases() {
     // Unpinning something never pinned reports false, not an error.
     assert!(!db.namespace_unpin(volume, other.inode).unwrap());
 }
+
+#[test]
+fn set_times_updates_selected_columns() {
+    let (dir, db) = open();
+    let volume = vol(3);
+    let root = db.namespace_create_volume(volume, 1).expect("volume");
+    let entry = db
+        .namespace_create(volume, root, "Timed.bin", NamespaceNodeKind::File, 2)
+        .expect("create");
+    db.namespace_set_times(volume, entry.inode, Some(111), Some(222))
+        .expect("set times");
+    let stat = db
+        .namespace_stat(volume, entry.inode)
+        .expect("stat")
+        .expect("inode");
+    assert_eq!((stat.created_ns, stat.modified_ns), (111, 222));
+    // None leaves the column alone.
+    db.namespace_set_times(volume, entry.inode, None, Some(333))
+        .expect("mtime only");
+    let stat = db
+        .namespace_stat(volume, entry.inode)
+        .expect("stat")
+        .expect("inode");
+    assert_eq!((stat.created_ns, stat.modified_ns), (111, 333));
+    // Missing inode is an error, not a silent no-op.
+    assert!(
+        db.namespace_set_times(
+            volume,
+            mirage_types::InodeId::from_bytes([7; 16]),
+            None,
+            Some(1)
+        )
+        .is_err()
+    );
+    drop(dir);
+}

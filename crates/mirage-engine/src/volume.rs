@@ -382,6 +382,13 @@ impl VolumeCoordinator {
         }
         Ok(())
     }
+
+    /// Test-only: releases the OS lock without dropping the coordinator, so
+    /// an abandoned-engine test can remount the volume in the same process.
+    #[doc(hidden)]
+    pub fn force_release_owner_lock_for_tests(&self) {
+        let _ = self.lock.0.unlock();
+    }
 }
 
 impl Drop for VolumeCoordinator {

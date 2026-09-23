@@ -53,6 +53,8 @@ pub struct DirEntry {
     pub folded_name: String,
     pub kind: NamespaceNodeKind,
     pub size: u64,
+    pub created_ns: i64,
+    pub modified_ns: i64,
 }
 
 fn decode_inode(bytes: &[u8]) -> Result<InodeId, MirageError> {
@@ -122,7 +124,8 @@ pub fn lookup(
     let folded = fold_name(name)?;
     connection
         .query_row(
-            "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size
+            "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size,
+                    i.created_ns, i.modified_ns
              FROM dirents d JOIN inodes i
                ON i.volume_id = d.volume_id AND i.inode = d.child_inode
              WHERE d.volume_id = ?1 AND d.parent_inode = ?2 AND d.folded_name = ?3",
@@ -137,21 +140,28 @@ pub fn lookup(
                 let folded: String = row.get(2)?;
                 let kind: String = row.get(3)?;
                 let size: i64 = row.get(4)?;
-                Ok((inode, display, folded, kind, size))
+                let created_ns: i64 = row.get(5)?;
+                let modified_ns: i64 = row.get(6)?;
+                Ok((inode, display, folded, kind, size, created_ns, modified_ns))
             },
         )
         .optional()
         .map_err(|e| sqlite(e, "namespace lookup failed"))?
-        .map(|(inode, display_name, folded_name, kind, size)| {
-            Ok(DirEntry {
-                inode: decode_inode(&inode)?,
-                display_name,
-                folded_name,
-                kind: NamespaceNodeKind::parse(&kind)?,
-                size: u64::try_from(size)
-                    .map_err(|_| MirageError::integrity_mismatch("namespace size is negative"))?,
-            })
-        })
+        .map(
+            |(inode, display_name, folded_name, kind, size, created_ns, modified_ns)| {
+                Ok(DirEntry {
+                    inode: decode_inode(&inode)?,
+                    display_name,
+                    folded_name,
+                    kind: NamespaceNodeKind::parse(&kind)?,
+                    size: u64::try_from(size).map_err(|_| {
+                        MirageError::integrity_mismatch("namespace size is negative")
+                    })?,
+                    created_ns,
+                    modified_ns,
+                })
+            },
+        )
         .transpose()
 }
 
@@ -214,7 +224,8 @@ pub fn list_children(
     }
     let mut statement = connection
         .prepare(
-            "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size
+            "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size,
+                    i.created_ns, i.modified_ns
              FROM dirents d JOIN inodes i
                ON i.volume_id = d.volume_id AND i.inode = d.child_inode
              WHERE d.volume_id = ?1 AND d.parent_inode = ?2
@@ -239,13 +250,15 @@ pub fn list_children(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
         .map_err(|e| sqlite(e, "namespace listing failed"))?;
     let mut entries = Vec::new();
     for row in rows {
-        let (inode, display_name, folded_name, kind, size) =
+        let (inode, display_name, folded_name, kind, size, created_ns, modified_ns) =
             row.map_err(|e| sqlite(e, "namespace listing row failed"))?;
         entries.push(DirEntry {
             inode: decode_inode(&inode)?,
@@ -254,6 +267,8 @@ pub fn list_children(
             kind: NamespaceNodeKind::parse(&kind)?,
             size: u64::try_from(size)
                 .map_err(|_| MirageError::integrity_mismatch("namespace size is negative"))?,
+            created_ns,
+            modified_ns,
         });
     }
     Ok(entries)
@@ -404,6 +419,8 @@ pub fn create_node(
         folded_name: folded,
         kind,
         size: 0,
+        created_ns: now_ns,
+        modified_ns: now_ns,
     })
 }
 
@@ -646,6 +663,35 @@ pub fn delete_node(
     transaction
         .commit()
         .map_err(|e| sqlite(e, "namespace delete commit failed"))
+}
+
+/// Sets explicit created/modified timestamps on an inode; `None` leaves the
+/// column unchanged. Errors when the inode does not exist.
+pub fn set_times(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+    created_ns: Option<i64>,
+    modified_ns: Option<i64>,
+) -> Result<(), MirageError> {
+    let changed = connection
+        .execute(
+            "UPDATE inodes
+             SET created_ns = COALESCE(?1, created_ns),
+                 modified_ns = COALESCE(?2, modified_ns)
+             WHERE volume_id = ?3 AND inode = ?4",
+            params![
+                created_ns,
+                modified_ns,
+                volume_id.as_bytes().as_slice(),
+                inode.as_bytes().as_slice()
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace set times failed"))?;
+    if changed != 1 {
+        return Err(MirageError::invalid_argument("namespace inode is missing"));
+    }
+    Ok(())
 }
 
 /// Updates a file inode's size and content roots inside a metadata commit.
@@ -937,6 +983,18 @@ impl crate::Database {
             extent_root,
             now_ns,
         )
+    }
+
+    /// Sets explicit created/modified timestamps; `None` keeps the column.
+    pub fn namespace_set_times(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        created_ns: Option<i64>,
+        modified_ns: Option<i64>,
+    ) -> Result<(), MirageError> {
+        self.writer()
+            .namespace_set_times(volume_id, inode, created_ns, modified_ns)
     }
 
     /// The seed-time legacy (index) path recorded for an inode — the stable

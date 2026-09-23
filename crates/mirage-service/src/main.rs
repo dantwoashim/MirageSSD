@@ -71,8 +71,37 @@ mod windows_service_host {
             .parent()
             .ok_or("service executable has no parent")?
             .join("mirage-fs.exe");
+        // Migrations can take minutes on a bloated control.db — run them on a
+        // helper thread and keep reporting StartPending with fresh checkpoints
+        // so the SCM and the installer never time the service out.
+        let db_path = state_root.join("control.db");
+        let (db_tx, db_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = db_tx.send(mirage_db::Database::open(&db_path));
+        });
+        let mut checkpoint = 1u32;
+        let db = loop {
+            match db_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(db) => break db?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    checkpoint += 1;
+                    status.set_service_status(ServiceStatus {
+                        service_type: ServiceType::OWN_PROCESS,
+                        current_state: ServiceState::StartPending,
+                        controls_accepted: ServiceControlAccept::empty(),
+                        exit_code: ServiceExitCode::Win32(0),
+                        checkpoint,
+                        wait_hint: Duration::from_secs(30),
+                        process_id: None,
+                    })?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("database open thread exited without a result".into());
+                }
+            }
+        };
         let handler = Arc::new(ControlPlaneHandler::with_mount_control(
-            mirage_db::Database::open(&state_root.join("control.db"))?,
+            db,
             NativeMountControl::new(filesystem_host),
         ));
         // Mount recovery runs on the watchdog thread below: it can wait on

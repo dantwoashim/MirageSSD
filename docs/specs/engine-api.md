@@ -35,3 +35,19 @@ no remaining subscriber needs it, and dropping the owner's future cannot strand 
 fan out with their cause preserved — checksum, authorization, missing source, timeout, budget
 exhaustion, and caller cancellation stay distinct — and a completed or already-cancelled flight is
 never joined again: a new caller becomes the owner of a fresh flight.
+
+## Write-behind durability
+
+Managed writable volumes buffer writes into per-inode segments (one payload
+file per up-to-32 MiB of contiguous data) instead of committing a durable
+extent version per cache-manager chunk. A segment becomes durable when it
+seals, which happens on any of: `FlushFileBuffers`, file close on a
+write-capable handle, segment roll-over (a non-contiguous write or the
+32 MiB ceiling), or two seconds of write idle. Truncate and delete are also
+seal points — truncate drains the inode first, delete discards the unsealed
+tail.
+
+A crash loses at most the unsealed tail of an open segment: durable extent
+versions are committed from a map snapshot taken when the segment closes, so
+no durable version can ever reference an unsealed payload file. Orphan
+payload files left by a crash are swept at the next mount.

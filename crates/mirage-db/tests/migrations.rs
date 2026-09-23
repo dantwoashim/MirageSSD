@@ -42,7 +42,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations");
-    assert_eq!(migration_count, 26);
+    assert_eq!(migration_count, 27);
     drop(raw);
     drop(db);
 
@@ -54,7 +54,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations after restart");
-    assert_eq!(migration_count2, 26);
+    assert_eq!(migration_count2, 27);
     drop(raw2);
     drop(db2);
 }
@@ -128,7 +128,7 @@ fn future_unsupported_migration_version_is_rejected() {
     let raw = open_raw_connection(&db_path);
     raw.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at_ns)
-         VALUES (27, '0027_future.sql', ?1, 1000)",
+         VALUES (28, '0028_future.sql', ?1, 1000)",
         [[0xAA_u8; 32].as_slice()],
     )
     .expect("insert future migration");
@@ -159,4 +159,20 @@ fn corrupted_database_fails_startup_quick_check() {
 
     let result = Database::open(&db_path);
     assert!(result.is_err());
+}
+
+#[test]
+fn migration_0027_adds_the_payload_lookup_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(&dir.path().join("control.db")).expect("open");
+    drop(db);
+    let raw = open_raw_connection(&dir.path().join("control.db"));
+    let index: Option<String> = raw
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'byte_extents_payload'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(index.as_deref(), Some("byte_extents_payload"));
 }

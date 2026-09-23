@@ -274,6 +274,8 @@ pub struct MirageEngineHandle {
     /// Pinned inodes (files, and directories whose descendants inherit
     /// protection); refreshed at create and on `PINS-RELOAD`.
     pub pins: Arc<std::sync::RwLock<std::collections::HashSet<mirage_types::InodeId>>>,
+    /// Write-behind segment writer (managed engines only).
+    pub segments: Option<Arc<crate::segments::SegmentWriter>>,
 }
 
 /// A page provider waiting for its first credential: the coordinator's
@@ -442,6 +444,13 @@ pub struct MirageFileHandle {
     pub prefetch_state: Arc<PrefetchState>,
     /// Pinned inodes shared with the engine (eviction exclusion).
     pub pins: Arc<std::sync::RwLock<std::collections::HashSet<mirage_types::InodeId>>>,
+    /// Write-behind segment writer shared with the engine (managed only).
+    pub segments: Option<Arc<crate::segments::SegmentWriter>>,
+    /// Namespace timestamps loaded at open (0 = unknown / legacy engine).
+    pub created_ns: i64,
+    pub modified_ns: AtomicI64,
+    /// Set when `mirage_set_times` pinned an explicit mtime on this handle.
+    pub explicit_mtime: AtomicBool,
 }
 
 /// Per-open sequential-read tracking for managed readahead.
@@ -501,6 +510,7 @@ impl MirageEngineHandle {
                 0,
             ))),
             pins: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            segments: None,
         }
     }
     /// Owner-side origin decodes performed by this engine.

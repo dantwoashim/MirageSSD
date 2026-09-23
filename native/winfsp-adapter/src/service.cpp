@@ -19,6 +19,22 @@ bool create_mount_security(const std::wstring& owner_sid, PSECURITY_DESCRIPTOR* 
     sddl += sid; sddl += L")"; LocalFree(sid); LocalFree(parsed_sid);
     return ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, descriptor, size) != FALSE;
 }
+static UINT64 process_start_filetime() {
+    // Fallback stamp for files whose namespace timestamps are absent.
+    static const UINT64 value = [] {
+        FILETIME created{}, dummy1{}, dummy2{}, dummy3{};
+        if (GetProcessTimes(GetCurrentProcess(), &created, &dummy1, &dummy2, &dummy3)) {
+            return (UINT64(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        }
+        FILETIME now{}; GetSystemTimeAsFileTime(&now);
+        return (UINT64(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    }();
+    return value;
+}
+static UINT64 ns_to_filetime(int64_t ns) {
+    if (ns <= 0) return process_start_filetime();
+    return UINT64(ns / 100) + 116444736000000000ULL;
+}
 void fill_info(const MirageFileInfo& source, FSP_FSCTL_FILE_INFO* output, bool writable) {
     std::memset(output, 0, sizeof(*output));
     // A managed writable volume must not advertise read-only files; legacy
@@ -26,6 +42,10 @@ void fill_info(const MirageFileInfo& source, FSP_FSCTL_FILE_INFO* output, bool w
     output->FileAttributes = source.directory ? FILE_ATTRIBUTE_DIRECTORY
         : (writable ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_READONLY);
     output->AllocationSize = (source.size + 4095) & ~UINT64_C(4095); output->FileSize = source.size; output->IndexNumber = source.stable_index;
+    output->CreationTime = ns_to_filetime(source.created_ns);
+    output->LastWriteTime = ns_to_filetime(source.modified_ns);
+    output->ChangeTime = output->LastWriteTime;
+    output->LastAccessTime = output->LastWriteTime;
 }
 NTSTATUS lookup(FSP_FILE_SYSTEM* fs, PCWSTR name, MirageFileHandle** output, MirageFileInfo* info) {
     const auto status = mirage_lookup(host(fs)->engine(), reinterpret_cast<const uint16_t*>(name), std::wcslen(name), output);
@@ -110,12 +130,19 @@ NTSTATUS read_file(FSP_FILE_SYSTEM* fs, PVOID context, PVOID buffer, UINT64 offs
     }
     size_t read{};const auto status=mirage_read_ex(opened->rust_handle,offset,static_cast<uint8_t*>(buffer),length,&read,pid);*transferred=static_cast<ULONG>(read);return mirage_status_to_ntstatus(status);
 }
-NTSTATUS set_basic_info(FSP_FILE_SYSTEM* fs,PVOID context,UINT32,UINT64,UINT64,UINT64,UINT64,FSP_FSCTL_FILE_INFO* info){
+NTSTATUS set_basic_info(FSP_FILE_SYSTEM* fs,PVOID context,UINT32,UINT64 creation_time,UINT64,UINT64 last_write_time,UINT64,FSP_FSCTL_FILE_INFO* info){
     auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
     if(!host(fs)->writable()) return STATUS_MEDIA_WRITE_PROTECTED;
-    // Timestamps and attribute bits are not yet persisted in the namespace;
-    // accepting the call keeps ordinary tooling (attrib clears, -Force
-    // deletes, save dialogs) working. Content semantics are unaffected.
+    // Persist the caller's creation/modification stamps in the namespace;
+    // attribute bits are accepted but not stored (content semantics are
+    // unaffected) and access/change times track the write stamp.
+    auto ft_to_ns = [](UINT64 ft) -> int64_t {
+        if (ft <= 116444736000000000ULL) return 0;
+        return int64_t((ft - 116444736000000000ULL) * 100);
+    };
+    int64_t created_ns = ft_to_ns(creation_time);
+    int64_t modified_ns = ft_to_ns(last_write_time);
+    if (created_ns || modified_ns) mirage_set_times(opened->rust_handle, created_ns, modified_ns);
     MirageFileInfo refreshed{}; if(mirage_file_stat(opened->rust_handle,&refreshed)==MIRAGE_OK) opened->info=refreshed;
     fill_info(opened->info,info,host(fs)->writable());
     return STATUS_SUCCESS;
