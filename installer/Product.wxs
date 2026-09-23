@@ -1,6 +1,6 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="MirageSSD" Manufacturer="MirageSSD" Version="$(var.ProductVersion)" ProductCode="$(var.ProductCode)" UpgradeCode="D9208A1A-218D-4C80-AB41-704DFF8B3485" Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer MirageSSD version is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer MirageSSD version is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <PropertyRef Id="WINDOWS_BUILD" />
     <PropertyRef Id="WINFSP_INSTALLED" />
