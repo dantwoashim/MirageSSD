@@ -492,3 +492,51 @@ fn custom_journal_root_holds_the_payloads_and_survives_remount() {
     );
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
+
+/// Raw FFI read throughput (no WinFsp): 256 MiB written, then read back in
+/// 64 KiB requests like the cache manager issues. Prints MB/s; run with
+/// --ignored --nocapture.
+#[test]
+#[ignore]
+fn ffi_read_throughput_probe() {
+    let (_objects, index) = build_index();
+    let state = tempfile::tempdir().expect("state");
+    let engine = managed_engine(&index, state.path(), 1 << 30);
+    let total: usize = 256 << 20;
+    let chunk: usize = 1 << 20;
+    let data: Vec<u8> = (0..chunk as u32).map(|i| (i % 253) as u8).collect();
+    let file = create_and_open(engine, "\\probe.bin");
+    let started = std::time::Instant::now();
+    for offset in (0..total).step_by(chunk) {
+        assert_eq!(write(file, offset as u64, &data), MirageStatus::Ok);
+    }
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    let write_secs = started.elapsed().as_secs_f64();
+    let read_chunk: usize = 64 << 10;
+    let mut buffer = vec![0u8; read_chunk];
+    let started = std::time::Instant::now();
+    for offset in (0..total).step_by(read_chunk) {
+        let mut transferred = 0usize;
+        assert_eq!(
+            unsafe {
+                mirage_read(
+                    file,
+                    offset as u64,
+                    buffer.as_mut_ptr(),
+                    read_chunk,
+                    &mut transferred,
+                )
+            },
+            MirageStatus::Ok
+        );
+        assert_eq!(transferred, read_chunk);
+    }
+    let read_secs = started.elapsed().as_secs_f64();
+    eprintln!(
+        "FFI write {:.0} MB/s, read (64 KiB requests) {:.0} MB/s",
+        (total as f64 / (1 << 20) as f64) / write_secs,
+        (total as f64 / (1 << 20) as f64) / read_secs
+    );
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}

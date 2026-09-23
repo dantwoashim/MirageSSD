@@ -215,10 +215,14 @@ auto ffi=writable?mirage_engine_create_managed_drive_at(reinterpret_cast<const u
     // node semantics would let a second open see a stale/freed context.
     params.UmFileContextIsUserContext2=1;
     // INFINITE FileInfoTimeout enables kernel data caching and read-ahead in
-    // WinFsp — safe only while a mounted generation is immutable. A writable
-    // managed volume must keep a finite timeout so mutations propagate to
-    // other readers.
-    params.Version=sizeof(params);params.FileInfoTimeout=writable?1000:INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
+    // WinFsp; with a finite timeout every 64 KiB read is a user-mode round
+    // trip (~0.3 ms) and small-buffer readers crawl at tens of MB/s. It is
+    // safe here because every mutation of a managed volume goes through this
+    // FSD (Write/SetFileSize/SetBasicInfo responses carry fresh FileInfo and
+    // the kernel FileNode keeps concurrent handles coherent); nothing changes
+    // file content behind WinFsp's back. Directory and volume info stay on a
+    // 1 s timeout so listings and free space refresh.
+    params.Version=sizeof(params);params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
     auto status=FspFileSystemCreate(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME),&params,const_cast<FSP_FILE_SYSTEM_INTERFACE*>(&winfsp_interface()),&fs_);if(dbg)std::wcerr<<L"FspFileSystemCreate=0x"<<std::hex<<(unsigned long)status<<L"\n";if(!NT_SUCCESS(status))return status;fs_->UserContext=this;status=FspFileSystemSetMountPoint(fs_,const_cast<PWSTR>(path.c_str()));if(dbg)std::wcerr<<L"SetMountPoint=0x"<<std::hex<<(unsigned long)status<<L"\n";if(!NT_SUCCESS(status)){FspFileSystemDelete(fs_);fs_=nullptr;}return status;
 }
 NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;
