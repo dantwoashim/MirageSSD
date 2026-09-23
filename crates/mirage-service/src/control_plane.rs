@@ -109,6 +109,10 @@ impl ControlPlaneHandler {
                 == Some(mirage_db::VolumeMode::Managed);
             let drive_provider =
                 drive_provider_paths(&self.database, repository.repository_id, managed)?;
+            crate::logging::log_event(
+                "mount.restoring",
+                &format!("{} at {}", repository.repository_id, mount_point.display()),
+            );
             self.mounts
                 .lock()
                 .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
@@ -131,6 +135,10 @@ impl ControlPlaneHandler {
                     },
                     &repository.display_name,
                 )?;
+            crate::logging::log_event(
+                "mount.restored_volume",
+                &format!("{} at {}", repository.repository_id, mount_point.display()),
+            );
             restored += 1;
         }
         Ok(restored)

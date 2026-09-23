@@ -26,9 +26,12 @@ use windows_sys::Win32::{
     },
 };
 
+/// The production control pipe. Clients in mirage-cli hardcode the same name.
+pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MirageSSD.v1";
+
 /// Connects briefly so a service blocked in `ConnectNamedPipe` can observe shutdown.
 pub fn wake_server() {
-    let name: Vec<u16> = r"\\.\pipe\MirageSSD.v1".encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = SERVICE_PIPE_NAME.encode_utf16().chain([0]).collect();
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -48,7 +51,7 @@ pub fn wake_server() {
 }
 
 pub fn serve_one(handler: &impl RequestHandler) -> Result<(), MirageError> {
-    serve_one_named(handler, r"\\.\pipe\MirageSSD.v1")
+    serve_one_named(handler, SERVICE_PIPE_NAME)
 }
 
 fn pipe_security_attributes() -> Result<SecurityDescriptorGuard, MirageError> {

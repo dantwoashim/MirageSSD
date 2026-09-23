@@ -2,7 +2,9 @@
 
 #[cfg(windows)]
 mod windows_service_host {
-    use mirage_service::{ControlPlaneHandler, NativeMountControl, logging, serve, wake_server};
+    use mirage_service::{
+        ControlPlaneHandler, NativeMountControl, SERVICE_PIPE_NAME, logging, serve, wake_server,
+    };
     use std::{
         ffi::OsString,
         sync::{
@@ -73,8 +75,9 @@ mod windows_service_host {
             mirage_db::Database::open(&state_root.join("control.db"))?,
             NativeMountControl::new(filesystem_host),
         ));
-        handler.recover_native_activations()?;
-        handler.maintain_persistent_mounts()?;
+        // Mount recovery runs on the watchdog thread below: it can wait on
+        // filesystem hosts and remote credentials, and the service must
+        // report Running promptly so installers and the SCM never stall on it.
 
         status.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -92,8 +95,14 @@ mod windows_service_host {
                 if let Err(error) = mount_watchdog_handler.recover_native_activations() {
                     logging::log_event("mount.recovery_failed", &error.to_string());
                 }
-                if let Err(error) = mount_watchdog_handler.maintain_persistent_mounts() {
-                    logging::log_event("mount.maintenance_failed", &error.to_string());
+                match mount_watchdog_handler.maintain_persistent_mounts() {
+                    Ok(0) => {}
+                    Ok(restored) => {
+                        logging::log_event("mount.restored", &format!("{restored} volume(s)"))
+                    }
+                    Err(error) => {
+                        logging::log_event("mount.maintenance_failed", &error.to_string())
+                    }
                 }
                 for _ in 0..20 {
                     if mount_watchdog_stopping.load(Ordering::Acquire) {
@@ -118,9 +127,16 @@ mod windows_service_host {
                 }
             }
         });
-        if let Err(error) = serve(handler.as_ref(), r"\.\pipe\MirageSSD.v1", &stopping) {
+        logging::log_event(
+            "service.running",
+            &format!("version {}", env!("CARGO_PKG_VERSION")),
+        );
+        if let Err(error) = serve(handler.as_ref(), SERVICE_PIPE_NAME, &stopping) {
             logging::log_event("ipc.stopped", &error.to_string());
         }
+        // A failed accept loop must still let the watchdogs finish, otherwise
+        // the service can never reach Stopped.
+        stopping.store(true, Ordering::Release);
         logging::log_event("service.stopping", "stop requested");
         let _ = mount_watchdog.join();
         let _ = floor_watchdog.join();
