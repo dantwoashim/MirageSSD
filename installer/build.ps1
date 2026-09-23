@@ -3,7 +3,7 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.10',
+  [string]$Version = '0.1.11',
   [Parameter(Mandatory = $true)]
   [string]$DriveClientCredentials,
   [long]$SourceDateEpoch = 946684800,
