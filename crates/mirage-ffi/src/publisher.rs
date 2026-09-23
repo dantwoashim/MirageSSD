@@ -24,10 +24,35 @@ use tokio_util::sync::CancellationToken;
 /// Plaintext bytes per encrypted frame inside a payload object.
 pub const PAYLOAD_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Concurrent payload uploads per publisher pass. Bounded so peak memory
-/// (plaintext + ciphertext per in-flight object) and Drive request rate stay
-/// modest; four already turns per-object latency into throughput.
-pub const PUBLISH_PARALLELISM: usize = 4;
+/// Concurrent payload uploads per publisher pass. Each Drive object costs ~5
+/// round trips (dedup lookup, session start, upload, metadata + readback
+/// verify), so small payloads are latency-bound and need many in flight.
+pub const PUBLISH_PARALLELISM: usize = 16;
+/// Plaintext bytes in flight per batch: each upload holds plaintext and
+/// ciphertext in memory, so 32 MiB segments batch fewer at a time.
+pub const PUBLISH_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Splits the pending list into batches of at most PUBLISH_PARALLELISM``n/// payloads and PUBLISH_BATCH_BYTES plaintext (a single larger payload
+/// still forms its own batch).
+fn publish_batches(pending: &[UnpublishedPayload]) -> Vec<&[UnpublishedPayload]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < pending.len() {
+        let mut end = start;
+        let mut bytes = 0_u64;
+        while end < pending.len() && end - start < PUBLISH_PARALLELISM {
+            let next = u64::try_from(pending[end].bytes).unwrap_or(0);
+            if end > start && bytes.saturating_add(next) > PUBLISH_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
+        batches.push(&pending[start..end]);
+        start = end;
+    }
+    batches
+}
 
 /// Number of plaintext frames for a payload of `plaintext_len` bytes. A
 /// non-empty payload always has at least one frame; an empty payload
@@ -298,7 +323,7 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
         // record still goes through the single writer channel; a backend
         // failure anywhere in a batch ends the pass and backs off.
         let mut any_error = false;
-        for batch in pending.chunks(PUBLISH_PARALLELISM) {
+        for batch in publish_batches(&pending) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -901,4 +926,35 @@ async fn collect_stream(
         out.extend_from_slice(&chunk?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn payload(bytes: i64) -> UnpublishedPayload {
+        UnpublishedPayload {
+            payload_id: [0; 16],
+            path: String::new(),
+            bytes,
+            checksum: None,
+            device_seq: 0,
+        }
+    }
+
+    #[test]
+    fn batches_bound_count_and_bytes() {
+        let small: Vec<_> = (0..40).map(|_| payload(1 << 20)).collect();
+        let sizes: Vec<usize> = publish_batches(&small).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![16, 16, 8]);
+        let large: Vec<_> = (0..20).map(|_| payload(32 << 20)).collect();
+        let sizes: Vec<usize> = publish_batches(&large).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![8, 8, 4]);
+        let huge = vec![payload(1 << 30)];
+        assert_eq!(
+            publish_batches(&huge).len(),
+            1,
+            "an oversized payload still publishes"
+        );
+    }
 }
