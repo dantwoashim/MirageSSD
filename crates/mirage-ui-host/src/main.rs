@@ -224,6 +224,7 @@ mod windows_host {
         login: LoginState,
         login_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         create: serde_json::Value,
+        set_cache: serde_json::Value,
     }
 
     #[derive(Default)]
@@ -358,6 +359,81 @@ mod windows_host {
         serde_json::json!({"started": true})
     }
 
+    /// Moves a volume's local cache to another disk on a worker thread;
+    /// progress and the outcome are polled through set_cache.
+    fn start_volume_set_cache(
+        shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+        payload: &serde_json::Value,
+        drive_token_store: Option<&Path>,
+    ) -> Result<serde_json::Value, MirageError> {
+        let repository_id = payload["repository_id"]
+            .as_str()
+            .ok_or_else(|| MirageError::invalid_argument("repository_id is required"))?
+            .parse::<mirage_types::RepositoryId>()?;
+        let cache_disk = payload["cache_disk"]
+            .as_str()
+            .map(str::trim)
+            .filter(|disk| !disk.is_empty())
+            .map(str::to_owned);
+        {
+            let mut state = shared
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("state lock poisoned"))?;
+            if state.set_cache["in_flight"].as_bool() == Some(true) {
+                return Ok(serde_json::json!({"started": false, "in_flight": true}));
+            }
+            state.set_cache = serde_json::json!({
+                "in_flight": true,
+                "step": "starting",
+                "repository_id": repository_id.to_string(),
+            });
+        }
+        let token_store = drive_token_store.map(Path::to_path_buf);
+        std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let progress_shared = shared.clone();
+                let mut progress = move |step: &str| {
+                    if let Ok(mut state) = progress_shared.lock() {
+                        state.set_cache["step"] = serde_json::json!(step);
+                    }
+                };
+                // A remount needs a Drive token; without one the move still
+                // completes and the agent remounts when it next signs in.
+                let token = futures_executor::block_on(
+                    mirage_backend_drive::refresh_stored_session(token_store.as_deref()),
+                )
+                .ok()
+                .and_then(|session| {
+                    mirage_ipc::SensitiveString::new(session.access_token.as_str().to_owned()).ok()
+                });
+                let result = mirage_cli::commands::volume::set_cache(
+                    repository_id,
+                    cache_disk.as_deref(),
+                    token,
+                    None,
+                    &mut progress,
+                );
+                if let Ok(mut state) = shared.lock() {
+                    state.set_cache = match result {
+                        Ok(mut value) => {
+                            value["in_flight"] = serde_json::json!(false);
+                            value["done"] = serde_json::json!(true);
+                            value
+                        }
+                        Err(error) => serde_json::json!({
+                            "in_flight": false,
+                            "done": false,
+                            "repository_id": repository_id.to_string(),
+                            "error": error.to_string(),
+                        }),
+                    };
+                }
+            }
+        });
+        Ok(serde_json::json!({"started": true}))
+    }
+
     fn start_volume_create(
         shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
         payload: &serde_json::Value,
@@ -382,11 +458,20 @@ mod windows_host {
                 .map(Ok)
                 .unwrap_or_else(mirage_cli::commands::volume::default_budget_bytes)
                 .unwrap_or(8 * (1 << 30)),
-            floor_bytes: payload["floor_bytes"].as_u64().or_else(|| {
-                mirage_cli::commands::volume::state_volume()
+            cache_disk: match payload["cache_disk"].as_str() {
+                Some(disk) if !disk.trim().is_empty() => Some(disk.trim().to_owned()),
+                _ => mirage_cli::commands::volume::default_cache_disk().unwrap_or(None),
+            },
+            floor_bytes: payload["floor_bytes"].as_u64(),
+        };
+        // The floor guards the disk that holds the cache.
+        let spec = mirage_cli::commands::volume::VolumeSpec {
+            floor_bytes: spec.floor_bytes.or_else(|| {
+                mirage_cli::commands::volume::cache_disk_info(spec.cache_disk.as_deref())
                     .ok()
                     .map(|disk| mirage_cli::commands::volume::default_floor_bytes(&disk))
             }),
+            ..spec
         };
         std::thread::spawn({
             let shared = shared.clone();
@@ -417,6 +502,7 @@ mod windows_host {
                             "drive_letter": created.drive_letter,
                             "name": created.name,
                             "budget_bytes": created.budget_bytes,
+                            "cache_root": created.cache_root,
                             "account_id": created.account_id,
                         }),
                         Err(error) => serde_json::json!({
@@ -509,6 +595,14 @@ mod windows_host {
                         .unwrap_or_default(),
                     "default_budget_bytes": mirage_cli::commands::volume::default_budget_bytes()
                         .unwrap_or(0),
+                    // The disk that will hold the local cache unless the user
+                    // picks another: freest fixed disk, or the state disk.
+                    "default_cache_disk": mirage_cli::commands::volume::default_cache_disk()
+                        .ok()
+                        .flatten()
+                        .or_else(|| mirage_cli::commands::volume::state_volume()
+                            .ok()
+                            .map(|disk| disk.volume_root.to_string_lossy().into_owned())),
                 });
                 write_response(
                     stream,
@@ -745,6 +839,56 @@ mod windows_host {
                     Some(body) => body,
                     None => serde_json::json!({"error": "volume creation could not be started"}),
                 };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("POST", "/api/volume/set-cache") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = match serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|payload| {
+                        start_volume_set_cache(shared, &payload, drive_token_store).ok()
+                    }) {
+                    Some(body) => body,
+                    None => serde_json::json!({"error": "cache move could not be started"}),
+                };
+                write_response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                    false,
+                )?;
+            }
+            ("GET", "/api/volume/set-cache-status") => {
+                if let Err(response) = authorize(&request, origin, token) {
+                    write_response(
+                        stream,
+                        403,
+                        "application/json; charset=utf-8",
+                        &response,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let body = shared
+                    .lock()
+                    .map(|state| state.set_cache.clone())
+                    .unwrap_or_default();
                 write_response(
                     stream,
                     200,

@@ -17,7 +17,7 @@ bool parse_capacity(const wchar_t* text, std::uint64_t& value) {
 }
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 5 && (argc < 8 || argc % 2 != 0 || argc > 24)) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache|--managed total-bytes free-bytes [--origin path] [--drive-manifest p --repository-key p]]\n  --managed: total-bytes = advertised volume size; free-bytes = dirty-payload budget unless --budget sets it separately\n  options: --origin --drive-manifest --repository-key --floor --label --budget\n"; return 2; }
+    if (argc != 5 && (argc < 8 || argc % 2 != 0 || argc > 26)) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache|--managed total-bytes free-bytes [--origin path] [--drive-manifest p --repository-key p]]\n  --managed: total-bytes = advertised volume size; free-bytes = dirty-payload budget unless --budget sets it separately\n  options: --origin --drive-manifest --repository-key --floor --label --budget --journal-root\n"; return 2; }
     const bool cache_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--cache";
     const bool managed_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--managed";
     if (argc >= 8 && !cache_mode && !managed_mode) { std::wcerr << L"unknown storage mode\n"; return 2; }
@@ -25,7 +25,7 @@ int wmain(int argc, wchar_t** argv) {
     // origin pack directory for --cache, the local pack mirror for --managed);
     // --drive-manifest + --repository-key enable the on-demand Drive provider
     // (managed only; the bearer token arrives on stdin as a TOKEN line).
-    std::wstring origin, drive_manifest, repository_key, label;
+    std::wstring origin, drive_manifest, repository_key, label, journal_root;
     std::uint64_t disk_floor = 0, dirty_budget = 0;
     for (int i = 8; i < argc; i += 2) {
         const std::wstring_view flag = argv[i];
@@ -35,6 +35,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (flag == L"--repository-key") repository_key = argv[i + 1];
         else if (flag == L"--floor") { if (!parse_capacity(argv[i + 1], disk_floor)) { std::wcerr << L"invalid --floor\n"; return 2; } }
         else if (flag == L"--label") label = argv[i + 1];
+        else if (flag == L"--journal-root") journal_root = argv[i + 1];
         else if (flag == L"--budget") { if (!parse_capacity(argv[i + 1], dirty_budget) || dirty_budget == 0) { std::wcerr << L"invalid --budget\n"; return 2; } }
         else { std::wcerr << L"unknown option " << flag << L"\n"; return 2; }
     }
@@ -58,6 +59,7 @@ int wmain(int argc, wchar_t** argv) {
     // A managed mount is the local-first writable volume: same state root
     // and cache constructor as --cache, but mutation callbacks are live.
     if (!label.empty()) host.set_volume_label(label);
+    if (!journal_root.empty()) { if (!managed_mode) { std::wcerr << L"--journal-root requires --managed\n"; return 2; } host.set_journal_root(journal_root); }
     if (dirty_budget != 0) { if (!managed_mode) { std::wcerr << L"--budget requires --managed\n"; return 2; } host.set_dirty_budget(dirty_budget); }
     const auto status = host.mount(mount.wstring(), argv[2], argv[3], argv[4], cache_mode || managed_mode, managed_mode, total_bytes, free_bytes, origin, drive_manifest, repository_key, disk_floor);
     if (!NT_SUCCESS(status)) { std::wcerr << L"mount failed status=0x" << std::hex << static_cast<unsigned long>(status) << L"\n"; return 1; }

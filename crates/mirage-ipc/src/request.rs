@@ -123,6 +123,16 @@ pub enum Command {
         repository_id: RepositoryId,
         managed: bool,
     },
+    /// Choose where a managed volume keeps its local cache (journal payloads):
+    /// a disk root such as `D:\` or an absolute directory on a fixed local
+    /// disk. The repository must be unmounted; existing payloads are moved
+    /// and verified before the new location becomes authoritative. `None`
+    /// returns to the default under the service state root.
+    RepositorySetCacheRoot {
+        repository_id: RepositoryId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_root: Option<String>,
+    },
     Mount {
         repository_id: RepositoryId,
         generation: GenerationId,
@@ -275,6 +285,7 @@ impl Command {
                 | Self::RepositoryRestoreNative { .. }
                 | Self::RepositorySetDriveOrigin { .. }
                 | Self::RepositorySetVolumeMode { .. }
+                | Self::RepositorySetCacheRoot { .. }
                 | Self::Mount { .. }
                 | Self::DriveTokenSupply { .. }
                 | Self::Unmount { .. }
@@ -326,6 +337,7 @@ impl Command {
     pub fn min_protocol(&self) -> u16 {
         match self {
             Self::RepositoryUnregister { .. } => 4,
+            Self::RepositorySetCacheRoot { .. } => 5,
             _ => 3,
         }
     }

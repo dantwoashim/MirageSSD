@@ -705,11 +705,26 @@ pub enum VolumeCommand {
         /// (default: min(25% of the freest disk, 64 GiB)).
         #[arg(long)]
         budget: Option<String>,
-        /// Keep at least this many bytes free on the state disk
+        /// Keep at least this many bytes free on the cache disk
         /// (default: max(10% of that disk, 20 GiB)).
         #[arg(long)]
         floor: Option<String>,
+        /// Disk (`D:`) or directory that stores the local cache
+        /// (default: the disk with the most free space).
+        #[arg(long)]
+        cache_disk: Option<String>,
         /// Desktop OAuth JSON; defaults to the installed oauth-desktop.json.
+        #[arg(long)]
+        client_credentials: Option<std::path::PathBuf>,
+        #[arg(long)]
+        token_store: Option<std::path::PathBuf>,
+    },
+    /// Move a volume's local cache to another disk (unmounts and remounts).
+    SetCache {
+        repository_id: mirage_types::RepositoryId,
+        /// Disk (`D:`) or directory for the cache; omit to return to the default.
+        #[arg(long)]
+        cache_disk: Option<String>,
         #[arg(long)]
         client_credentials: Option<std::path::PathBuf>,
         #[arg(long)]
@@ -1519,6 +1534,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                 name,
                 budget,
                 floor,
+                cache_disk,
                 client_credentials,
                 token_store,
             } => {
@@ -1531,9 +1547,15 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                     Some(value) => disk::parse_byte_size(&value)?,
                     None => volume::default_budget_bytes()?,
                 };
+                let cache_disk = match cache_disk {
+                    Some(disk) => Some(disk),
+                    None => volume::default_cache_disk()?,
+                };
                 let floor_bytes = match floor {
                     Some(value) => Some(disk::parse_byte_size(&value)?),
-                    None => Some(volume::default_floor_bytes(&volume::state_volume()?)),
+                    None => Some(volume::default_floor_bytes(&volume::cache_disk_info(
+                        cache_disk.as_deref(),
+                    )?)),
                 };
                 let created = volume::create(
                     &volume::VolumeSpec {
@@ -1541,6 +1563,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                         drive_letter: letter,
                         budget_bytes,
                         floor_bytes,
+                        cache_disk,
                     },
                     &credentials,
                     token_store.as_deref(),
@@ -1558,6 +1581,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                         "drive_letter": created.drive_letter,
                         "budget_bytes": created.budget_bytes,
                         "floor_bytes": created.floor_bytes,
+                        "cache_root": created.cache_root,
                         "floor_error": created.floor_error,
                         "account_id": created.account_id,
                         "mount_point": created.mount_point,
@@ -1565,6 +1589,37 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
                     }),
                     json,
                 )
+            }
+            VolumeCommand::SetCache {
+                repository_id,
+                cache_disk,
+                client_credentials,
+                token_store,
+            } => {
+                // A remount needs a Drive token; without a sign-in the move
+                // still happens and the volume stays unmounted until the agent
+                // supplies one.
+                let token = backend_login::oauth_client_credentials(client_credentials)
+                    .and_then(|credentials| {
+                        drive_live::connect(&credentials, token_store.as_deref())
+                    })
+                    .ok()
+                    .and_then(|session| {
+                        mirage_ipc::SensitiveString::new(session.access_token.as_str().to_owned())
+                            .ok()
+                    });
+                let result = volume::set_cache(
+                    repository_id,
+                    cache_disk.as_deref(),
+                    token,
+                    None,
+                    &mut |step| {
+                        if !json {
+                            eprintln!("{step}...");
+                        }
+                    },
+                )?;
+                service::emit(result, json)
             }
             VolumeCommand::List => {
                 service::emit(serde_json::json!({"volumes": volume::list(None)?}), json)

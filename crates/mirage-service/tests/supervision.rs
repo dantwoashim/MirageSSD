@@ -56,6 +56,7 @@ fn spec() -> HostSpec {
         disk_floor: None,
         label: None,
         dirty_budget: None,
+        journal_root: None,
     }
 }
 

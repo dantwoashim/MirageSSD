@@ -25,6 +25,9 @@ pub struct VolumeSpec {
     pub drive_letter: String,
     pub budget_bytes: u64,
     pub floor_bytes: Option<u64>,
+    /// Disk root (`D:\`) or directory that holds the local cache; `None`
+    /// keeps the service default under `%ProgramData%\MirageSSD`.
+    pub cache_disk: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ pub struct VolumeCreated {
     pub drive_letter: String,
     pub budget_bytes: u64,
     pub floor_bytes: Option<u64>,
+    /// Where the local cache lives (as recorded by the service).
+    pub cache_root: Option<String>,
     /// Set when the free-space floor could not be applied (for example the
     /// installed service predates interactive-user floor permission or the
     /// caller lacks rights) — the volume is still usable; set the floor
@@ -183,9 +188,50 @@ pub fn default_budget_bytes() -> Result<u64, MirageError> {
     Ok((disk.free_bytes / 4).clamp(GIB, 64 * GIB))
 }
 
-/// Default free-space floor for the state disk: max(10% of total, 20 GiB).
+/// Default free-space floor for the cache disk: max(10% of total, 20 GiB).
 pub fn default_floor_bytes(disk: &DiskInfo) -> u64 {
     (disk.total_bytes / 10).max(20 * GIB)
+}
+
+/// Default cache disk for a new volume: the fixed disk with the most free
+/// space, as a root such as `D:\`. `None` when that is the state disk (the
+/// service default location already lives there).
+pub fn default_cache_disk() -> Result<Option<String>, MirageError> {
+    let state = state_volume_root()?;
+    let best = disks()?
+        .into_iter()
+        .max_by_key(|disk| disk.free_bytes)
+        .ok_or_else(|| MirageError::invalid_argument("no fixed disk has free space"))?;
+    if best
+        .volume_root
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&state.to_string_lossy())
+    {
+        return Ok(None);
+    }
+    Ok(Some(best.volume_root.to_string_lossy().into_owned()))
+}
+
+/// Free/total bytes of the disk that will hold the cache: the requested disk
+/// (or directory's disk), or the state disk when none was requested.
+pub fn cache_disk_info(cache_disk: Option<&str>) -> Result<DiskInfo, MirageError> {
+    let Some(request) = cache_disk else {
+        return state_volume();
+    };
+    let bytes = request.trim().as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return Err(MirageError::invalid_argument(
+            "cache disk must be a local disk such as D:",
+        ));
+    }
+    let root = PathBuf::from(format!("{}:\\", bytes[0].to_ascii_uppercase() as char));
+    let (total, free) = disk_space(&root)
+        .ok_or_else(|| MirageError::invalid_argument("the cache disk could not be inspected"))?;
+    Ok(DiskInfo {
+        volume_root: root,
+        total_bytes: total,
+        free_bytes: free,
+    })
 }
 
 pub fn default_volume_name() -> &'static str {
@@ -329,6 +375,7 @@ fn create_in(
                 drive_letter: letter,
                 budget_bytes: spec.budget_bytes,
                 floor_bytes: applied_floor,
+                cache_root: mounted["cache_root"].as_str().map(str::to_owned),
                 floor_error,
                 account_id: backend.account_id().to_owned(),
                 mount_point,
@@ -475,6 +522,7 @@ fn create_staged(
         generation,
         letter,
         spec.budget_bytes,
+        spec.cache_disk.as_deref(),
         token,
         transport,
         progress,
@@ -491,12 +539,19 @@ fn create_staged(
     let mut applied_floor = None;
     let mut floor_error = None;
     if let Some(floor) = spec.floor_bytes {
-        let disk = state_volume()
-            .map_err(|error| ("reading the state disk".to_owned(), published, true, error))?;
+        // The floor guards the disk that physically holds the cache.
+        let volume_root = match mounted["cache_disk_root"].as_str() {
+            Some(root) => root.to_owned(),
+            None => state_volume()
+                .map_err(|error| ("reading the state disk".to_owned(), published, true, error))?
+                .volume_root
+                .to_string_lossy()
+                .into_owned(),
+        };
         match service_request(
             transport,
             mirage_ipc::Command::DiskFloorSet {
-                volume_root: disk.volume_root.to_string_lossy().into_owned(),
+                volume_root,
                 floor_bytes: floor,
                 hysteresis_bytes: None,
             },
@@ -546,6 +601,7 @@ fn onboard(
     generation: GenerationId,
     letter: &str,
     budget_bytes: u64,
+    cache_disk: Option<&str>,
     token: mirage_ipc::SensitiveString,
     transport: Option<&dyn ServiceTransport>,
     progress: &mut dyn FnMut(&str),
@@ -580,14 +636,124 @@ fn onboard(
             managed: true,
         },
     )?;
+    // Cache placement is chosen before the first mount so the journal is
+    // created on the right disk from the start (nothing to move yet).
+    let mut cache = serde_json::Value::Null;
+    if let Some(disk) = cache_disk {
+        progress(&format!("Placing the local cache on {disk}"));
+        cache = service_request(
+            transport,
+            mirage_ipc::Command::RepositorySetCacheRoot {
+                repository_id,
+                cache_root: Some(disk.to_owned()),
+            },
+        )?;
+    }
     progress(&format!("Mounting {letter}:"));
-    service_request(
+    let mut mounted = service_request(
         transport,
         mirage_ipc::Command::Mount {
             repository_id,
             generation,
             drive_letter: Some(letter.to_owned()),
             drive_access_token: Some(token),
+        },
+    )?;
+    if let Some(root) = cache["cache_root"].as_str() {
+        mounted["cache_root"] = serde_json::json!(root);
+    }
+    if let Some(disk_root) = cache["cache_disk_root"].as_str() {
+        mounted["cache_disk_root"] = serde_json::json!(disk_root);
+    }
+    Ok(mounted)
+}
+
+/// Move an existing volume's local cache to another disk: unmount if
+/// mounted, relocate through the service (copy + verify + switch), then
+/// remount with a fresh token when one is available.
+pub fn set_cache(
+    repository_id: RepositoryId,
+    cache_disk: Option<&str>,
+    drive_access_token: Option<mirage_ipc::SensitiveString>,
+    transport: Option<&dyn ServiceTransport>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<serde_json::Value, MirageError> {
+    let detail = service_request(
+        transport,
+        mirage_ipc::Command::RepositoryDetail { repository_id },
+    )?;
+    let was_mounted = detail["state"].as_str() == Some("ready_mounted");
+    let letter = detail["mount_path"]
+        .as_str()
+        .and_then(|path| path.chars().next())
+        .map(|c| c.to_string());
+    if was_mounted {
+        progress("Unmounting");
+        service_request(transport, mirage_ipc::Command::Unmount { repository_id })?;
+    }
+    let step = match cache_disk {
+        Some(disk) => format!("Moving the local cache to {disk}"),
+        None => "Moving the local cache back to the default location".to_owned(),
+    };
+    progress(&step);
+    let moved = service_request(
+        transport,
+        mirage_ipc::Command::RepositorySetCacheRoot {
+            repository_id,
+            cache_root: cache_disk.map(str::to_owned),
+        },
+    );
+    let mut result = match moved {
+        Ok(value) => value,
+        Err(error) => {
+            // Remount over the untouched old location so the drive comes back.
+            if was_mounted {
+                let _ = remount(
+                    repository_id,
+                    &detail,
+                    letter.as_deref(),
+                    drive_access_token,
+                    transport,
+                );
+            }
+            return Err(error);
+        }
+    };
+    if was_mounted {
+        progress("Remounting");
+        let mounted = remount(
+            repository_id,
+            &detail,
+            letter.as_deref(),
+            drive_access_token,
+            transport,
+        )?;
+        result["remounted"] = serde_json::json!(true);
+        result["mount_point"] = mounted["mount_point"].clone();
+    } else {
+        result["remounted"] = serde_json::json!(false);
+    }
+    Ok(result)
+}
+
+fn remount(
+    repository_id: RepositoryId,
+    detail: &serde_json::Value,
+    letter: Option<&str>,
+    drive_access_token: Option<mirage_ipc::SensitiveString>,
+    transport: Option<&dyn ServiceTransport>,
+) -> Result<serde_json::Value, MirageError> {
+    let generation = detail["active_generation"]
+        .as_u64()
+        .map(GenerationId::from_u64)
+        .unwrap_or(GenerationId::ZERO);
+    service_request(
+        transport,
+        mirage_ipc::Command::Mount {
+            repository_id,
+            generation,
+            drive_letter: letter.map(str::to_owned),
+            drive_access_token,
         },
     )
 }
@@ -710,6 +876,7 @@ mod tests {
             GenerationId::ZERO,
             "Q",
             8 << 30,
+            None,
             token,
             Some(&transport),
             &mut |_| {},
@@ -839,6 +1006,7 @@ mod tests {
                 drive_letter: "n:".to_owned(),
                 budget_bytes: 8 * GIB,
                 floor_bytes: None,
+                cache_disk: None,
             },
             &backend,
             &mut |step| steps.push(step.to_owned()),
@@ -920,6 +1088,7 @@ mod tests {
                 drive_letter: "N".to_owned(),
                 budget_bytes: 8 * GIB,
                 floor_bytes: None,
+                cache_disk: None,
             },
             &PublishOk,
             &mut |_| {},
@@ -987,6 +1156,7 @@ mod tests {
                 drive_letter: "N".to_owned(),
                 budget_bytes: 8 * GIB,
                 floor_bytes: Some(20 * GIB),
+                cache_disk: None,
             },
             &PublishOk,
             &mut |_| {},

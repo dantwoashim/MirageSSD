@@ -250,6 +250,9 @@ pub struct MirageEngineHandle {
     pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
     /// State root holding journal payload files for dirty extents.
     pub state_root: Option<PathBuf>,
+    /// Directory holding this volume's journal payloads (the user's chosen
+    /// cache disk); `None` on engines without a journal.
+    pub journal_dir: Option<PathBuf>,
     /// Managed writable volume: the durable namespace is authoritative for
     /// names and mutation exports are enabled.
     pub managed: bool,
@@ -419,6 +422,8 @@ pub struct MirageFileHandle {
     pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
     /// State root holding journal payload files for dirty extents.
     pub state_root: Option<PathBuf>,
+    /// This volume's journal payload directory (see the engine field).
+    pub journal_dir: Option<PathBuf>,
     /// Desired access this handle opened with, for handle-table accounting.
     pub desired_access: mirage_engine::handles::DesiredAccess,
     /// Share mode this handle granted, for handle-table accounting.
@@ -500,6 +505,7 @@ impl MirageEngineHandle {
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(Mutex::new(HashMap::new())),
             state_root: None,
+            journal_dir: None,
             managed: false,
             dirty: None,
             publisher: None,

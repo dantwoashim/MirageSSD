@@ -130,6 +130,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(std::sync::Mutex::new(Default::default())),
             state_root: None,
+            journal_dir: None,
             managed: false,
             dirty: None,
             segments: None,
@@ -220,6 +221,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(std::sync::Mutex::new(Default::default())),
             state_root: None,
+            journal_dir: None,
             managed: false,
             dirty: None,
             segments: None,
@@ -424,6 +426,7 @@ unsafe fn create_cache_impl(
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(std::sync::Mutex::new(Default::default())),
             state_root: Some(state_root.clone()),
+            journal_dir: None,
             managed: false,
             dirty: None,
             segments: None,
@@ -504,7 +507,62 @@ pub unsafe extern "C" fn mirage_engine_create_managed_drive(
     repository_key_len: usize,
     output: *mut *mut MirageEngineHandle,
 ) -> MirageStatus {
+    unsafe {
+        mirage_engine_create_managed_drive_at(
+            index_path,
+            index_path_len,
+            state_root,
+            state_root_len,
+            object_root,
+            object_root_len,
+            dirty_budget_bytes,
+            drive_manifest_path,
+            drive_manifest_len,
+            repository_key_path,
+            repository_key_len,
+            std::ptr::null(),
+            0,
+            output,
+        )
+    }
+}
+
+/// Same as `mirage_engine_create_managed_drive` with an explicit journal
+/// payload directory (`journal_root`, UTF-16) — the user's chosen cache disk.
+/// Null/empty keeps the default `<state_root>/journal`.
+///
+/// # Safety
+/// Same pointer contract as `mirage_engine_create_managed_drive`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_create_managed_drive_at(
+    index_path: *const u16,
+    index_path_len: usize,
+    state_root: *const u16,
+    state_root_len: usize,
+    object_root: *const u16,
+    object_root_len: usize,
+    dirty_budget_bytes: u64,
+    drive_manifest_path: *const u16,
+    drive_manifest_len: usize,
+    repository_key_path: *const u16,
+    repository_key_len: usize,
+    journal_root: *const u16,
+    journal_root_len: usize,
+    output: *mut *mut MirageEngineHandle,
+) -> MirageStatus {
     contained(|| {
+        if journal_root.is_null() && journal_root_len != 0 {
+            return MirageStatus::InvalidArgument;
+        }
+        let journal_root = if journal_root_len == 0 {
+            None
+        } else {
+            let units = unsafe { std::slice::from_raw_parts(journal_root, journal_root_len) };
+            match String::from_utf16(units) {
+                Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
+                _ => return MirageStatus::InvalidArgument,
+            }
+        };
         let drive = if drive_manifest_len != 0 {
             Some(ManagedProviderSpec::Drive)
         } else {
@@ -525,6 +583,7 @@ pub unsafe extern "C" fn mirage_engine_create_managed_drive(
             std::ptr::null(),
             0,
             drive,
+            journal_root,
             output,
         )
     })
@@ -568,6 +627,7 @@ pub unsafe extern "C" fn mirage_engine_create_managed_local_provider(
             provider_root,
             provider_root_len,
             Some(ManagedProviderSpec::Local),
+            None,
             output,
         )
     })
@@ -596,6 +656,7 @@ fn create_managed_impl(
     provider_root: *const u16,
     provider_root_len: usize,
     provider_spec: Option<ManagedProviderSpec>,
+    journal_root: Option<PathBuf>,
     output: *mut *mut MirageEngineHandle,
 ) -> MirageStatus {
     let debug_stage = |stage: &str, status: MirageStatus| -> MirageStatus {
@@ -671,6 +732,9 @@ fn create_managed_impl(
             );
         };
         let state_root = std::path::PathBuf::from(state_root);
+        // Journal payloads live on the user's chosen cache disk; the state
+        // root is only the default so existing volumes keep their location.
+        let journal_dir = journal_root.unwrap_or_else(|| state_root.join("journal"));
         // The local pack directory that mirrors committed remote content;
         // absent it, committed-page reads resolve through the provider hook.
         let (object_root, encryption) = if object_root_len != 0 {
@@ -807,7 +871,6 @@ fn create_managed_impl(
         // Orphan sweep: a `*.payload` file may only be deleted once the
         // ledger says it is neither a live reservation nor referenced by
         // any remaining extent row.
-        let journal_dir = state_root.join("journal");
         if journal_dir.is_dir() {
             let Ok(referenced) = db.referenced_payload_ids(volume) else {
                 return debug_stage(
@@ -947,7 +1010,7 @@ fn create_managed_impl(
             Arc::new(publisher::Publisher::spawn(
                 db.clone(),
                 volume,
-                state_root.join("journal"),
+                journal_dir.clone(),
                 Arc::clone(provider),
                 Arc::clone(&provider.publication_key),
             ))
@@ -967,7 +1030,7 @@ fn create_managed_impl(
             segments::SegmentWriter::new(
                 db.clone(),
                 volume,
-                state_root.join("journal"),
+                journal_dir.clone(),
                 Arc::clone(dirty),
                 Arc::clone(&extents),
                 Some(Arc::clone(&coordinator)),
@@ -1006,6 +1069,7 @@ fn create_managed_impl(
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents,
             state_root: Some(state_root),
+            journal_dir: Some(journal_dir),
             managed: true,
             dirty,
             managed_provider,
@@ -1431,7 +1495,13 @@ pub unsafe extern "C" fn mirage_engine_mark_mounted(
                 if let (Some(db), Some(state_root)) = (&engine.db, &engine.state_root) {
                     let volume = coordinator.repository_id();
                     let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
-                    journal.reclaim_pending(&state_root.join("journal"), now_ns_i64())?;
+                    journal.reclaim_pending(
+                        engine
+                            .journal_dir
+                            .as_deref()
+                            .unwrap_or(&state_root.join("journal")),
+                        now_ns_i64(),
+                    )?;
                 }
                 coordinator.transition(VolumeState::Starting)?;
             }
@@ -1542,8 +1612,7 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
             return MirageStatus::InvalidArgument;
         }
         let engine = unsafe { &*engine };
-        let (Some(db), Some(state_root), Some(dirty)) =
-            (&engine.db, &engine.state_root, &engine.dirty)
+        let (Some(db), Some(_), Some(dirty)) = (&engine.db, &engine.state_root, &engine.dirty)
         else {
             return MirageStatus::Ok;
         };
@@ -1562,7 +1631,7 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
             Ok(dead) => dead,
             Err(_) => return MirageStatus::IntegrityFailure,
         };
-        let journal_dir = state_root.join("journal");
+        let journal_dir = engine_journal_dir(engine);
         for (payload_id, length_bytes) in dead {
             // Only after the ledger commit does the file go; a failed delete
             // is left for the startup orphan sweep.
@@ -1840,6 +1909,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         handles: Arc::clone(&engine.handles),
                         extents: Arc::clone(&engine.extents),
                         state_root: engine.state_root.clone(),
+                        journal_dir: engine.journal_dir.clone(),
                         desired_access: mirage_engine::handles::DesiredAccess {
                             read: true,
                             write: true,
@@ -1901,6 +1971,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     handles: Arc::clone(&engine.handles),
                     extents: Arc::clone(&engine.extents),
                     state_root: engine.state_root.clone(),
+                    journal_dir: engine.journal_dir.clone(),
                     desired_access: mirage_engine::handles::DesiredAccess {
                         read: true,
                         write: true,
@@ -3403,6 +3474,30 @@ fn commit_extent_mutation(
     )
 }
 
+/// The journal payload directory of a managed engine: the configured cache
+/// location, or `<state_root>/journal` for engines created before cache
+/// placement existed.
+fn engine_journal_dir(engine: &MirageEngineHandle) -> PathBuf {
+    engine.journal_dir.clone().unwrap_or_else(|| {
+        engine
+            .state_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new(""))
+            .join("journal")
+    })
+}
+
+/// Same resolution as [`engine_journal_dir`] for a file handle.
+fn handle_journal_dir(handle: &MirageFileHandle) -> PathBuf {
+    handle.journal_dir.clone().unwrap_or_else(|| {
+        handle
+            .state_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new(""))
+            .join("journal")
+    })
+}
+
 /// The transaction body of `commit_extent_mutation` without a file handle —
 /// the segment sealer commits closed payloads from its own thread.
 #[allow(clippy::too_many_arguments)]
@@ -3494,9 +3589,9 @@ pub unsafe extern "C" fn mirage_write(
         let Some(inode) = handle.inode else {
             return MirageStatus::AccessDenied;
         };
-        let Some(state_root) = &handle.state_root else {
+        if handle.state_root.is_none() {
             return MirageStatus::BackendUnavailable;
-        };
+        }
         let data = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
         let now = now_ns_i64();
         let Some(db) = &handle.db else {
@@ -3509,7 +3604,7 @@ pub unsafe extern "C" fn mirage_write(
         else {
             return MirageStatus::IntegrityFailure;
         };
-        let journal_dir = state_root.join("journal");
+        let journal_dir = handle_journal_dir(handle);
         if std::fs::create_dir_all(&journal_dir).is_err() {
             return MirageStatus::IoError;
         }
@@ -3744,7 +3839,10 @@ unsafe fn read_via_extents(
         Ok(slices) => slices,
         Err(_) => return MirageStatus::IntegrityFailure,
     };
-    let journal_dir = handle.state_root.as_ref().map(|root| root.join("journal"));
+    let journal_dir = handle
+        .state_root
+        .as_ref()
+        .map(|_| handle_journal_dir(handle));
     // Bytes actually covered by slices; a read reaching past EOF reports
     // short rather than filling the request with fabricated zeros.
     let mut covered_end = offset;
@@ -4000,7 +4098,7 @@ pub unsafe extern "C" fn mirage_engine_evict_published(
     let Some(handle) = (unsafe { engine.as_ref() }) else {
         return MirageStatus::InvalidArgument;
     };
-    let (Some(db), Some(dirty), Some(state_root), Some(volume)) = (
+    let (Some(db), Some(dirty), Some(_), Some(volume)) = (
         handle.db.as_ref(),
         handle.dirty.as_ref(),
         handle.state_root.as_ref(),
@@ -4018,7 +4116,7 @@ pub unsafe extern "C" fn mirage_engine_evict_published(
     match publisher::evict_published(
         db,
         dirty,
-        &state_root.join("journal"),
+        &engine_journal_dir(handle),
         volume,
         &handle.handles,
         &pins,

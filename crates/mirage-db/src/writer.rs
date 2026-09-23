@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use crate::cache::{
     self, CacheShardSpec, CacheSlotRecord, CommitCacheSlotOutcome, ReserveCacheSlotOutcome,
 };
+use crate::cache_root;
 use crate::disk_floor::{self, DiskFloor, DiskFloorRun};
 use crate::error::writer_unavailable;
 use crate::generation::{self, Activation, VerifiedGeneration};
@@ -69,6 +70,7 @@ enum Command {
     CreateSpaceLease(NewSpaceLease, Reply<()>),
     DiskFloorSet(DiskFloor, Reply<()>),
     DiskFloorClear(String, Reply<bool>),
+    CacheRootSet(RepositoryId, Option<String>, i64, Reply<()>),
     DiskFloorRecordRun(DiskFloorRun, Reply<()>),
     TransitionSpaceLease(SpaceLeaseTransition, Reply<SpaceLeaseState>),
     CreateNamespaceVolume(RepositoryId, i64, Reply<InodeId>),
@@ -347,6 +349,17 @@ impl DbWriter {
                         }
                         Command::DiskFloorClear(root, reply) => {
                             respond(reply, disk_floor::clear_floor(&mut connection, &root));
+                        }
+                        Command::CacheRootSet(repository_id, root, now_ns, reply) => {
+                            respond(
+                                reply,
+                                cache_root::set_cache_root(
+                                    &mut connection,
+                                    repository_id,
+                                    root.as_deref(),
+                                    now_ns,
+                                ),
+                            );
                         }
                         Command::DiskFloorRecordRun(value, reply) => {
                             respond(reply, disk_floor::record_run(&mut connection, value));
@@ -984,6 +997,15 @@ impl DbWriter {
 
     pub(crate) fn disk_floor_clear(&self, volume_root: String) -> Result<bool, MirageError> {
         self.request(|reply| Command::DiskFloorClear(volume_root, reply))
+    }
+
+    pub(crate) fn cache_root_set(
+        &self,
+        repository_id: RepositoryId,
+        cache_root: Option<String>,
+        now_ns: i64,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::CacheRootSet(repository_id, cache_root, now_ns, reply))
     }
 
     pub(crate) fn disk_floor_record_run(&self, run: DiskFloorRun) -> Result<(), MirageError> {

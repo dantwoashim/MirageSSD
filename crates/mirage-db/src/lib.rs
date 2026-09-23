@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod cache_root;
 pub mod disk_floor;
 mod error;
 pub mod extent;

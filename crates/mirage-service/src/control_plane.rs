@@ -6,7 +6,7 @@ use mirage_types::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,11 @@ impl ControlPlaneHandler {
                 managed_capacity(&self.database, repository.repository_id, &index, managed)?;
             let drive_provider =
                 drive_provider_paths(&self.database, repository.repository_id, managed)?;
+            let journal_root = if managed {
+                runtime::prepare_journal_root(&self.database, repository.repository_id)?
+            } else {
+                None
+            };
             crate::logging::log_event(
                 "mount.restoring",
                 &format!("{} at {}", repository.repository_id, mount_point.display()),
@@ -131,12 +136,13 @@ impl ControlPlaneHandler {
                         .as_ref()
                         .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
                     if managed {
-                        state_root_disk_floor(&self.database)
+                        cache_disk_floor(&self.database, repository.repository_id)
                     } else {
                         None
                     },
                     &repository.display_name,
                     dirty_budget,
+                    journal_root.as_deref(),
                 )?;
             // Restored letters get the same Explorer icon and shell verbs as
             // an explicit mount; failures are cosmetic only.
@@ -211,7 +217,7 @@ impl ControlPlaneHandler {
             .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
         let mut summary = summary_json(&repository);
         // Truthful durability state: pending journal depth, live divergence,
-        // and verified workspace coverage — a failed query fails the status
+        // and verified workspace coverage â€” a failed query fails the status
         // rather than reporting an optimistic zero.
         let volume = repository_id;
         let pending_operations = self.database.replayable_operations(volume)?.len();
@@ -242,6 +248,21 @@ impl ControlPlaneHandler {
         summary["verified_workspace_bytes"] = json!(verified_workspace_bytes);
         if let Ok(Some(record)) = runtime::load_mount_record(&self.database, repository_id) {
             summary["mount_path"] = json!(record.mount_point.to_string_lossy());
+        }
+        // Local cache placement: where journal payloads live, how much room
+        // that disk has, and the floor guarding it.
+        if let Ok(cache_root) = runtime::repository_cache_root(&self.database, repository_id) {
+            summary["cache_root"] = json!(cache_root.to_string_lossy());
+            if let Ok(disk_root) = disk_space::volume_root_of(&cache_root) {
+                summary["cache_disk_root"] = json!(disk_root);
+                if let Ok(space) = disk_space::query(&cache_root) {
+                    summary["cache_disk_free_bytes"] = json!(space.available_bytes);
+                    summary["cache_disk_total_bytes"] = json!(space.total_bytes);
+                }
+                if let Ok(Some(floor)) = self.database.disk_floor(&disk_root) {
+                    summary["cache_disk_floor_bytes"] = json!(floor.floor_bytes);
+                }
+            }
         }
         // Origin/volume mode are only known for runtime-registered
         // repositories; a bare registered fixture reports nulls.
@@ -378,6 +399,124 @@ impl ControlPlaneHandler {
             .lock()
             .map_err(|_| MirageError::internal_invariant("mount lifecycle lock poisoned"))?;
         runtime::set_volume_mode(&self.database, repository_id, managed).map(ResponseBody::Json)
+    }
+
+    /// Relocates a managed volume's local cache (journal payloads) to the
+    /// requested disk/directory, or back to the default under the state root
+    /// with `None`. The repository must be unmounted. Every payload file is
+    /// copied and verified (length + BLAKE3) before the new location is
+    /// recorded; the old copies are removed only after that record lands, so
+    /// a failure at any step leaves the previous location fully intact.
+    fn set_cache_root(
+        &self,
+        repository_id: RepositoryId,
+        requested: Option<&str>,
+    ) -> Result<ResponseBody, MirageError> {
+        let _mount = self
+            .mount_lifecycle
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("mount lifecycle lock poisoned"))?;
+        let state = self
+            .database
+            .load_repository_state(repository_id)?
+            .ok_or_else(|| MirageError::invalid_argument("repository is not configured"))?;
+        let running = self
+            .mounts
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("mount coordinator lock poisoned"))?
+            .is_running(repository_id)?;
+        if state == RepositoryState::ReadyMounted || running {
+            return Err(MirageError::repository_conflict(
+                "unmount the drive before moving its local cache",
+            ));
+        }
+        let state_root = runtime::service_state_root(&self.database)?;
+        let current_root = runtime::repository_cache_root(&self.database, repository_id)?;
+        let target_root = match requested {
+            Some(request) => runtime::resolve_cache_root_request(request, repository_id)?,
+            None => state_root.clone(),
+        };
+        let unchanged = target_root
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&current_root.to_string_lossy());
+        let source_journal = current_root.join("journal");
+        let target_journal = target_root.join("journal");
+        let mut moved_files = 0_u64;
+        let mut moved_bytes = 0_u64;
+        if !unchanged {
+            if target_root != state_root {
+                let fresh = !target_root.is_dir();
+                std::fs::create_dir_all(&target_journal).map_err(service_io)?;
+                // Hardened only under the service identity; a user-context
+                // caller would lock itself out of the directory.
+                if fresh && mirage_crypto::file_acl::running_as_local_system() {
+                    mirage_crypto::file_acl::restrict_directory_to_system_admins(&target_root)?;
+                }
+            } else {
+                std::fs::create_dir_all(&target_journal).map_err(service_io)?;
+            }
+            // Only this volume's payloads move; the default journal directory
+            // is shared with other volumes and must not be drained.
+            let referenced = self.database.referenced_payload_ids(repository_id)?;
+            let mut copied: Vec<PathBuf> = Vec::new();
+            let mut sources: Vec<PathBuf> = Vec::new();
+            let mut copy_all = || -> Result<(), MirageError> {
+                for payload_id in &referenced {
+                    let name = format!("{}.payload", hex16(payload_id));
+                    let source = source_journal.join(&name);
+                    let Ok(metadata) = std::fs::metadata(&source) else {
+                        continue; // evicted (remote-only) payload: nothing local to move
+                    };
+                    let destination = target_journal.join(&name);
+                    std::fs::copy(&source, &destination).map_err(service_io)?;
+                    copied.push(destination.clone());
+                    let (source_hash, destination_hash) =
+                        (blake3_file(&source)?, blake3_file(&destination)?);
+                    let destination_len =
+                        std::fs::metadata(&destination).map_err(service_io)?.len();
+                    if destination_len != metadata.len() || source_hash != destination_hash {
+                        return Err(MirageError::integrity_mismatch(format!(
+                            "cache payload {name} did not copy intact"
+                        )));
+                    }
+                    moved_files += 1;
+                    moved_bytes += metadata.len();
+                    sources.push(source);
+                }
+                Ok(())
+            };
+            if let Err(error) = copy_all() {
+                for path in &copied {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+            let record = if target_root == state_root {
+                None
+            } else {
+                Some(target_root.to_string_lossy().into_owned())
+            };
+            self.database
+                .set_repository_cache_root(repository_id, record.as_deref(), now_ns())?;
+            for source in &sources {
+                let _ = std::fs::remove_file(source);
+            }
+            crate::logging::log_event(
+                "cache.relocated",
+                &format!(
+                    "{repository_id} -> {} ({moved_files} payloads, {moved_bytes} bytes)",
+                    target_root.display()
+                ),
+            );
+        }
+        Ok(ResponseBody::Json(json!({
+            "repository_id": repository_id.to_string(),
+            "cache_root": target_root.to_string_lossy(),
+            "cache_disk_root": disk_space::volume_root_of(&target_root).ok(),
+            "changed": !unchanged,
+            "moved_payloads": moved_files,
+            "moved_bytes": moved_bytes,
+        })))
     }
 
     fn acquire_capacity(
@@ -642,6 +781,10 @@ impl RequestHandler for ControlPlaneHandler {
                 repository_id,
                 managed,
             } => self.set_volume_mode(repository_id, managed),
+            Command::RepositorySetCacheRoot {
+                repository_id,
+                cache_root,
+            } => self.set_cache_root(repository_id, cache_root.as_deref()),
             Command::Mount {
                 repository_id,
                 generation,
@@ -900,6 +1043,11 @@ impl ControlPlaneHandler {
         }
         let ((volume_total_bytes, volume_free_bytes), dirty_budget) =
             managed_capacity(&self.database, repository_id, &index, managed)?;
+        let journal_root = if managed {
+            runtime::prepare_journal_root(&self.database, repository_id)?
+        } else {
+            None
+        };
         self.database.set_repository_state(
             repository_id,
             state,
@@ -923,12 +1071,13 @@ impl ControlPlaneHandler {
                     .as_ref()
                     .map(|(manifest, key)| (manifest.as_path(), key.as_path())),
                 if managed {
-                    state_root_disk_floor(&self.database)
+                    cache_disk_floor(&self.database, repository_id)
                 } else {
                     None
                 },
                 &display_name,
                 dirty_budget,
+                journal_root.as_deref(),
             );
         if let Err(error) = mounted {
             let _ = runtime::clear_mount_record(&self.database, repository_id);
@@ -1009,7 +1158,7 @@ impl ControlPlaneHandler {
     }
 
     /// Forwards a bearer token to the repository's live filesystem host; the
-    /// token is never persisted — it leaves the service on the host's stdin.
+    /// token is never persisted â€” it leaves the service on the host's stdin.
     fn supply_drive_token(
         &self,
         repository_id: RepositoryId,
@@ -1082,7 +1231,7 @@ impl ControlPlaneHandler {
             let mut shadow_packs = 0_u64;
             let mut published_payloads = 0_u64;
             // Managed journal payloads physically live under the service
-            // state root — attribute them to that volume like reclaim does,
+            // state root â€” attribute them to that volume like reclaim does,
             // not to each repository's native_root.
             let state_root_volume = runtime::service_state_root(&self.database)
                 .ok()
@@ -1265,10 +1414,11 @@ impl ControlPlaneHandler {
                     break;
                 }
                 if repository.state == RepositoryState::ReadyMounted {
-                    // The managed journal lives under the service state root;
-                    // only hosts whose journal volume matches may evict.
-                    let state_root = runtime::service_state_root(&self.database)?;
-                    if disk_space::volume_root_of(&state_root).ok().as_deref()
+                    // Only hosts whose journal (cache root) disk matches the
+                    // floor's disk may evict for it.
+                    let cache_root =
+                        runtime::repository_cache_root(&self.database, repository.repository_id)?;
+                    if disk_space::volume_root_of(&cache_root).ok().as_deref()
                         != Some(floor.volume_root.as_str())
                     {
                         continue;
@@ -1372,7 +1522,7 @@ impl ControlPlaneHandler {
             explorer_drive_icon::unregister(&owner_sid, &record.mount_point);
             explorer_drive_icon::unregister_verbs(&owner_sid, &record.mount_point);
         }
-        // Payload ids that belonged to this volume — after the rows are gone
+        // Payload ids that belonged to this volume â€” after the rows are gone
         // their journal files are pure orphans, so delete them now rather
         // than waiting for the next startup sweep.
         let owned_payloads = self
@@ -1432,8 +1582,8 @@ impl ControlPlaneHandler {
             .map_or(database_mount_root.as_path(), |record| {
                 record.mount_point.as_path()
             });
-        // Lifecycle ordering: quiesce → flush fence over committed journal
-        // operations → unmount. A flush failure blocks the unmount rather
+        // Lifecycle ordering: quiesce â†’ flush fence over committed journal
+        // operations â†’ unmount. A flush failure blocks the unmount rather
         // than silently dropping the durability boundary.
         mirage_engine::journal::LocalJournal::new(self.database.clone(), repository_id)
             .flush_fence(now_ns())?;
@@ -1703,6 +1853,18 @@ fn random_space_lease_id() -> Result<mirage_types::SpaceLeaseId, MirageError> {
     Ok(mirage_types::SpaceLeaseId::from_bytes(bytes))
 }
 
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// BLAKE3 of a whole file, streamed â€” cache payloads are up to 32 MiB.
+fn blake3_file(path: &Path) -> Result<[u8; 32], MirageError> {
+    let mut file = std::fs::File::open(path).map_err(service_io)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).map_err(service_io)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn service_io(error: std::io::Error) -> MirageError {
     MirageError::new(
         mirage_types::MirageErrorKind::Io,
@@ -1759,6 +1921,7 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::RepositoryRestoreNative { repository_id, .. }
         | Command::RepositorySetDriveOrigin { repository_id, .. }
         | Command::RepositorySetVolumeMode { repository_id, .. }
+        | Command::RepositorySetCacheRoot { repository_id, .. }
         | Command::Mount { repository_id, .. }
         | Command::DriveTokenSupply { repository_id, .. }
         | Command::Unmount { repository_id }
@@ -1830,11 +1993,11 @@ fn managed_capacity(
     Ok(((total.max(budget), budget), None))
 }
 
-/// The configured disk floor for the volume holding the service state root
-/// (where managed journals live), if any.
-fn state_root_disk_floor(database: &Database) -> Option<u64> {
-    let state_root = runtime::service_state_root(database).ok()?;
-    let root = disk_space::volume_root_of(&state_root).ok()?;
+/// The configured disk floor for the disk holding the repository's journal
+/// (its cache root, or the service state root by default), if any.
+fn cache_disk_floor(database: &Database, repository_id: RepositoryId) -> Option<u64> {
+    let cache_root = runtime::repository_cache_root(database, repository_id).ok()?;
+    let root = disk_space::volume_root_of(&cache_root).ok()?;
     database
         .disk_floor(&root)
         .ok()?

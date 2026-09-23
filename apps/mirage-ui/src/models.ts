@@ -21,6 +21,11 @@ export type RepositoryState = {
   volumeMode?: string;
   origin?: string;
   mountPath?: string;
+  cacheRoot?: string;
+  cacheDiskRoot?: string;
+  cacheDiskFreeBytes?: number | null;
+  cacheDiskTotalBytes?: number | null;
+  cacheDiskFloorBytes?: number | null;
 };
 
 export type Readiness = {
@@ -48,6 +53,8 @@ export type DisksPayload = {
   default_letter: string;
   default_budget_bytes: number;
   free_letters?: string[];
+  /// Disk root that will hold the local cache unless the user picks another.
+  default_cache_disk?: string | null;
 };
 
 export type DriveStatus = {
@@ -78,6 +85,20 @@ export type VolumeCreateStatus = {
   name?: string;
   budget_bytes?: number;
   account_id?: string;
+  cache_root?: string | null;
+};
+
+export type VolumeSetCacheStatus = {
+  in_flight?: boolean;
+  step?: string;
+  done?: boolean;
+  error?: string;
+  repository_id?: string;
+  cache_root?: string;
+  cache_disk_root?: string | null;
+  moved_payloads?: number;
+  moved_bytes?: number;
+  remounted?: boolean;
 };
 
 export type ServiceSnapshot = {
@@ -104,6 +125,11 @@ export type ServiceRepository = {
   volume_mode?: string;
   origin?: string;
   mount_path?: string;
+  cache_root?: string;
+  cache_disk_root?: string;
+  cache_disk_free_bytes?: number;
+  cache_disk_total_bytes?: number;
+  cache_disk_floor_bytes?: number;
 };
 
 export type StatusPayload = {
@@ -187,6 +213,7 @@ export type IpcCommand =
   | { command: 'namespace_unpin'; body: { repository_id: string; path: string } }
   | { command: 'namespace_pins'; body: { repository_id: string } }
   | { command: 'disk_status' }
+  | { command: 'disk_floor_set'; body: { volume_root: string; floor_bytes: number } }
   | { command: 'disk_reclaim_now' };
 
 export type Request = {

@@ -1,7 +1,7 @@
-import { ArrowSquareOut, Broom, FolderOpen, Info, PushPin, SpinnerGap } from '@phosphor-icons/react';
+import { ArrowSquareOut, Broom, FolderOpen, HardDrives, Info, PushPin, SpinnerGap } from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
 import type { ServiceClient } from '../api/client';
-import type { RepositoryState } from '../models';
+import type { DiskInfo, RepositoryState, VolumeSetCacheStatus } from '../models';
 import { formatBytes } from '../components/CapsuleBreakdown';
 
 /** Card shown for a managed Drive-backed volume: letter, staged/pending
@@ -75,7 +75,11 @@ export function DriveCard({
               </div>
             );
           })()}
-          <FloorSentence client={client} />
+          {repository.cacheDiskRoot ? (
+            <CacheLocation client={client} repository={repository} busy={busy || Boolean(working)} onChanged={onChanged} />
+          ) : (
+            <FloorSentence client={client} />
+          )}
         </div>
         <div className="button-row">
           {letter && repository.mounted && (
@@ -184,6 +188,128 @@ export function DriveCard({
       : [];
     setPins(list);
   }
+}
+
+const GIB = 1 << 30;
+
+/** Where this drive keeps its local cache, how much room that disk has, the
+ * floor guarding it — with the controls to move the cache to another disk
+ * and to change the floor. */
+function CacheLocation({ client, repository, busy, onChanged }: {
+  client: ServiceClient;
+  repository: RepositoryState;
+  busy: boolean;
+  onChanged: (notice?: string, error?: string) => void;
+}) {
+  const [disks, setDisks] = useState<DiskInfo[]>();
+  const [choosing, setChoosing] = useState(false);
+  const [target, setTarget] = useState('');
+  const [move, setMove] = useState<VolumeSetCacheStatus>();
+  const [editingFloor, setEditingFloor] = useState(false);
+  const [floorGib, setFloorGib] = useState(Math.max(1, Math.round((repository.cacheDiskFloorBytes ?? 20 * GIB) / GIB)));
+  const [floorError, setFloorError] = useState<string>();
+  const diskRoot = repository.cacheDiskRoot ?? '';
+  const free = repository.cacheDiskFreeBytes ?? undefined;
+  const floor = repository.cacheDiskFloorBytes ?? undefined;
+  const room = free !== undefined && floor !== undefined ? free - floor : undefined;
+
+  useEffect(() => {
+    if (!choosing || disks) return;
+    void client.disks().then((payload) => {
+      setDisks(payload.disks);
+      setTarget(payload.disks.find((disk) => disk.volume_root !== diskRoot)?.volume_root ?? '');
+    }).catch((failure) => onChanged(undefined, failure instanceof Error ? failure.message : String(failure)));
+  }, [choosing, disks, client, diskRoot, onChanged]);
+
+  // Poll the move until the host reports it finished.
+  useEffect(() => {
+    if (!move?.in_flight) return;
+    const tick = async () => {
+      try {
+        const next = await client.volumeSetCacheStatus();
+        setMove(next);
+        if (next.in_flight) { window.setTimeout(() => void tick(), 1000); return; }
+        if (next.done) onChanged(`Local cache moved to ${next.cache_disk_root ?? next.cache_root ?? 'the new disk'}${next.remounted ? ' and the drive is back' : ''}.`);
+        else onChanged(undefined, next.error ?? 'The cache move did not finish.');
+      } catch (failure) {
+        setMove({ in_flight: false, error: failure instanceof Error ? failure.message : String(failure) });
+      }
+    };
+    window.setTimeout(() => void tick(), 1000);
+  }, [move?.in_flight, client, onChanged]);
+
+  const startMove = async () => {
+    if (!target || target === diskRoot) return;
+    try {
+      await client.volumeSetCache({ repository_id: repository.id, cache_disk: target });
+      setMove({ in_flight: true, step: 'starting' });
+      setChoosing(false);
+    } catch (failure) {
+      onChanged(undefined, failure instanceof Error ? failure.message : String(failure));
+    }
+  };
+
+  const saveFloor = async () => {
+    setFloorError(undefined);
+    const bytes = Math.max(1, floorGib) * GIB;
+    try {
+      await client.diskFloorSet(diskRoot, bytes);
+      setEditingFloor(false);
+      onChanged(`MirageSSD now always keeps ${formatBytes(bytes)} free on ${diskRoot}.`);
+    } catch (failure) {
+      setFloorError(failure instanceof Error ? failure.message : String(failure));
+    }
+  };
+
+  const moving = Boolean(move?.in_flight);
+  return (
+    <div className="cache-location">
+      <p className="floor-sentence">
+        <HardDrives size={14} /> Local cache on <strong>{diskRoot}</strong>
+        {free !== undefined && ` · ${formatBytes(free)} free`}
+        {floor !== undefined ? ` · always keeps ${formatBytes(floor)} free` : ' · no free-space floor'}
+        {room !== undefined && room <= 0 && (
+          <span className="text-amber-300"> · nothing more can be kept locally until {diskRoot} has more than {formatBytes(floor ?? 0)} free</span>
+        )}
+      </p>
+      <div className="button-row">
+        {!choosing ? (
+          <button className="quiet-button" disabled={busy || moving} onClick={() => setChoosing(true)}>
+            Move cache…
+          </button>
+        ) : (
+          <div className="confirm-panel" role="dialog" aria-label="Move local cache">
+            <p>Move the local cache to another disk. The drive disconnects briefly while files are copied and verified, then comes back.</p>
+            <select aria-label="Target disk" value={target} onChange={(event) => setTarget(event.target.value)} disabled={moving}>
+              {(disks ?? []).filter((disk) => disk.volume_root !== diskRoot).map((disk) => (
+                <option key={disk.volume_root} value={disk.volume_root}>{disk.volume_root} — {formatBytes(disk.free_bytes)} free of {formatBytes(disk.total_bytes)}</option>
+              ))}
+            </select>
+            <div className="button-row">
+              <button className="quiet-button" disabled={moving} onClick={() => setChoosing(false)}>Cancel</button>
+              <button className="secondary-button" disabled={moving || !target} onClick={() => void startMove()}>Move to {target || '…'}</button>
+            </div>
+          </div>
+        )}
+        {!editingFloor ? (
+          <button className="quiet-button" disabled={busy || moving} onClick={() => setEditingFloor(true)}>
+            Change floor
+          </button>
+        ) : (
+          <form className="pin-form" onSubmit={(event) => { event.preventDefault(); void saveFloor(); }}>
+            <label>
+              <span className="sr-only">Always keep free on {diskRoot}, in GiB</span>
+              <input type="number" min={1} max={65536} value={floorGib} onChange={(event) => setFloorGib(Math.max(1, Number(event.target.value)))} aria-label="Free-space floor in GiB" />
+            </label>
+            <button type="submit" className="quiet-button">Keep {floorGib} GiB free on {diskRoot}</button>
+            <button type="button" className="quiet-button" onClick={() => setEditingFloor(false)}>Cancel</button>
+          </form>
+        )}
+      </div>
+      {floorError && <p className="text-xs text-rose-300" role="alert">{floorError}</p>}
+      {moving && <p className="upload-live" role="status"><SpinnerGap size={13} className="refreshing" /> {move?.step ?? 'Moving'}…</p>}
+    </div>
+  );
 }
 
 /** One-line floor status under the drive card: which disk is protected and

@@ -40,6 +40,9 @@ public:
     // remote (Drive) capacity to Windows and keep the budget internal.
     void set_dirty_budget(std::uint64_t bytes) noexcept { dirty_budget_ = bytes; }
     bool advertises_remote_capacity() const noexcept { return dirty_budget_ != 0; }
+    // Journal payload directory on the user's chosen cache disk (--journal-root);
+    // empty keeps the engine default <state-root>\journal.
+    void set_journal_root(const std::wstring& root) { journal_root_ = root; }
     void begin_pending() noexcept;
     void end_pending() noexcept;
 private:
@@ -57,6 +60,7 @@ private:
     std::uint64_t volume_total_bytes_{1};
     std::uint64_t volume_free_bytes_{};
     std::uint64_t dirty_budget_{};
+    std::wstring journal_root_{};
     std::wstring label_{L"MirageSSD"};
 };
 void release_file_context(FileContext*) noexcept;

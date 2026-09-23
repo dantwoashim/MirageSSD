@@ -536,6 +536,7 @@ impl MountControl for FakeMountControl {
         _: Option<u64>,
         _: &str,
         _: Option<u64>,
+        _: Option<&Path>,
     ) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("mount");
         Ok(())
@@ -717,4 +718,140 @@ fn namespace_pin_unpin_list_round_trip() {
         ),
     );
     assert!(matches!(again, ResponseBody::Error { .. }), "{again:?}");
+}
+
+#[test]
+fn cache_root_move_copies_verifies_records_and_is_refused_while_mounted() {
+    let directory = tempfile::tempdir().expect("directory");
+    let database = Database::open(&directory.path().join("control.db")).expect("database");
+    let repository_id = RepositoryId::from_bytes([0x77; 16]);
+    database
+        .create_repository(NewRepository {
+            repository_id,
+            display_name: "cache fixture".into(),
+            local_root: directory.path().join("repository"),
+            owner_sid: "S-1-5-18".into(),
+            content_encrypted: false,
+            initial_state: RepositoryState::ReadyUnmounted,
+            created_at_ns: 1,
+        })
+        .expect("repository");
+    // One dirty extent referencing a payload that physically exists in the
+    // default journal, plus an unrelated file that must never move.
+    let payload_id = [0xAB; 16];
+    let inode = mirage_types::InodeId::from_bytes([0x11; 16]);
+    database
+        .writer()
+        .extent_replace(
+            repository_id,
+            inode,
+            1,
+            vec![mirage_db::ByteExtent {
+                extent_id: [0x01; 16],
+                volume_id: repository_id,
+                inode,
+                version: 1,
+                start: 0,
+                length: 5,
+                kind: mirage_db::ExtentKind::Dirty,
+                page_hash: None,
+                base_offset: None,
+                payload_id: Some(payload_id),
+                payload_offset: Some(0),
+                created_ns: 1,
+            }],
+            1,
+        )
+        .expect("extent");
+    let default_journal = directory.path().join("journal");
+    std::fs::create_dir_all(&default_journal).expect("journal");
+    let payload_name = format!("{}.payload", "ab".repeat(16));
+    std::fs::write(default_journal.join(&payload_name), b"hello").expect("payload");
+    std::fs::write(default_journal.join("other-volume.payload"), b"stay").expect("other payload");
+    let handler = ControlPlaneHandler::new(database.clone());
+
+    // A directory target on this (fixed) disk: the same disk the temp dir is on.
+    let target = directory.path().join("cache-on-d");
+    let moved = handler.handle(
+        &principal(),
+        request(
+            1,
+            Command::RepositorySetCacheRoot {
+                repository_id,
+                cache_root: Some(target.to_string_lossy().into_owned()),
+            },
+        ),
+    );
+    let ResponseBody::Json(moved) = moved else {
+        panic!("move must succeed: {moved:?}");
+    };
+    assert_eq!(moved["changed"], true);
+    assert_eq!(moved["moved_payloads"], 1);
+    assert_eq!(moved["moved_bytes"], 5);
+    assert_eq!(
+        std::fs::read(target.join("journal").join(&payload_name)).expect("moved payload"),
+        b"hello"
+    );
+    assert!(
+        !default_journal.join(&payload_name).exists(),
+        "old copy is removed only after the record lands"
+    );
+    assert!(
+        default_journal.join("other-volume.payload").exists(),
+        "payloads of other volumes are never touched"
+    );
+    assert_eq!(
+        database
+            .repository_cache_root(repository_id)
+            .unwrap()
+            .as_deref(),
+        Some(target.to_string_lossy().as_ref())
+    );
+    let detail = handler.handle(
+        &principal(),
+        request(2, Command::RepositoryDetail { repository_id }),
+    );
+    let ResponseBody::Json(detail) = detail else {
+        panic!("detail: {detail:?}");
+    };
+    assert_eq!(detail["cache_root"], target.to_string_lossy().as_ref());
+    assert!(
+        detail["cache_disk_root"]
+            .as_str()
+            .is_some_and(|root| root.ends_with(":\\")),
+        "{detail}"
+    );
+
+    // Mounted volumes refuse the move.
+    database
+        .set_repository_state(
+            repository_id,
+            RepositoryState::ReadyUnmounted,
+            mirage_types::RepositoryEvent::MountRequested,
+            2,
+        )
+        .expect("mount requested");
+    database
+        .set_repository_state(
+            repository_id,
+            RepositoryState::Mounting,
+            mirage_types::RepositoryEvent::MountSucceeded,
+            3,
+        )
+        .expect("mounted");
+    let refused = handler.handle(
+        &principal(),
+        request(
+            3,
+            Command::RepositorySetCacheRoot {
+                repository_id,
+                cache_root: None,
+            },
+        ),
+    );
+    assert!(
+        matches!(refused, ResponseBody::Error { ref code, .. } if code == "MIRAGE_REPOSITORY_CONFLICT"),
+        "mounted move must be refused: {refused:?}"
+    );
+    assert!(target.join("journal").join(&payload_name).exists());
 }

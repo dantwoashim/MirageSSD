@@ -13,6 +13,7 @@ import {
   type ServiceSnapshot,
   type UpdateCheck,
   type VolumeCreateStatus,
+  type VolumeSetCacheStatus,
 } from '../models';
 import { record } from '../presentation';
 
@@ -329,13 +330,25 @@ export class ServiceClient {
     await this.apiPost('/api/drive/logout');
   }
 
-  async volumeCreate(payload: { name: string; letter: string; budget_bytes: number; floor_bytes?: number }): Promise<void> {
+  async volumeCreate(payload: { name: string; letter: string; budget_bytes: number; floor_bytes?: number; cache_disk?: string }): Promise<void> {
     const value = await this.apiPost('/api/volume/create', payload);
     if (record(value) && typeof value.error === 'string') throw new Error(value.error);
   }
 
   async volumeCreateStatus(): Promise<VolumeCreateStatus> {
     return await this.apiGet('/api/volume/create-status') as VolumeCreateStatus;
+  }
+
+  /// Move a volume's local cache to another disk (the host unmounts,
+  /// relocates with verification, and remounts); poll volumeSetCacheStatus.
+  async volumeSetCache(payload: { repository_id: string; cache_disk?: string }): Promise<void> {
+    const value = await this.apiPost('/api/volume/set-cache', payload);
+    if (record(value) && typeof value.error === 'string') throw new Error(value.error);
+    if (record(value) && value.in_flight === true && value.started !== true) throw new Error('Another cache move is already running.');
+  }
+
+  async volumeSetCacheStatus(): Promise<VolumeSetCacheStatus> {
+    return await this.apiGet('/api/volume/set-cache-status') as VolumeSetCacheStatus;
   }
 
   async openExplorer(letter: string): Promise<void> {
@@ -361,6 +374,11 @@ export class ServiceClient {
 
   async diskReclaimNow(): Promise<unknown> {
     return await this.invoke({ command: 'disk_reclaim_now' });
+  }
+
+  /// Set the always-keep-free floor for a disk root such as `D:\`.
+  async diskFloorSet(volumeRoot: string, floorBytes: number): Promise<unknown> {
+    return await this.invoke({ command: 'disk_floor_set', body: { volume_root: volumeRoot, floor_bytes: floorBytes } });
   }
 }
 
@@ -390,5 +408,10 @@ function normalizeRepository(value: unknown) {
     volumeMode: repository.volume_mode,
     origin: repository.origin,
     mountPath: repository.mount_path,
+    cacheRoot: repository.cache_root,
+    cacheDiskRoot: repository.cache_disk_root,
+    cacheDiskFreeBytes: size(repository.cache_disk_free_bytes),
+    cacheDiskTotalBytes: size(repository.cache_disk_total_bytes),
+    cacheDiskFloorBytes: size(repository.cache_disk_floor_bytes),
   };
 }

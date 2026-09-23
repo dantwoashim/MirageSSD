@@ -120,6 +120,58 @@ pub(crate) fn allocated_file_bytes(_path: &Path) -> Result<u64, MirageError> {
     ))
 }
 
+/// What kind of drive a root such as `D:\` is, for cache-placement checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriveKind {
+    Fixed,
+    Other,
+}
+
+/// Classifies a drive root; a MirageSSD (WinFsp) drive reports itself with
+/// the `MirageSSD` filesystem name and is never a valid cache location.
+#[cfg(windows)]
+pub(crate) fn drive_kind(root: &Path) -> Result<DriveKind, MirageError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
+    const DRIVE_FIXED: u32 = 3;
+    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the root is NUL-terminated and lives for the call.
+    let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+    if kind != DRIVE_FIXED {
+        return Ok(DriveKind::Other);
+    }
+    let mut fs_name = vec![0_u16; 64];
+    // SAFETY: all output pointers are valid for the sizes given; unused outputs are null.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(MirageError::from(std::io::Error::last_os_error()));
+    }
+    let len = fs_name.iter().position(|v| *v == 0).unwrap_or(0);
+    let name = String::from_utf16_lossy(&fs_name[..len]);
+    if name.eq_ignore_ascii_case("MirageSSD") {
+        return Ok(DriveKind::Other);
+    }
+    Ok(DriveKind::Fixed)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn drive_kind(_root: &Path) -> Result<DriveKind, MirageError> {
+    Err(MirageError::provider_unavailable(
+        "drive classification is currently available only on Windows",
+    ))
+}
+
 /// The volume mount root (e.g. `D:\`) containing `path`, upper-cased.
 #[cfg(windows)]
 pub(crate) fn volume_root_of(path: &Path) -> Result<String, MirageError> {
@@ -260,6 +312,24 @@ pub(crate) fn query(_path: &Path) -> Result<VolumeSpace, MirageError> {
     Err(MirageError::provider_unavailable(
         "physical volume accounting is currently available only on Windows NTFS",
     ))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_root_of_a_fresh_directory_is_its_drive_root() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let nested = directory.path().join("cache-on-disk");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let root = volume_root_of(&nested).expect("volume root");
+        assert!(root.ends_with(":\\"), "{root}");
+        assert_eq!(
+            drive_kind(Path::new(&root)).expect("kind"),
+            DriveKind::Fixed
+        );
+    }
 }
 
 // Test-only free-space injection: `FREE_BYTES_OVERRIDE` pins the baseline,

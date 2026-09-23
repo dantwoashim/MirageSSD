@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use mirage_ffi::{
     MirageEngineHandle, MirageFileHandle, MirageFileInfo, MirageStatus,
-    mirage_engine_abandon_for_tests, mirage_engine_create_managed, mirage_engine_destroy,
-    mirage_engine_mark_mounted, mirage_enumerate, mirage_file_close, mirage_file_stat,
-    mirage_flush, mirage_lookup, mirage_namespace_create, mirage_read, mirage_set_times,
-    mirage_truncate, mirage_write,
+    mirage_engine_abandon_for_tests, mirage_engine_create_managed,
+    mirage_engine_create_managed_drive_at, mirage_engine_destroy, mirage_engine_mark_mounted,
+    mirage_enumerate, mirage_file_close, mirage_file_stat, mirage_flush, mirage_lookup,
+    mirage_namespace_create, mirage_read, mirage_set_times, mirage_truncate, mirage_write,
 };
 use mirage_manifest::FileClass;
 use mirage_pack::{ImportPlan, PlannedFile, import_local};
@@ -413,4 +413,82 @@ fn idle_seal_during_active_writes_never_deadlocks() {
     assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
     done.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Engine whose journal payloads live in journal_root (the user's cache
+/// disk) instead of <state_root>/journal.
+fn managed_engine_at(
+    index: &Path,
+    state_root: &Path,
+    journal_root: &Path,
+    budget: u64,
+) -> *mut MirageEngineHandle {
+    let index16: Vec<u16> = index.to_string_lossy().encode_utf16().collect();
+    let root16: Vec<u16> = state_root.to_string_lossy().encode_utf16().collect();
+    let journal16: Vec<u16> = journal_root.to_string_lossy().encode_utf16().collect();
+    let mut engine: *mut MirageEngineHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            mirage_engine_create_managed_drive_at(
+                index16.as_ptr(),
+                index16.len(),
+                root16.as_ptr(),
+                root16.len(),
+                std::ptr::null(),
+                0,
+                budget,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                journal16.as_ptr(),
+                journal16.len(),
+                &mut engine,
+            )
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(
+        unsafe { mirage_engine_mark_mounted(engine) },
+        MirageStatus::Ok
+    );
+    engine
+}
+
+#[test]
+fn custom_journal_root_holds_the_payloads_and_survives_remount() {
+    let (_objects, index) = build_index();
+    let state = tempfile::tempdir().expect("state");
+    let cache = tempfile::tempdir().expect("cache disk");
+    let journal_root = cache.path().join("MirageSSD").join("journal");
+    std::fs::create_dir_all(&journal_root).expect("journal root");
+    let data: Vec<u8> = (0..(3u32 << 20)).map(|i| (i % 251) as u8).collect();
+
+    let engine = managed_engine_at(&index, state.path(), &journal_root, 64 << 20);
+    let file = create_and_open(engine, "\\on-d.bin");
+    assert_eq!(write(file, 0, &data), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(
+        payload_files(&journal_root).len(),
+        1,
+        "payload lands on the cache disk"
+    );
+    assert!(
+        payload_files(&state.path().join("journal")).is_empty(),
+        "nothing is written under the state root"
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+
+    // Remount with the same journal root: the bytes are still there.
+    let engine = managed_engine_at(&index, state.path(), &journal_root, 64 << 20);
+    let file = open_existing(engine, "\\on-d.bin");
+    assert_eq!(stat(file).size, data.len() as u64);
+    assert_eq!(read_exact(file, 0, data.len()), data);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(
+        payload_files(&journal_root).len(),
+        1,
+        "remount sweep keeps referenced payloads"
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
