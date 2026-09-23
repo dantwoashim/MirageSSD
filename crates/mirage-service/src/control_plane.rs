@@ -100,13 +100,23 @@ impl ControlPlaneHandler {
                 .ok_or_else(|| {
                     MirageError::integrity_mismatch("repository owner SID is missing")
                 })?;
-            let capacity =
+            let (mut volume_total_bytes, mut volume_free_bytes) =
                 runtime::volume_capacity(&self.database, repository.repository_id, &index)?;
             let origin_root = local_origin_root(&self.database, repository.repository_id)?;
             let managed = self
                 .database
                 .load_repository_volume_mode(repository.repository_id)?
                 == Some(mirage_db::VolumeMode::Managed);
+            // Same budget rule as an explicit mount: a managed volume without
+            // a Drive quota snapshot advertises its reviewed cache budget,
+            // otherwise Explorer shows "0 bytes free of 0 bytes" and every
+            // write is refused after a reboot.
+            if managed && volume_free_bytes == 0 {
+                volume_free_bytes =
+                    runtime::load_config(&self.database, repository.repository_id)?.cache_bytes;
+                volume_total_bytes = volume_total_bytes.max(volume_free_bytes);
+            }
+            let capacity = (volume_total_bytes, volume_free_bytes);
             let drive_provider =
                 drive_provider_paths(&self.database, repository.repository_id, managed)?;
             crate::logging::log_event(
@@ -135,6 +145,14 @@ impl ControlPlaneHandler {
                     },
                     &repository.display_name,
                 )?;
+            // Restored letters get the same Explorer icon and shell verbs as
+            // an explicit mount; failures are cosmetic only.
+            explorer_drive_icon::register(&owner_sid, &mount_point);
+            explorer_drive_icon::register_verbs(
+                &owner_sid,
+                &mount_point,
+                &repository.repository_id.to_string(),
+            );
             crate::logging::log_event(
                 "mount.restored_volume",
                 &format!("{} at {}", repository.repository_id, mount_point.display()),

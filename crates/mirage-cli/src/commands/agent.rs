@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use mirage_types::{GenerationId, MirageError, RepositoryId};
 
-use super::{backend_login, drive_live, service, volume};
+use super::{backend_login, drive_live, service};
 
 const REFRESH_SECONDS: u64 = 45 * 60;
 const RETRY_SECONDS: u64 = 60;
@@ -101,11 +101,16 @@ fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
                 }
             }
             Some("ready_unmounted") => {
+                // Only volumes the user had mounted come back by themselves;
+                // a volume that was never mounted or was unmounted on purpose
+                // has no recorded letter and stays as the user left it.
+                let Some(letter) = recorded_letter(&detail) else {
+                    continue;
+                };
                 let Some(generation) = detail["active_generation"].as_u64() else {
                     log.line(&format!("{id_text}: no active generation; skipping mount"));
                     continue;
                 };
-                let letter = mount_letter(repository_id, &detail);
                 let token =
                     mirage_ipc::SensitiveString::new(session.access_token.as_str().to_owned())?;
                 match service::request_json(mirage_ipc::Command::Mount {
@@ -124,20 +129,13 @@ fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
     Ok(())
 }
 
-/// Prefer the letter recorded in the volume's mount record; otherwise the
-/// first free letter from M.
-fn mount_letter(repository_id: RepositoryId, detail: &serde_json::Value) -> String {
-    if let Some(letter) = detail["mount_point"]
+/// The Explorer letter recorded by the volume's last mount, if any.
+fn recorded_letter(detail: &serde_json::Value) -> Option<String> {
+    detail["mount_point"]
         .as_str()
         .and_then(|point| point.chars().next())
         .filter(|letter| letter.is_ascii_alphabetic())
-    {
-        return letter.to_ascii_uppercase().to_string();
-    }
-    let _ = repository_id;
-    volume::first_free_letter()
-        .map(|letter| letter.to_string())
-        .unwrap_or_else(|_| "M".to_owned())
+        .map(|letter| letter.to_ascii_uppercase().to_string())
 }
 
 /// Registers `mirage.exe agent` under the per-user Run key so volumes
