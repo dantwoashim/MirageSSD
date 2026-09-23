@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 authors = ["MirageSSD Contributors"]
 license = "Apache-2.0"
@@ -44,27 +44,27 @@ unsafe_code = "deny"
 
 [workspace.dependencies]
 # Workspace internal crates
-mirage-types = { path = "crates/mirage-types", version = "0.1.9" }
-mirage-config = { path = "crates/mirage-config", version = "0.1.9" }
-mirage-backend = { path = "crates/mirage-backend", version = "0.1.9" }
-mirage-backend-local = { path = "crates/mirage-backend-local", version = "0.1.9" }
-mirage-cache = { path = "crates/mirage-cache", version = "0.1.9" }
-mirage-engine = { path = "crates/mirage-engine", version = "0.1.9" }
-mirage-manifest = { path = "crates/mirage-manifest", version = "0.1.9" }
-mirage-index = { path = "crates/mirage-index", version = "0.1.9" }
-mirage-db = { path = "crates/mirage-db", version = "0.1.9" }
-mirage-pack = { path = "crates/mirage-pack", version = "0.1.9" }
-mirage-predictor = { path = "crates/mirage-predictor", version = "0.1.9" }
-mirage-simulator = { path = "crates/mirage-simulator", version = "0.1.9" }
-mirage-scheduler = { path = "crates/mirage-scheduler", version = "0.1.9" }
-mirage-ffi = { path = "crates/mirage-ffi", version = "0.1.9" }
-mirage-service = { path = "crates/mirage-service", version = "0.1.9" }
-mirage-crypto = { path = "crates/mirage-crypto", version = "0.1.9" }
-mirage-backend-drive = { path = "crates/mirage-backend-drive", version = "0.1.9" }
-mirage-etw = { path = "crates/mirage-etw", version = "0.1.9" }
-mirage-ipc = { path = "crates/mirage-ipc", version = "0.1.9" }
-mirage-cli = { path = "crates/mirage-cli", version = "0.1.9" }
-mirage-observability = { path = "crates/mirage-observability", version = "0.1.9" }
+mirage-types = { path = "crates/mirage-types", version = "0.1.10" }
+mirage-config = { path = "crates/mirage-config", version = "0.1.10" }
+mirage-backend = { path = "crates/mirage-backend", version = "0.1.10" }
+mirage-backend-local = { path = "crates/mirage-backend-local", version = "0.1.10" }
+mirage-cache = { path = "crates/mirage-cache", version = "0.1.10" }
+mirage-engine = { path = "crates/mirage-engine", version = "0.1.10" }
+mirage-manifest = { path = "crates/mirage-manifest", version = "0.1.10" }
+mirage-index = { path = "crates/mirage-index", version = "0.1.10" }
+mirage-db = { path = "crates/mirage-db", version = "0.1.10" }
+mirage-pack = { path = "crates/mirage-pack", version = "0.1.10" }
+mirage-predictor = { path = "crates/mirage-predictor", version = "0.1.10" }
+mirage-simulator = { path = "crates/mirage-simulator", version = "0.1.10" }
+mirage-scheduler = { path = "crates/mirage-scheduler", version = "0.1.10" }
+mirage-ffi = { path = "crates/mirage-ffi", version = "0.1.10" }
+mirage-service = { path = "crates/mirage-service", version = "0.1.10" }
+mirage-crypto = { path = "crates/mirage-crypto", version = "0.1.10" }
+mirage-backend-drive = { path = "crates/mirage-backend-drive", version = "0.1.10" }
+mirage-etw = { path = "crates/mirage-etw", version = "0.1.10" }
+mirage-ipc = { path = "crates/mirage-ipc", version = "0.1.10" }
+mirage-cli = { path = "crates/mirage-cli", version = "0.1.10" }
+mirage-observability = { path = "crates/mirage-observability", version = "0.1.10" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
