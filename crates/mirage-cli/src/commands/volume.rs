@@ -84,7 +84,10 @@ fn used_drive_mask() -> Result<u32, MirageError> {
     ))
 }
 
-/// Free/total bytes for each fixed drive letter (C: through Z:).
+/// Free/total bytes for each local disk that can hold a cache: a fixed drive
+/// formatted NTFS or ReFS. Virtual drives (MirageSSD, rclone, Google Drive
+/// for desktop, network shares, USB sticks) report huge or unstable free space
+/// and must never be picked as the place to keep local data.
 pub fn disks() -> Result<Vec<DiskInfo>, MirageError> {
     let used = used_drive_mask()?;
     let mut disks = Vec::new();
@@ -94,6 +97,9 @@ pub fn disks() -> Result<Vec<DiskInfo>, MirageError> {
             continue;
         }
         let root = PathBuf::from(format!("{letter}:\\"));
+        if !is_local_disk(&root) {
+            continue;
+        }
         let Some((total, free)) = disk_space(&root) else {
             continue;
         };
@@ -107,6 +113,47 @@ pub fn disks() -> Result<Vec<DiskInfo>, MirageError> {
         });
     }
     Ok(disks)
+}
+
+/// A fixed (non-removable, non-network) drive whose file system is NTFS or
+/// ReFS — the file systems a real local disk uses on Windows.
+#[cfg(windows)]
+pub fn is_local_disk(root: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
+    const DRIVE_FIXED: u32 = 3;
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_FIXED {
+        return false;
+    }
+    let mut fs_name = [0_u16; 64];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let len = fs_name.iter().position(|unit| *unit == 0).unwrap_or(0);
+    let name = String::from_utf16_lossy(&fs_name[..len]);
+    name.eq_ignore_ascii_case("NTFS") || name.eq_ignore_ascii_case("ReFS")
+}
+
+#[cfg(not(windows))]
+pub fn is_local_disk(_root: &Path) -> bool {
+    false
 }
 
 #[cfg(windows)]

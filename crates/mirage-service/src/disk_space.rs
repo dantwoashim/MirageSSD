@@ -159,10 +159,14 @@ pub(crate) fn drive_kind(root: &Path) -> Result<DriveKind, MirageError> {
     }
     let len = fs_name.iter().position(|v| *v == 0).unwrap_or(0);
     let name = String::from_utf16_lossy(&fs_name[..len]);
-    if name.eq_ignore_ascii_case("MirageSSD") {
-        return Ok(DriveKind::Other);
+    // Only real local file systems: virtual drives (MirageSSD, rclone and
+    // other WinFsp/Dokan mounts, Google Drive for desktop) also report as
+    // fixed but are never a place to keep local cache data.
+    if name.eq_ignore_ascii_case("NTFS") || name.eq_ignore_ascii_case("ReFS") {
+        Ok(DriveKind::Fixed)
+    } else {
+        Ok(DriveKind::Other)
     }
-    Ok(DriveKind::Fixed)
 }
 
 #[cfg(not(windows))]

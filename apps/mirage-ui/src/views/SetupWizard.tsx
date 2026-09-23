@@ -59,7 +59,7 @@ function ErrorCard({ message }: { message: string }) {
   );
 }
 
-export function SetupWizard({ client, account, onDone }: { client: ServiceClient; account: DriveAccount; onDone: () => void }) {
+export function SetupWizard({ client, account, onDone, autoCreate = false }: { client: ServiceClient; account: DriveAccount; onDone: () => void; autoCreate?: boolean }) {
   const acct = useDriveAccount(account);
   const [step, setStep] = useState<Step>('signin');
   const [disks, setDisks] = useState<DisksPayload>();
@@ -75,6 +75,9 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
   const [error, setError] = useState<string>();
   const [pinState, setPinState] = useState<'idle' | 'done' | 'failed'>('idle');
   const polling = useRef(true);
+  // First drive on a fresh PC: create it as soon as sign-in finishes and the
+  // defaults are known — no extra click. Happens at most once per mount.
+  const autoStarted = useRef(false);
 
   const budgetBytes = budgetValue * unitFactor(budgetUnit);
   const floorBytes = floorValue * unitFactor(floorUnit);
@@ -163,6 +166,14 @@ export function SetupWizard({ client, account, onDone }: { client: ServiceClient
       setError(failure instanceof Error ? failure.message : String(failure));
     }
   };
+
+  useEffect(() => {
+    if (!autoCreate || autoStarted.current || step !== 'create' || disksLoading || !disks || !letter || budgetValue <= 0 || createStatus) return;
+    autoStarted.current = true;
+    void startCreate();
+  // startCreate reads the current form values; the guards above make this run once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoCreate, step, disksLoading, disks, letter, budgetValue, createStatus]);
 
   const pinToQuickAccess = async (driveLetter: string) => {
     try {

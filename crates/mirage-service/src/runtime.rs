@@ -2318,7 +2318,7 @@ pub fn resolve_cache_root_request(
     if crate::disk_space::drive_kind(Path::new(&disk_root))? != crate::disk_space::DriveKind::Fixed
     {
         return Err(MirageError::invalid_argument(
-            "cache location must be on a fixed local disk (not removable, network, or a MirageSSD drive)",
+            "cache location must be a local NTFS or ReFS disk (not removable, network, or a virtual drive such as MirageSSD or Google Drive)",
         ));
     }
     let path = if trimmed.len() <= 3 {

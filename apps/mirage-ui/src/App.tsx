@@ -66,6 +66,14 @@ export function App({ client }: { client: ServiceClient }) {
   const [notice, setNotice] = useState<string>();
   const [lastChecked, setLastChecked] = useState<Date>();
   const driveAccount = useMemo(() => createDriveAccount(client), [client]);
+  // First run: with no drives yet the only useful thing to do is set one up,
+  // so the app opens the setup flow instead of an overview with one button.
+  const firstRunRouted = useRef(false);
+  useEffect(() => {
+    if (!snapshot || firstRunRouted.current) return;
+    firstRunRouted.current = true;
+    if (snapshot.repositories.length === 0 && view === 'overview') setView('setup');
+  }, [snapshot, view]);
 
   const loadDetail = useCallback(async (id: string) => {
     const sequence = ++detailSequence.current;
@@ -249,7 +257,7 @@ export function App({ client }: { client: ServiceClient }) {
         {busy && <div className="working-banner" role="status"><span className="working-indicator" /><span>{busy} in progress. You can keep this window open while MirageSSD works.</span></div>}
 
         {!snapshot ? connectionError ? <section className="disconnected-state"><HardDrives size={40} weight="duotone" />{connectionError.includes('bridge token') ? <><h2>This window lost its connection to the MirageSSD app</h2><p>Close it and open MirageSSD again from the Start menu.</p></> : <><h2>MirageSSD’s background service isn’t running</h2><p>Your files on Drive are safe. Start the service to bring your drives back — Windows may ask for permission.</p><div className="button-row"><button className="primary-button" disabled={refreshing} onClick={() => void client.serviceStart().then(() => window.setTimeout(() => void refresh(), 3000)).catch((failure) => setConnectionError(failure instanceof Error ? failure.message : String(failure)))}>Start service</button><button className="secondary-button" onClick={() => void client.diagnosticsCollect().then(setNotice).catch(() => {})}>Collect diagnostics</button><button className="quiet-button" onClick={() => void refresh()} disabled={refreshing}>Try reconnecting <ArrowRight size={17} /></button></div></>}</section> : <LoadingState /> : <div className="view-content">
-          {view === 'setup' && <SetupWizard client={client} account={driveAccount} onDone={() => { setView('overview'); void refresh(); }} />}
+          {view === 'setup' && <SetupWizard client={client} account={driveAccount} autoCreate={snapshot.repositories.length === 0} onDone={() => { setView('overview'); void refresh(); }} />}
           {view === 'overview' && <>
             <Dashboard repositories={snapshot.repositories} selectedId={selectedId} onSelect={select} onRefresh={() => void refresh()} busy={Boolean(busy)} onSetup={() => setView('setup')} />
             {selected && selected.origin === 'drive' && selected.volumeMode === 'managed' && (
