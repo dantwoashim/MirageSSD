@@ -16,12 +16,18 @@
          filesystem hosts and the open app window would trigger the
          "Files in use" prompt. Quiesce them first: stopping the service
          unmounts every volume cleanly; the app is closed and relaunched by
-         the setup bundle when the upgrade finishes. Both are best effort. -->
+         the setup bundle when the upgrade finishes. A service registration
+         left behind by an interrupted install (no product record, but the
+         SCM entry exists) would make ServiceInstall fail with error 1923, so
+         it is removed as well. All three run on every install and are best
+         effort: on a clean machine there is nothing to stop or delete. -->
     <CustomAction Id="StopPreviousService" Directory="SystemFolder" ExeCommand="net.exe stop MirageSSD" Execute="immediate" Return="ignore" />
     <CustomAction Id="ClosePreviousApp" Directory="SystemFolder" ExeCommand="taskkill.exe /F /IM mirage-ui.exe /IM mirage-fs.exe /IM mirage-service.exe" Execute="immediate" Return="ignore" />
+    <CustomAction Id="DeleteOrphanService" Directory="SystemFolder" ExeCommand="sc.exe delete MirageSSD" Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
-      <Custom Action="StopPreviousService" Before="ClosePreviousApp" Condition="WIX_UPGRADE_DETECTED OR Installed" />
-      <Custom Action="ClosePreviousApp" Before="InstallValidate" Condition="WIX_UPGRADE_DETECTED OR Installed" />
+      <Custom Action="StopPreviousService" Before="ClosePreviousApp" Condition="NOT REMOVE" />
+      <Custom Action="ClosePreviousApp" Before="DeleteOrphanService" Condition="NOT REMOVE" />
+      <Custom Action="DeleteOrphanService" Before="InstallValidate" Condition="NOT REMOVE" />
       <Custom Action="BlockUnsafeUninstall" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
