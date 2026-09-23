@@ -371,3 +371,27 @@ fn set_times_updates_selected_columns() {
     );
     drop(dir);
 }
+
+#[test]
+fn creating_an_existing_name_is_a_conflict_not_an_io_error() {
+    let (dir, db) = open();
+    let volume = vol(4);
+    let root = db.namespace_create_volume(volume, 1).expect("volume");
+    db.namespace_create(volume, root, "Photos", NamespaceNodeKind::Directory, 2)
+        .expect("first create");
+    let again = db
+        .namespace_create(volume, root, "photos", NamespaceNodeKind::Directory, 3)
+        .expect_err("second create must fail");
+    assert_eq!(
+        again.kind,
+        mirage_types::MirageErrorKind::RepositoryConflict,
+        "{again}"
+    );
+    // The failed create leaves no orphan inode behind: the directory still
+    // lists exactly one child.
+    let children = db
+        .namespace_list_children(volume, root, None, 16)
+        .expect("children");
+    assert_eq!(children.len(), 1);
+    drop(dir);
+}

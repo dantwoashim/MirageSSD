@@ -75,6 +75,9 @@ NTSTATUS create(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, 
     if(disposition==FILE_CREATE||disposition==FILE_OVERWRITE_IF||disposition==FILE_OPEN_IF||disposition==FILE_SUPERSEDE){
         const auto status=mirage_namespace_create(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name),directory);
         // OPEN_IF/SUPERSEDE may still resolve an existing entry.
+        // FILE_CREATE on an existing name is the ordinary "already exists"
+        // answer (mkdir twice, CreateFile CREATE_NEW), not a sharing violation.
+        if(status==MIRAGE_CONFLICT&&disposition==FILE_CREATE)return STATUS_OBJECT_NAME_COLLISION;
         if(status!=MIRAGE_OK&&!(disposition!=FILE_CREATE&&status==MIRAGE_CONFLICT))return mirage_status_to_ntstatus(status);
     }
     MirageFileHandle* file{}; MirageFileInfo stat{}; const auto status=lookup(fs,name,&file,&stat); if(!NT_SUCCESS(status)) return status;

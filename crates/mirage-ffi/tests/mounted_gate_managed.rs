@@ -385,6 +385,18 @@ fn managed_mount_writes_survive_restart() {
     std::fs::remove_file(mount.join("seeded").join("inner.dat")).expect("delete seeded nested");
     assert!(!mount.join("doomed-root.dat").exists());
 
+    // Creating a directory that already exists is ERROR_ALREADY_EXISTS —
+    // what `mkdir`, robocopy and create_dir_all expect — never an I/O error.
+    std::fs::create_dir(mount.join("twice")).expect("first mkdir");
+    let collision = std::fs::create_dir(mount.join("twice")).expect_err("second mkdir must fail");
+    assert_eq!(
+        collision.raw_os_error(),
+        Some(183),
+        "expected ERROR_ALREADY_EXISTS, got {collision}"
+    );
+    std::fs::create_dir_all(mount.join("twice").join("nested"))
+        .expect("create_dir_all over existing");
+
     // The dirty-payload budget is 64 KiB: a write beyond it must surface the
     // OS disk-full error, not corrupt or wedge.
     let oversized = vec![0u8; 128 * 1024];

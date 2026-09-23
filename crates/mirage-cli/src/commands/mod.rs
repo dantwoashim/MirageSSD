@@ -14,6 +14,7 @@ pub mod diagnostics;
 mod disk;
 mod drive_gate;
 mod drive_live;
+pub mod offload;
 mod recovery;
 mod repo_drive;
 mod repo_import_local;
@@ -732,6 +733,23 @@ pub enum VolumeCommand {
     },
     /// List this user's managed Drive-backed volumes.
     List,
+    /// Move a local folder into the drive: copy, verify every file back
+    /// through the drive, wait for Google Drive publication, and only then
+    /// (with --delete-source) remove the local copy.
+    Offload {
+        repository_id: mirage_types::RepositoryId,
+        /// Folder on a local disk to move into the drive.
+        source: std::path::PathBuf,
+        /// Destination folder inside the drive (default: <drive>\<folder name>).
+        #[arg(long)]
+        into: Option<std::path::PathBuf>,
+        /// Remove the source after everything is verified and published.
+        #[arg(long)]
+        delete_source: bool,
+        /// Seconds to wait for publication to finish (default 86400; 0 = don't wait).
+        #[arg(long, default_value_t = 86_400)]
+        wait_publish: u64,
+    },
     /// Remove a volume's local state; Drive content is kept unless
     /// --discard-unpublished is given (only pending uploads are dropped).
     Remove {
@@ -1623,6 +1641,35 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             }
             VolumeCommand::List => {
                 service::emit(serde_json::json!({"volumes": volume::list(None)?}), json)
+            }
+            VolumeCommand::Offload {
+                repository_id,
+                source,
+                into,
+                delete_source,
+                wait_publish,
+            } => {
+                let report = offload::run(
+                    &offload::OffloadSpec {
+                        repository_id,
+                        source,
+                        destination: into,
+                        delete_source,
+                        wait_publish: std::time::Duration::from_secs(wait_publish),
+                    },
+                    None,
+                    &mut |step| {
+                        if !json {
+                            eprintln!("{step}...");
+                        }
+                    },
+                )?;
+                service::emit(
+                    serde_json::to_value(report).map_err(|error| {
+                        MirageError::internal_invariant(format!("offload report: {error}"))
+                    })?,
+                    json,
+                )
             }
             VolumeCommand::Remove {
                 repository_id,

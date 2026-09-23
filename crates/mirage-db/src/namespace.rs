@@ -379,9 +379,13 @@ pub fn create_node(
             ],
         )
         .map_err(|e| sqlite(e, "namespace inode insert failed"))?;
+    // OR IGNORE turns a name collision into `changed == 0` so the caller sees
+    // a conflict (ERROR_ALREADY_EXISTS at the filesystem) rather than a raw
+    // constraint failure surfacing as an I/O error; the transaction drops
+    // and rolls back the inode row.
     let changed = transaction
         .execute(
-            "INSERT INTO dirents(volume_id, parent_inode, folded_name, display_name, child_inode)
+            "INSERT OR IGNORE INTO dirents(volume_id, parent_inode, folded_name, display_name, child_inode)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 volume_id.as_bytes().as_slice(),
