@@ -55,6 +55,7 @@ fn spec() -> HostSpec {
         repository_key: None,
         disk_floor: None,
         label: None,
+        dirty_budget: None,
     }
 }
 

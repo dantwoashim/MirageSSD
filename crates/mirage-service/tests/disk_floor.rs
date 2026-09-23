@@ -171,6 +171,7 @@ fn breached_floor_requests_eviction_from_mounted_host() {
             _: Option<(&Path, &Path)>,
             _: Option<u64>,
             _: &str,
+            _: Option<u64>,
         ) -> Result<(), MirageError> {
             Ok(())
         }

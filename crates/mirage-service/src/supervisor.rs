@@ -54,6 +54,10 @@ pub struct HostSpec {
     pub disk_floor: Option<u64>,
     /// WinFsp volume label — the repository's display name.
     pub label: Option<String>,
+    /// Local staging budget for a managed volume (`--budget`); when set,
+    /// `volume_total_bytes`/`volume_free_bytes` are the advertised remote
+    /// (Drive) capacity rather than the budget.
+    pub dirty_budget: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostExit {
@@ -317,6 +321,10 @@ fn host_args(spec: &HostSpec) -> Vec<std::ffi::OsString> {
         args.push("--label".into());
         args.push(label.clone().into());
     }
+    if let Some(budget) = spec.dirty_budget {
+        args.push("--budget".into());
+        args.push(budget.to_string().into());
+    }
     if let (Some(manifest), Some(key)) = (&spec.drive_manifest, &spec.repository_key) {
         args.push("--drive-manifest".into());
         args.push(manifest.clone().into_os_string());
@@ -540,6 +548,7 @@ mod tests {
             drive_manifest: None,
             repository_key: None,
             label: None,
+            dirty_budget: None,
         }
     }
 

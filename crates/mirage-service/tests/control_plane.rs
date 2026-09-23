@@ -535,6 +535,7 @@ impl MountControl for FakeMountControl {
         _: Option<(&Path, &Path)>,
         _: Option<u64>,
         _: &str,
+        _: Option<u64>,
     ) -> Result<(), MirageError> {
         self.calls.lock().unwrap().push("mount");
         Ok(())

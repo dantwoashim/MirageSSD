@@ -100,23 +100,15 @@ impl ControlPlaneHandler {
                 .ok_or_else(|| {
                     MirageError::integrity_mismatch("repository owner SID is missing")
                 })?;
-            let (mut volume_total_bytes, mut volume_free_bytes) =
-                runtime::volume_capacity(&self.database, repository.repository_id, &index)?;
             let origin_root = local_origin_root(&self.database, repository.repository_id)?;
             let managed = self
                 .database
                 .load_repository_volume_mode(repository.repository_id)?
                 == Some(mirage_db::VolumeMode::Managed);
-            // Same budget rule as an explicit mount: a managed volume without
-            // a Drive quota snapshot advertises its reviewed cache budget,
-            // otherwise Explorer shows "0 bytes free of 0 bytes" and every
-            // write is refused after a reboot.
-            if managed && volume_free_bytes == 0 {
-                volume_free_bytes =
-                    runtime::load_config(&self.database, repository.repository_id)?.cache_bytes;
-                volume_total_bytes = volume_total_bytes.max(volume_free_bytes);
-            }
-            let capacity = (volume_total_bytes, volume_free_bytes);
+            // Same capacity rule as an explicit mount (the last recorded
+            // Drive quota, or the budget when none exists yet).
+            let (capacity, dirty_budget) =
+                managed_capacity(&self.database, repository.repository_id, &index, managed)?;
             let drive_provider =
                 drive_provider_paths(&self.database, repository.repository_id, managed)?;
             crate::logging::log_event(
@@ -144,6 +136,7 @@ impl ControlPlaneHandler {
                         None
                     },
                     &repository.display_name,
+                    dirty_budget,
                 )?;
             // Restored letters get the same Explorer icon and shell verbs as
             // an explicit mount; failures are cosmetic only.
@@ -888,22 +881,25 @@ impl ControlPlaneHandler {
             .find(|item| item.repository_id == repository_id)
             .map(|item| item.display_name)
             .unwrap_or_else(|| "MirageSSD".to_owned());
-        let (mut volume_total_bytes, mut volume_free_bytes) =
-            runtime::volume_capacity(&self.database, repository_id, &index)?;
         let origin_root = local_origin_root(&self.database, repository_id)?;
         let managed = self.database.load_repository_volume_mode(repository_id)?
             == Some(mirage_db::VolumeMode::Managed);
-        // For a managed volume `volume_free_bytes` is the dirty-write budget:
-        // without a Drive quota snapshot (on-demand mounts need no
-        // materialize) fall back to the repository's reviewed cache budget
-        // rather than a zero budget that rejects every write.
-        if managed && volume_free_bytes == 0 {
-            volume_free_bytes = runtime::load_config(&self.database, repository_id)?.cache_bytes;
-            volume_total_bytes = volume_total_bytes.max(volume_free_bytes);
-        }
         // A managed Drive repository mounts with the publication manifest and
         // content key so the host can fetch non-resident pages on demand.
         let drive_provider = drive_provider_paths(&self.database, repository_id, managed)?;
+        // With a fresh token, record the account's Drive quota so Explorer
+        // shows cloud capacity. Best effort: a stale snapshot or the budget
+        // fallback is still a correct mount.
+        if managed
+            && drive_provider.is_some()
+            && let Some(token) = drive_access_token
+            && let Err(error) =
+                runtime::refresh_drive_capacity(&self.database, repository_id, token)
+        {
+            crate::logging::log_event("mount.quota_unavailable", &error.to_string());
+        }
+        let ((volume_total_bytes, volume_free_bytes), dirty_budget) =
+            managed_capacity(&self.database, repository_id, &index, managed)?;
         self.database.set_repository_state(
             repository_id,
             state,
@@ -932,6 +928,7 @@ impl ControlPlaneHandler {
                     None
                 },
                 &display_name,
+                dirty_budget,
             );
         if let Err(error) = mounted {
             let _ = runtime::clear_mount_record(&self.database, repository_id);
@@ -1808,6 +1805,31 @@ fn repository_id(command: &Command) -> Option<RepositoryId> {
 /// root. Only meaningful for a managed volume on the Drive origin; both files
 /// must exist or the mount proceeds without a provider (non-resident reads
 /// fail unavailable until a token-bearing remount).
+/// Advertised `(total, free)` for a mount plus the separate local staging
+/// budget. A managed volume with a recorded Drive quota shows the cloud
+/// capacity in Explorer and keeps its reviewed cache budget internal; without
+/// a quota the budget doubles as the advertised size (the old behavior).
+/// Non-managed mounts are unchanged and get no separate budget.
+fn managed_capacity(
+    database: &Database,
+    repository_id: RepositoryId,
+    index: &Path,
+    managed: bool,
+) -> Result<((u64, u64), Option<u64>), MirageError> {
+    if !managed {
+        return Ok((
+            runtime::volume_capacity(database, repository_id, index)?,
+            None,
+        ));
+    }
+    let budget = runtime::load_config(database, repository_id)?.cache_bytes;
+    if let Some(capacity) = runtime::drive_capacity_snapshot(database, repository_id)? {
+        return Ok((capacity, Some(budget)));
+    }
+    let (total, _) = runtime::volume_capacity(database, repository_id, index)?;
+    Ok(((total.max(budget), budget), None))
+}
+
 /// The configured disk floor for the volume holding the service state root
 /// (where managed journals live), if any.
 fn state_root_disk_floor(database: &Database) -> Option<u64> {

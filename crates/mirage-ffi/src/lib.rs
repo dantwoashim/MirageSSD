@@ -2839,6 +2839,10 @@ fn journal_namespace_operation(
 /// Physical-ledger file id for a managed volume's journal: one
 /// variable-length "file" tracks every staged dirty payload.
 const JOURNAL_FILE_ID: [u8; 16] = mirage_db::payload_remote::MANAGED_JOURNAL_FILE_ID;
+/// How long a write waits for uploads to free local budget before it fails
+/// with disk full. Kept well below WinFsp's IRP timeout.
+const WRITE_BACKPRESSURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+const WRITE_BACKPRESSURE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Splits a mount-relative UTF-16 path into namespace components, accepting
 /// both `\` and `/` separators. Rejects empty components, `.`/`..`, and NUL.
@@ -3298,38 +3302,55 @@ pub unsafe extern "C" fn mirage_write(
         // The dirty mutex serializes budget check + reservation + staging +
         // ledger commit across writers; the maps lock it is taken under
         // serializes extent mutations for the whole engine.
-        let _dirty_guard = match dirty.mutex.lock() {
+        let mut _dirty_guard = match dirty.mutex.lock() {
             Ok(guard) => guard,
             Err(_) => return MirageStatus::Internal,
         };
         let length = u64::try_from(bytes_len).unwrap_or(u64::MAX);
-        if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
+        let mut waited = std::time::Duration::ZERO;
+        while dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
             // Published payloads are reclaimable cloud-backed bytes: evict
-            // enough to fit, then retry the budget once.
-            let Some(volume) = handle
-                .index
-                .as_ref()
-                .map(|index| index.header().repository_id)
-            else {
-                return MirageStatus::IntegrityFailure;
+            // enough to fit, then re-check the budget.
+            {
+                let target = length.max(dirty.budget_bytes / 4);
+                let pins = handle
+                    .pins
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let _ = publisher::evict_published(
+                    db,
+                    dirty,
+                    &journal_dir,
+                    volume,
+                    &handle.handles,
+                    &pins,
+                    target,
+                );
+            }
+            if dirty.used.load(Ordering::Acquire).saturating_add(length) <= dirty.budget_bytes {
+                break;
+            }
+            // The budget is full of not-yet-uploaded data. The volume
+            // advertises cloud capacity, so a large copy must slow down to
+            // upload speed instead of failing: release the ledger, nudge the
+            // publisher, and retry for a bounded time before reporting full.
+            let Some(publisher) = handle.publisher.as_ref() else {
+                return MirageStatus::DiskFull;
             };
-            let target = length.max(dirty.budget_bytes / 4);
-            let pins = handle
-                .pins
-                .read()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let _ = publisher::evict_published(
-                db,
-                dirty,
-                &journal_dir,
-                volume,
-                &handle.handles,
-                &pins,
-                target,
-            );
-            if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
+            // Without a Drive token nothing can upload, so waiting is futile.
+            let uploading = publisher.stats.state.load(Ordering::Acquire)
+                != publisher::PublisherState::WaitingForToken as u8;
+            if !uploading || waited >= WRITE_BACKPRESSURE_LIMIT {
                 return MirageStatus::DiskFull;
             }
+            drop(_dirty_guard);
+            publisher.notify();
+            std::thread::sleep(WRITE_BACKPRESSURE_STEP);
+            waited += WRITE_BACKPRESSURE_STEP;
+            _dirty_guard = match dirty.mutex.lock() {
+                Ok(guard) => guard,
+                Err(_) => return MirageStatus::Internal,
+            };
         }
         // Real-disk floor: refuse to push the journal volume's actual free
         // space below the configured floor; published payloads are evicted to

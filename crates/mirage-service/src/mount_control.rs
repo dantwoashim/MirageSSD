@@ -22,6 +22,7 @@ pub trait MountControl: Send {
         drive_provider: Option<(&Path, &Path)>,
         disk_floor: Option<u64>,
         volume_label: &str,
+        dirty_budget: Option<u64>,
     ) -> Result<(), MirageError>;
     /// Pushes a bearer token to the live host of a mounted repository.
     fn send_drive_token(
@@ -79,6 +80,7 @@ impl MountControl for NativeMountControl {
         drive_provider: Option<(&Path, &Path)>,
         disk_floor: Option<u64>,
         volume_label: &str,
+        dirty_budget: Option<u64>,
     ) -> Result<(), MirageError> {
         let (volume_total_bytes, volume_free_bytes) = volume_capacity;
         if !self.executable.is_file() {
@@ -116,6 +118,7 @@ impl MountControl for NativeMountControl {
                     drive_manifest: drive_provider.map(|(manifest, _)| manifest.to_path_buf()),
                     repository_key: drive_provider.map(|(_, key)| key.to_path_buf()),
                     disk_floor,
+                    dirty_budget,
                     label: {
                         let trimmed = volume_label.trim();
                         (!trimmed.is_empty()).then(|| trimmed.chars().take(32).collect::<String>())
@@ -298,6 +301,7 @@ impl MountControl for UnavailableMountControl {
         _: Option<(&Path, &Path)>,
         _: Option<u64>,
         _: &str,
+        _: Option<u64>,
     ) -> Result<(), MirageError> {
         Err(MirageError::provider_unavailable(
             "filesystem host is not configured",

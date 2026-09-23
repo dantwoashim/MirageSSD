@@ -36,6 +36,10 @@ public:
     void set_volume_label(const std::wstring& label) { label_ = label.substr(0, 32); }
     const std::wstring& volume_label() const noexcept { return label_; }
     std::uint64_t volume_free_bytes() const noexcept { return volume_free_bytes_; }
+    // Managed volumes with a separate local staging budget advertise the
+    // remote (Drive) capacity to Windows and keep the budget internal.
+    void set_dirty_budget(std::uint64_t bytes) noexcept { dirty_budget_ = bytes; }
+    bool advertises_remote_capacity() const noexcept { return dirty_budget_ != 0; }
     void begin_pending() noexcept;
     void end_pending() noexcept;
 private:
@@ -52,6 +56,7 @@ private:
     bool writable_{};
     std::uint64_t volume_total_bytes_{1};
     std::uint64_t volume_free_bytes_{};
+    std::uint64_t dirty_budget_{};
     std::wstring label_{L"MirageSSD"};
 };
 void release_file_context(FileContext*) noexcept;
