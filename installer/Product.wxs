@@ -18,7 +18,7 @@
          unmounts every volume cleanly; the app is closed and relaunched by
          the setup bundle when the upgrade finishes. Both are best effort. -->
     <CustomAction Id="StopPreviousService" Directory="SystemFolder" ExeCommand="net.exe stop MirageSSD" Execute="immediate" Return="ignore" />
-    <CustomAction Id="ClosePreviousApp" Directory="SystemFolder" ExeCommand="taskkill.exe /F /IM mirage-ui.exe /IM mirage-fs.exe" Execute="immediate" Return="ignore" />
+    <CustomAction Id="ClosePreviousApp" Directory="SystemFolder" ExeCommand="taskkill.exe /F /IM mirage-ui.exe /IM mirage-fs.exe /IM mirage-service.exe" Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="StopPreviousService" Before="ClosePreviousApp" Condition="WIX_UPGRADE_DETECTED OR Installed" />
       <Custom Action="ClosePreviousApp" Before="InstallValidate" Condition="WIX_UPGRADE_DETECTED OR Installed" />
