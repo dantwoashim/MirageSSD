@@ -24,6 +24,11 @@ use tokio_util::sync::CancellationToken;
 /// Plaintext bytes per encrypted frame inside a payload object.
 pub const PAYLOAD_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Concurrent payload uploads per publisher pass. Bounded so peak memory
+/// (plaintext + ciphertext per in-flight object) and Drive request rate stay
+/// modest; four already turns per-object latency into throughput.
+pub const PUBLISH_PARALLELISM: usize = 4;
+
 /// Number of plaintext frames for a payload of `plaintext_len` bytes. A
 /// non-empty payload always has at least one frame; an empty payload
 /// encodes as a single empty frame so the object is never zero bytes.
@@ -287,18 +292,36 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
                 .store(PublisherState::Idle as u8, Ordering::Release);
             continue;
         }
+        // Uploads run a few at a time: Drive's per-object latency (upload +
+        // independent readback) dominates for small payloads, so sequential
+        // publishing crawled at one object every several seconds. The durable
+        // record still goes through the single writer channel; a backend
+        // failure anywhere in a batch ends the pass and backs off.
         let mut any_error = false;
-        for payload in &pending {
+        for batch in pending.chunks(PUBLISH_PARALLELISM) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            match publish_one(db, *volume, journal_dir, provider, key, payload, stats) {
-                Ok(()) => {}
-                Err(PublishFailure::Backend) => {
-                    any_error = true;
-                    break;
-                }
-                Err(PublishFailure::Integrity) => {}
+            let results: Vec<Result<(), PublishFailure>> = std::thread::scope(|scope| {
+                let workers: Vec<_> = batch
+                    .iter()
+                    .map(|payload| {
+                        scope.spawn(move || {
+                            publish_one(db, *volume, journal_dir, provider, key, payload, stats)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap_or(Err(PublishFailure::Backend)))
+                    .collect()
+            });
+            if results
+                .iter()
+                .any(|result| matches!(result, Err(PublishFailure::Backend)))
+            {
+                any_error = true;
+                break;
             }
         }
         backoff = if any_error {

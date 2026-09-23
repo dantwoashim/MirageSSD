@@ -127,9 +127,16 @@ mod windows_host {
             .or_else(|| mirage_cli::commands::backend_login::default_token_store_path().ok());
         if let Some(store) = token_store_path.as_deref()
             && store.is_file()
-            && let Err(error) = mirage_cli::commands::agent::install_logon_registration()
         {
-            log_event("agent.registration_failed", &error.to_string());
+            if let Err(error) = mirage_cli::commands::agent::install_logon_registration() {
+                log_event("agent.registration_failed", &error.to_string());
+            }
+            // An upgrade or a service restart leaves mounted drives without a
+            // Drive token until the agent runs; start it now if it is not
+            // already running (a second instance exits on the agent mutex).
+            if let Err(error) = mirage_cli::commands::agent::spawn_detached() {
+                log_event("agent.spawn_failed", &error.to_string());
+            }
         }
         // The tray companion keeps the host alive after the browser tab
         // closes; re-register on every start so updates repair the path.

@@ -12,8 +12,13 @@ use mirage_types::{GenerationId, MirageError, RepositoryId};
 
 use super::{backend_login, drive_live, service};
 
+/// How often the Drive access token is refreshed with Google.
 const REFRESH_SECONDS: u64 = 45 * 60;
-const RETRY_SECONDS: u64 = 60;
+/// How often the current token is (re)supplied to mounted hosts. A host that
+/// restarts (service upgrade, remount) starts without a token and cannot
+/// publish until one arrives, so the gap must stay short; supplying is one
+/// local IPC per drive.
+const SUPPLY_SECONDS: u64 = 60;
 const LOG_MAX_BYTES: u64 = 512 * 1024;
 
 pub fn run(once: bool) -> Result<(), MirageError> {
@@ -22,45 +27,60 @@ pub fn run(once: bool) -> Result<(), MirageError> {
         None => return Ok(()),
     };
     let log = AgentLog::open();
+    let mut state = AgentState::default();
     loop {
-        if let Err(error) = cycle(&log, once) {
+        if let Err(error) = cycle(&log, &mut state) {
             log.line(&format!("cycle failed: {error}"));
         }
         if once {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(REFRESH_SECONDS));
+        std::thread::sleep(Duration::from_secs(SUPPLY_SECONDS));
     }
 }
 
-fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
-    let credentials = match backend_login::oauth_client_credentials(None) {
-        Ok(credentials) => credentials,
-        Err(_) => {
-            log.line("oauth-desktop.json not found; waiting for sign-in");
-            if !once {
-                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+/// Session cache between cycles: the token is refreshed every
+/// REFRESH_SECONDS (or after a supply failure) and pushed every cycle;
+/// supplied remembers which drives already got this token so the log
+/// records a supply once per token, not once per minute.
+#[derive(Default)]
+struct AgentState {
+    session: Option<(std::time::Instant, drive_live::LiveDriveSession)>,
+    supplied: std::collections::HashSet<RepositoryId>,
+}
+
+fn cycle(log: &AgentLog, state: &mut AgentState) -> Result<(), MirageError> {
+    let stale = state
+        .session
+        .as_ref()
+        .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(REFRESH_SECONDS));
+    if stale {
+        let credentials = match backend_login::oauth_client_credentials(None) {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                log.line("oauth-desktop.json not found; waiting for sign-in");
+                return Ok(());
             }
-            return Ok(());
-        }
-    };
-    let session = match drive_live::connect(&credentials, None) {
-        Ok(session) => session,
-        Err(error) => {
-            log.line(&format!("Drive session refresh failed: {error}"));
-            if !once {
-                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
+        };
+        match drive_live::connect(&credentials, None) {
+            Ok(session) => {
+                state.session = Some((std::time::Instant::now(), session));
+                state.supplied.clear();
             }
-            return Ok(());
+            Err(error) => {
+                log.line(&format!("Drive session refresh failed: {error}"));
+                state.session = None;
+                return Ok(());
+            }
         }
+    }
+    let Some((_, session)) = state.session.as_ref() else {
+        return Ok(());
     };
     let status = match service::request_json(mirage_ipc::Command::Status) {
         Ok(status) => status,
         Err(error) => {
             log.line(&format!("service unreachable: {error}"));
-            if !once {
-                std::thread::sleep(Duration::from_secs(RETRY_SECONDS));
-            }
             return Ok(());
         }
     };
@@ -96,8 +116,17 @@ fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
                     repository_id,
                     drive_access_token: token,
                 }) {
-                    Ok(_) => log.line(&format!("{id_text}: supplied Drive token")),
-                    Err(error) => log.line(&format!("{id_text}: token supply failed: {error}")),
+                    Ok(_) => {
+                        if state.supplied.insert(repository_id) {
+                            log.line(&format!("{id_text}: supplied Drive token"));
+                        }
+                    }
+                    Err(error) => {
+                        log.line(&format!("{id_text}: token supply failed: {error}"));
+                        // Force a fresh token next cycle in case this one was rejected.
+                        state.session = None;
+                        return Ok(());
+                    }
                 }
             }
             Some("ready_unmounted") => {
@@ -119,7 +148,10 @@ fn cycle(log: &AgentLog, once: bool) -> Result<(), MirageError> {
                     drive_letter: Some(letter.clone()),
                     drive_access_token: Some(token),
                 }) {
-                    Ok(_) => log.line(&format!("{id_text}: mounted on {letter}")),
+                    Ok(_) => {
+                        state.supplied.insert(repository_id);
+                        log.line(&format!("{id_text}: mounted on {letter}"));
+                    }
                     Err(error) => log.line(&format!("{id_text}: mount failed: {error}")),
                 }
             }
@@ -161,6 +193,37 @@ fn agent_command_line(current_exe: &Path) -> Result<String, MirageError> {
         )));
     }
     Ok(format!("\"{}\" agent", executable.display()))
+}
+
+/// Starts `mirage.exe agent` (the sibling binary) as a detached background
+/// process. Idempotent: a running agent holds the agent mutex, so the new
+/// instance exits immediately.
+pub fn spawn_detached() -> Result<(), MirageError> {
+    let current_exe = std::env::current_exe().map_err(MirageError::from)?;
+    let command_line = agent_command_line(&current_exe)?;
+    // The command line is `"<path>\mirage.exe" agent`; recover the path.
+    let executable = command_line
+        .trim_start_matches('"')
+        .split('"')
+        .next()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| MirageError::internal_invariant("agent command line is malformed"))?;
+    let mut command = std::process::Command::new(executable);
+    command.arg("agent");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(MirageError::from)
 }
 
 pub fn install_logon_registration() -> Result<(), MirageError> {
