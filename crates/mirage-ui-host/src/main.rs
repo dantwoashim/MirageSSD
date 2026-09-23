@@ -39,6 +39,7 @@ mod windows_host {
             .join("ui");
         let mut ui_root = default_root;
         let mut no_open = false;
+        let mut print_url = false;
         let mut tray = false;
         let mut health_check = false;
         let mut drive_token_store = None;
@@ -49,6 +50,7 @@ mod windows_host {
                     ui_root = PathBuf::from(arguments.next().ok_or("--ui-root needs a path")?);
                 }
                 "--no-open" => no_open = true,
+                "--print-url" => print_url = true,
                 "--tray" => tray = true,
                 "--health-check" => health_check = true,
                 "--drive-token-store" => {
@@ -165,6 +167,11 @@ mod windows_host {
             });
             crate::tray::run(url);
         }
+        if print_url {
+            // Diagnostics: lets a script drive this host's page URL (the
+            // token is per launch and only valid for this process).
+            println!("{page_url}");
+        }
         if !no_open {
             open_browser(&page_url)?;
         }
@@ -280,12 +287,26 @@ mod windows_host {
         eprintln!("MirageSSD UI {event}: {detail}");
     }
 
+    /// The per-launch bridge token is the secret that authorizes a request;
+    /// only the page this host opened knows it. Same-origin evidence is a
+    /// second check, but browsers send `Origin` only on POST — a same-origin
+    /// GET carries none — so its absence must not refuse the page: when it
+    /// is present it must match, otherwise `Sec-Fetch-Site`/`Referer` must
+    /// say same-origin. Requiring `Origin` on GET left every fresh install's
+    /// sign-in status check at 403 in browsers that follow the spec.
     fn authorize(request: &HttpRequest, origin: &str, token: &str) -> Result<(), Vec<u8>> {
-        let supplied_origin = request.headers.get("origin").map(String::as_str);
-        let supplied_token = request.headers.get("x-mirage-token").map(String::as_str);
-        if supplied_origin != Some(origin)
-            || !supplied_token.is_some_and(|value| constant_time_eq(value, token))
-        {
+        let header = |name: &str| request.headers.get(name).map(String::as_str);
+        let token_ok = header("x-mirage-token").is_some_and(|value| constant_time_eq(value, token));
+        let origin_ok = match header("origin") {
+            Some(supplied) => supplied == origin,
+            None => {
+                header("sec-fetch-site") == Some("same-origin")
+                    || header("referer").is_some_and(|referer| {
+                        referer == origin || referer.starts_with(&format!("{origin}/"))
+                    })
+            }
+        };
+        if !token_ok || !origin_ok {
             return Err(br#"{"error":"forbidden"}"#.to_vec());
         }
         Ok(())
