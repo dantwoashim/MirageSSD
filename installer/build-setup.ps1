@@ -1,8 +1,8 @@
 param(
-  [string]$Version = '0.1.13',
+  [string]$Version = '0.1.14',
   [string]$MsiPath,
   [string]$Output = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist-dev\installer'),
-  [string]$Tag = 'v0.1.13-preview'
+  [string]$Tag = 'v0.1.14-preview'
 )
 
 $ErrorActionPreference = 'Stop'

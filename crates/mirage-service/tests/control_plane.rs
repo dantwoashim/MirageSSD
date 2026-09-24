@@ -857,10 +857,19 @@ fn cache_root_move_copies_verifies_records_and_is_refused_while_mounted() {
 }
 
 /// A fresh PC has no provisioned cache shard. A managed Drive volume mounts
-/// on demand and must not require one — this was the "Explorer volume
-/// requires exactly one local cache shard" failure on first-run create.
+/// on demand and must provision its arena before launching the host.
 #[test]
 fn managed_drive_volume_mounts_on_a_letter_without_any_cache_shard() {
+    fresh_managed_drive(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn fresh_managed_drive_reaches_real_host_and_survives_remount() {
+    fresh_managed_drive(true);
+}
+
+fn fresh_managed_drive(real_host: bool) {
     let directory = tempfile::tempdir().expect("directory");
     let database = Database::open(&directory.path().join("control.db")).expect("database");
     let repository_id = RepositoryId::from_bytes([0x62; 16]);
@@ -878,19 +887,50 @@ fn managed_drive_volume_mounts_on_a_letter_without_any_cache_shard() {
         b"drive manifest fixture",
     )
     .expect("drive manifest");
-    std::fs::write(import.join("repository-key.dpapi"), b"key fixture").expect("key");
+    if !real_host {
+        std::fs::write(import.join("repository-key.dpapi"), b"key fixture").expect("key");
+    }
     let fixture = decode_manifest_bounded(
         include_bytes!("../../mirage-manifest/tests/fixtures/manifest-v2-complex.cbor"),
         DecodeLimits::default(),
     )
     .expect("manifest fixture");
     std::fs::write(&index, compile_to_bytes(&fixture).expect("compile index")).expect("index");
+    #[cfg(windows)]
+    if real_host {
+        let source = directory.path().join("empty-source");
+        std::fs::create_dir(&source).unwrap();
+        let imported = mirage_pack::import_local_allow_empty(&mirage_pack::ImportPlan {
+            repository_id,
+            generation_id: generation,
+            source_root: source,
+            files: Vec::new(),
+            page_size: 1_048_576,
+            pack_target: 536_870_912,
+            output_staging_directory: directory.path().join("packs"),
+            encryption: None,
+        })
+        .unwrap();
+        std::fs::write(&index, compile_to_bytes(&imported.manifest).unwrap()).unwrap();
+        std::fs::write(
+            import.join("drive-manifest.cbor"),
+            mirage_manifest::encode_manifest(&imported.manifest).unwrap(),
+        )
+        .unwrap();
+        mirage_crypto::repository_key_store::save_repository_key(
+            &import.join("repository-key.dpapi"),
+            repository_id,
+            &mirage_crypto::aead::RepositoryKey::from_bytes([42; 32]),
+            mirage_crypto::dpapi::ProtectionScope::LocalMachine,
+        )
+        .unwrap();
+    }
     database
         .create_repository(NewRepository {
             repository_id,
             display_name: "fresh pc drive".into(),
             local_root: root.clone(),
-            owner_sid: "S-1-5-18".into(),
+            owner_sid: if real_host { "S-1-1-0" } else { "S-1-5-18" }.into(),
             content_encrypted: false,
             initial_state: RepositoryState::ReadyUnmounted,
             created_at_ns: 1,
@@ -944,6 +984,23 @@ fn managed_drive_volume_mounts_on_a_letter_without_any_cache_shard() {
             calls: Arc::clone(&calls),
         },
     );
+    #[cfg(windows)]
+    let handler = if real_host {
+        let executable = std::env::var_os("MIRAGE_FS_EXE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                    "../../build/windows-msvc-debug/native/winfsp-adapter/Debug/mirage-fs.exe",
+                )
+            });
+        assert!(executable.is_file(), "build the debug native adapter first");
+        ControlPlaneHandler::with_mount_control(
+            database.clone(),
+            mirage_service::NativeMountControl::new(executable),
+        )
+    } else {
+        handler
+    };
     let managed = handler.handle(
         &principal(),
         request(
@@ -975,5 +1032,76 @@ fn managed_drive_volume_mounts_on_a_letter_without_any_cache_shard() {
         matches!(mounted, ResponseBody::Json(_)),
         "fresh-PC mount must succeed: {mounted:?}"
     );
-    assert_eq!(*calls.lock().unwrap(), vec!["mount"]);
+    if !real_host {
+        assert_eq!(*calls.lock().unwrap(), vec!["mount"]);
+    }
+    let shards = database.load_cache_shards().unwrap();
+    assert_eq!(
+        shards.len(),
+        1,
+        "provider arena must exist before host launch"
+    );
+    assert!(
+        directory
+            .path()
+            .join("cache")
+            .join(&shards[0].relative_path)
+            .is_file()
+    );
+    if real_host {
+        let file = std::path::PathBuf::from(format!("{letter}:\\fresh.txt"));
+        let payload = b"first file on a fresh installation";
+        {
+            use std::io::Write;
+            let mut handle = std::fs::File::create(&file).unwrap();
+            handle.write_all(payload).unwrap();
+            handle.sync_all().unwrap();
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        let unmounted =
+            handler.handle(&principal(), request(3, Command::Unmount { repository_id }));
+        assert!(matches!(unmounted, ResponseBody::Json(_)), "{unmounted:?}");
+        // A changed staging budget must not resize or invalidate the shared
+        // read cache established by the first mount.
+        let config_path = runtime_root.join("runtime.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["cache_bytes"] = serde_json::json!(4 * 1024 * 1024 * 1024u64);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let remounted = handler.handle(
+            &principal(),
+            request(
+                4,
+                Command::Mount {
+                    repository_id,
+                    generation,
+                    drive_letter: Some(letter.to_string()),
+                    drive_access_token: None,
+                },
+            ),
+        );
+        assert!(matches!(remounted, ResponseBody::Json(_)), "{remounted:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        let unmounted =
+            handler.handle(&principal(), request(5, Command::Unmount { repository_id }));
+        assert!(matches!(unmounted, ResponseBody::Json(_)), "{unmounted:?}");
+        std::fs::remove_file(import.join("repository-key.dpapi")).unwrap();
+        let missing_key = handler.handle(
+            &principal(),
+            request(
+                6,
+                Command::Mount {
+                    repository_id,
+                    generation,
+                    drive_letter: Some(letter.to_string()),
+                    drive_access_token: None,
+                },
+            ),
+        );
+        assert!(
+            matches!(missing_key, ResponseBody::Error { ref message, .. }
+            if message.contains("repository key")),
+            "{missing_key:?}"
+        );
+    }
 }

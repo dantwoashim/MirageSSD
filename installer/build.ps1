@@ -3,9 +3,10 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.13',
+  [string]$Version = '0.1.14',
   [Parameter(Mandatory = $true)]
   [string]$DriveClientCredentials,
+  [string]$VCRuntimeDir,
   [long]$SourceDateEpoch = 946684800,
   [string]$Output = "$PSScriptRoot\out"
 )
@@ -86,12 +87,42 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 Copy-Item -LiteralPath $credentials -Destination $oauth -Force
 $required = @((Join-Path $bin 'mirage.exe'), (Join-Path $bin 'mirage-service.exe'), (Join-Path $bin 'mirage-fs.exe'), (Join-Path $bin 'mirage-ui.exe'), (Join-Path $ui 'index.html'), (Join-Path $ui 'assets\mirage-ui.js'), (Join-Path $ui 'assets\mirage-ui.css'))
 foreach ($path in $required) { if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release binary: $path" } }
+# App-local deployment keeps the native host runnable on PCs without Visual
+# Studio or a separately installed VC++ redistributable. Use the toolchain's
+# redistributable directory, never DLLs copied from Windows/System32.
+if (-not $VCRuntimeDir) {
+  $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+  $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'Cannot locate the MSVC redistributable; supply -VCRuntimeDir.' }
+  $redist = Get-ChildItem -LiteralPath (Join-Path $vs 'VC\Redist\MSVC') -Directory |
+    Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+    Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+  if ($redist) { $VCRuntimeDir = Join-Path $redist.FullName 'x64\Microsoft.VC143.CRT' }
+}
+foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+  if (-not $VCRuntimeDir -or -not (Test-Path -LiteralPath (Join-Path $VCRuntimeDir $name))) {
+    throw "Missing redistributable runtime: $name. Supply the matching x64 CRT directory with -VCRuntimeDir."
+  }
+}
+$runtimeFiles = @(Get-ChildItem -LiteralPath $VCRuntimeDir -Filter '*.dll' -File | Sort-Object Name)
+$runtimeComponents = foreach ($file in $runtimeFiles) {
+  $id = 'Runtime_' + ($file.Name -replace '[^A-Za-z0-9_]', '_')
+  $source = [Security.SecurityElement]::Escape($file.FullName)
+  "<Component Id=`"$id`" Guid=`"*`" Bitness=`"always64`"><File Id=`"${id}_File`" Source=`"$source`" KeyPath=`"yes`" /></Component>"
+}
+$runtimeWxs = Join-Path $Output 'Runtime.wxs'
+Set-Content -LiteralPath $runtimeWxs -Encoding utf8 -Value (
+  '<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"><Fragment><ComponentGroup Id="RuntimeComponents" Directory="INSTALLFOLDER">' +
+  ($runtimeComponents -join '') + '</ComponentGroup></Fragment></Wix>')
 $productCode = New-DeterministicGuid "MirageSSD/ProductCode/$Version"
 $packageInputs = @(
   $required
+  $runtimeFiles.FullName
+  $credentials
   (Join-Path $PSScriptRoot 'Product.wxs')
   (Join-Path $PSScriptRoot 'Components.wxs')
   (Join-Path $PSScriptRoot 'Prerequisites.wxs')
+  $runtimeWxs
 )
 $packageSeed = @("MirageSSD/PackageCode/$Version") + @($packageInputs | ForEach-Object {
   "$(Split-Path -Leaf $_)=$((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash)"
@@ -109,6 +140,7 @@ $arguments = @(
   '-d', "ProductVersion=$Version",
   '-d', "ProductCode=$productCode",
   '-o', (Join-Path $Output 'MirageSSD.msi'),
+  $runtimeWxs,
   (Join-Path $PSScriptRoot 'Product.wxs'),
   (Join-Path $PSScriptRoot 'Components.wxs'),
   (Join-Path $PSScriptRoot 'Prerequisites.wxs')

@@ -117,6 +117,20 @@ cmake --build --preset windows-msvc-debug
 
 Tagged MSI builds use `scripts/build-release.ps1` with a clean checkout and exact version tag. That is separate from the one-click writable-drive package.
 
+The management-app MSI built by `installer/build.ps1` includes the x64 MSVC
+runtime DLLs beside the application. The builder locates them in Visual Studio's
+`VC/Redist/MSVC` directory; `-VCRuntimeDir` can select the matching
+`x64/Microsoft.VC143.CRT` directory explicitly. Do not use DLLs copied from
+Windows/System32. This avoids requiring development tools or a separate C++
+runtime installation on the receiving PC. The setup EXE also carries the pinned
+WinFsp prerequisite.
+
+Fresh-install regression coverage includes an empty service database, a real
+Drive-capable WinFsp host, first-file write/read, unmount/remount, and refusal to
+mount after removal of the repository key. It uses disposable local metadata
+without a Google bearer token; it does not prove remote upload or a new user's
+Google OAuth consent configuration.
+
 ## macOS
 
 The macOS preview app is built with `scripts/build-rclone-miragessd.sh` and `scripts/build-macos-app.sh` on a Mac with Xcode Command Line Tools, Go, and macFUSE. It reuses the Google configuration from step 2. See the [macOS guide](macos.md).

@@ -449,7 +449,9 @@ fn create_in(
                 )
                 .is_ok();
             // Only this run's directory — never anything else under volumes/.
-            let _ = std::fs::remove_dir_all(&root);
+            if !onboarded || unregistered {
+                let _ = std::fs::remove_dir_all(&root);
+            }
             let remote_note = if published {
                 " A Drive folder for this repository may have been left behind and can be deleted from Google Drive."
             } else {
@@ -584,11 +586,11 @@ fn create_staged(
         transport,
         progress,
     )
-    .map_err(|error| {
+    .map_err(|(onboarded, error)| {
         (
             "onboarding with the service".to_owned(),
             published,
-            false,
+            onboarded,
             error,
         )
     })?;
@@ -662,7 +664,7 @@ fn onboard(
     token: mirage_ipc::SensitiveString,
     transport: Option<&dyn ServiceTransport>,
     progress: &mut dyn FnMut(&str),
-) -> Result<serde_json::Value, MirageError> {
+) -> Result<serde_json::Value, (bool, MirageError)> {
     progress("Registering the volume");
     service_request(
         transport,
@@ -678,51 +680,57 @@ fn onboard(
             configuration_label: "managed".to_owned(),
             cache_bytes: budget_bytes,
         },
-    )?;
-    service_request(
-        transport,
-        mirage_ipc::Command::RepositorySetDriveOrigin {
-            repository_id,
-            drive: true,
-        },
-    )?;
-    service_request(
-        transport,
-        mirage_ipc::Command::RepositorySetVolumeMode {
-            repository_id,
-            managed: true,
-        },
-    )?;
-    // Cache placement is chosen before the first mount so the journal is
-    // created on the right disk from the start (nothing to move yet).
-    let mut cache = serde_json::Value::Null;
-    if let Some(disk) = cache_disk {
-        progress(&format!("Placing the local cache on {disk}"));
-        cache = service_request(
+    )
+    .map_err(|error| (false, error))?;
+    // Once registration succeeds, every later failure needs rollback. Keep
+    // that fact even when the host never reaches its readiness marker.
+    (|| {
+        service_request(
             transport,
-            mirage_ipc::Command::RepositorySetCacheRoot {
+            mirage_ipc::Command::RepositorySetDriveOrigin {
                 repository_id,
-                cache_root: Some(disk.to_owned()),
+                drive: true,
             },
         )?;
-    }
-    progress(&format!("Mounting {letter}:"));
-    let mut mounted = service_request(
-        transport,
-        mirage_ipc::Command::Mount {
-            repository_id,
-            generation,
-            drive_letter: Some(letter.to_owned()),
-            drive_access_token: Some(token),
-        },
-    )?;
-    if let Some(root) = cache["cache_root"].as_str() {
-        mounted["cache_root"] = serde_json::json!(root);
-    }
-    if let Some(disk_root) = cache["cache_disk_root"].as_str() {
-        mounted["cache_disk_root"] = serde_json::json!(disk_root);
-    }
-    Ok(mounted)
+        service_request(
+            transport,
+            mirage_ipc::Command::RepositorySetVolumeMode {
+                repository_id,
+                managed: true,
+            },
+        )?;
+        // Cache placement is chosen before the first mount so the journal is
+        // created on the right disk from the start (nothing to move yet).
+        let mut cache = serde_json::Value::Null;
+        if let Some(disk) = cache_disk {
+            progress(&format!("Placing the local cache on {disk}"));
+            cache = service_request(
+                transport,
+                mirage_ipc::Command::RepositorySetCacheRoot {
+                    repository_id,
+                    cache_root: Some(disk.to_owned()),
+                },
+            )?;
+        }
+        progress(&format!("Mounting {letter}:"));
+        let mut mounted = service_request(
+            transport,
+            mirage_ipc::Command::Mount {
+                repository_id,
+                generation,
+                drive_letter: Some(letter.to_owned()),
+                drive_access_token: Some(token),
+            },
+        )?;
+        if let Some(root) = cache["cache_root"].as_str() {
+            mounted["cache_root"] = serde_json::json!(root);
+        }
+        if let Some(disk_root) = cache["cache_disk_root"].as_str() {
+            mounted["cache_disk_root"] = serde_json::json!(disk_root);
+        }
+        Ok(mounted)
+    })()
+    .map_err(|error| (true, error))
 }
 
 /// Move an existing volume's local cache to another disk: unmount if
@@ -1157,6 +1165,86 @@ mod tests {
         assert!(message.contains("Drive folder"), "{message}");
         // The only directory under volumes/ was ours — it is gone now.
         assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn failed_mount_unregisters_or_preserves_recoverable_metadata() {
+        struct Transport {
+            refuse_cleanup: bool,
+            cleanup_requested: Mutex<bool>,
+        }
+        impl ServiceTransport for Transport {
+            fn exchange(&self, request: &Request) -> Result<Response, MirageError> {
+                match request.command {
+                    mirage_ipc::Command::Mount { .. } => {
+                        return Err(MirageError::provider_unavailable(
+                            "host failed before readiness",
+                        ));
+                    }
+                    mirage_ipc::Command::RepositoryUnregister { .. } => {
+                        *self.cleanup_requested.lock().unwrap() = true;
+                        if self.refuse_cleanup {
+                            return Err(MirageError::provider_unavailable(
+                                "service unavailable during cleanup",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    body: ResponseBody::Json(serde_json::json!({})),
+                })
+            }
+        }
+        struct Backend;
+        impl VolumeBackend for Backend {
+            fn account_id(&self) -> &str {
+                "test@example.com"
+            }
+            fn access_token(&self) -> &str {
+                "test-token"
+            }
+            fn publish(
+                &self,
+                _: &Path,
+                _: RepositoryId,
+                _: &dyn CommitSigner,
+            ) -> Result<(), MirageError> {
+                Ok(())
+            }
+        }
+        for refuse_cleanup in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let transport = Transport {
+                refuse_cleanup,
+                cleanup_requested: Mutex::new(false),
+            };
+            let error = create_in(
+                root.path(),
+                &VolumeSpec {
+                    name: "Test".into(),
+                    drive_letter: "N".into(),
+                    budget_bytes: 8 * GIB,
+                    floor_bytes: None,
+                    cache_disk: None,
+                },
+                &Backend,
+                &mut |_| {},
+                Some(&transport),
+            )
+            .unwrap_err();
+            assert!(*transport.cleanup_requested.lock().unwrap());
+            assert_eq!(
+                std::fs::read_dir(root.path()).unwrap().next().is_some(),
+                refuse_cleanup
+            );
+            assert_eq!(
+                error.to_string().contains("still registered"),
+                refuse_cleanup
+            );
+        }
     }
 
     #[test]

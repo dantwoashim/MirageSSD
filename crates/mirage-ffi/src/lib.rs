@@ -660,9 +660,7 @@ fn create_managed_impl(
     output: *mut *mut MirageEngineHandle,
 ) -> MirageStatus {
     let debug_stage = |stage: &str, status: MirageStatus| -> MirageStatus {
-        if std::env::var_os("MIRAGE_DEBUG_PROVIDER").is_some() {
-            eprintln!("managed create failed at {stage}: {status:?}");
-        }
+        eprintln!("managed create failed at {stage}: {status:?}");
         status
     };
     contained(|| {
@@ -961,7 +959,7 @@ fn create_managed_impl(
                 };
                 let (Some(resident), Some(shard)) = (resident.clone(), shard.clone()) else {
                     return debug_stage(
-                        "let (Some(resident), Some(shard)) = (resident.clone(), shard",
+                        "provider cache arena is unavailable; provision or repair the service cache before mounting",
                         MirageStatus::BackendUnavailable,
                     );
                 };
@@ -993,7 +991,7 @@ fn create_managed_impl(
                 };
                 let (Some(resident), Some(shard)) = (resident.clone(), shard.clone()) else {
                     return debug_stage(
-                        "let (Some(resident), Some(shard)) = (resident.clone(), shard",
+                        "provider cache arena is unavailable; provision or repair the service cache before mounting",
                         MirageStatus::BackendUnavailable,
                     );
                 };

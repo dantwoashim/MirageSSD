@@ -2019,9 +2019,37 @@ fn drive_provider_paths(
     let manifest = config.import_root.join("drive-manifest.cbor");
     let key = config.import_root.join("repository-key.dpapi");
     if manifest.is_file() && key.is_file() {
+        // Both explicit mounts and logon recovery pass here. The Drive host
+        // needs an arena even when no pages have been fetched yet.
+        let active = database
+            .load_active_generation(repository_id)?
+            .ok_or_else(|| {
+                MirageError::integrity_mismatch("managed Drive generation is missing")
+            })?;
+        let index_path = active.mount_index_path.ok_or_else(|| {
+            MirageError::integrity_mismatch("managed Drive mount index is missing")
+        })?;
+        let index = mirage_index::MountIndex::open(&index_path)?;
+        let page_size = u32::try_from(index.header().page_size)
+            .map_err(|_| MirageError::unsupported_layout("repository page size exceeds u32"))?;
+        // The arena is service-wide. Reuse its established capacity rather
+        // than resize it when a second volume chooses a different budget.
+        let shards = database.load_cache_shards()?;
+        let cache_bytes = match shards.as_slice() {
+            [] => config.cache_bytes,
+            [spec] => spec.page_size.as_u64() * u64::from(spec.slot_count),
+            _ => {
+                return Err(MirageError::unsupported_layout(
+                    "service cache requires one shard",
+                ));
+            }
+        };
+        runtime::open_cache(database, page_size, cache_bytes)?;
         Ok(Some((manifest, key)))
     } else {
-        Ok(None)
+        Err(MirageError::integrity_mismatch(
+            "managed Drive volume requires its publication manifest and repository key; restore the missing metadata before mounting",
+        ))
     }
 }
 

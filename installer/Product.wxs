@@ -9,6 +9,7 @@
     <Launch Condition="WINFSP_INSTALLED AND WINFSP_VERSION = &quot;2.1.25156&quot;" Message="MirageSSD requires the signed WinFsp 2.1.25156 runtime." />
     <Feature Id="Main" Title="MirageSSD" Level="1">
       <ComponentGroupRef Id="MirageComponents" />
+      <ComponentGroupRef Id="RuntimeComponents" />
     </Feature>
     <CustomAction Id="BlockUnsafeUninstall" FileRef="MirageService" ExeCommand="--uninstall-check &quot;[CommonAppDataFolder]MirageSSD&quot;" Execute="deferred" Impersonate="no" Return="check" />
     <!-- Windows Installer checks for in-use files (InstallValidate) before it

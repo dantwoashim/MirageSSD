@@ -90,9 +90,7 @@ impl MountControl for NativeMountControl {
                 "filesystem host executable is unavailable",
             ));
         }
-        // A fresh install has no cache directory yet (shards are optional for
-        // managed volumes); create it rather than refuse the first mount.
-        let _ = fs::create_dir_all(state_root.join("cache"));
+        fs::create_dir_all(state_root.join("cache")).map_err(MirageError::from)?;
         if !index.is_file()
             || !state_root.join("control.db").is_file()
             || !state_root.join("cache").is_dir()

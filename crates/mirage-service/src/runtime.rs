@@ -2376,9 +2376,9 @@ pub fn validate_explorer_mount_ready(
     let config = load_config(database, repository_id)?;
     // A managed Drive volume fetches non-resident pages on demand, so the
     // Explorer gate only needs the provider inputs (manifest + key), not
-    // upfront residency or a provisioned cache shard — a fresh PC has
-    // neither, and the engine is correct without resident pages. Legacy
-    // mounts still require the shard and full verification.
+    // upfront residency. The mount path provisions the provider's empty
+    // arena before starting the host. Legacy mounts still require the shard
+    // and full verification here.
     let on_demand = database.load_repository_volume_mode(repository_id)?
         == Some(mirage_db::VolumeMode::Managed)
         && config.origin == RuntimeOrigin::Drive

@@ -229,7 +229,6 @@ impl Launcher for StdLauncher {
             .ok()
             .map(Arc::new);
             thread::spawn(move || {
-                const CAP: usize = 8192;
                 let mut reader = BufReader::new(stderr);
                 let mut buf = [0_u8; 1024];
                 while let Ok(read) = reader.read(&mut buf) {
@@ -245,11 +244,7 @@ impl Launcher for StdLauncher {
                         }
                     }
                     if let Ok(mut guard) = tail.lock() {
-                        guard.push_str(&text);
-                        let excess = guard.len().saturating_sub(CAP);
-                        if excess > 0 {
-                            guard.drain(..excess);
-                        }
+                        append_stderr_tail(&mut guard, &text);
                     }
                 }
             });
@@ -299,6 +294,20 @@ impl Launcher for StdLauncher {
             lines,
             stderr_tail,
         })
+    }
+}
+
+fn append_stderr_tail(tail: &mut String, text: &str) {
+    const CAP: usize = 8192;
+    tail.push_str(text);
+    let mut excess = tail.len().saturating_sub(CAP);
+    // stderr may contain Unicode paths. Never panic the diagnostic pump by
+    // splitting a UTF-8 code point.
+    while !tail.is_char_boundary(excess) {
+        excess += 1;
+    }
+    if excess > 0 {
+        tail.drain(..excess);
     }
 }
 
@@ -539,6 +548,17 @@ impl<L: Launcher> Supervisor<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_stderr_preserves_unicode_boundaries() {
+        let mut tail = "界".repeat(3000);
+        append_stderr_tail(&mut tail, "mount failed");
+        assert!(tail.len() <= 8192);
+        assert!(tail.ends_with("mount failed"));
+        append_stderr_tail(&mut tail, &"é".repeat(9000));
+        assert!(tail.len() <= 8192);
+        assert!(tail.chars().all(|c| c == 'é'));
+    }
 
     fn spec(managed: bool) -> HostSpec {
         HostSpec {
