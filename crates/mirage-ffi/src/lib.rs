@@ -814,7 +814,10 @@ fn create_managed_impl(
                     );
                 }
             }
-            Err(_) => return MirageStatus::IoError,
+            Err(error) => {
+                eprintln!("managed create failed at seed_namespace: {error}");
+                return MirageStatus::IoError;
+            }
         }
         // Dirty-payload ledger: one variable-length physical file tracks
         // every staged journal payload so managed writes stay bounded by

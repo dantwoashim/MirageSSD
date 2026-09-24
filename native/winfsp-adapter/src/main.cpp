@@ -15,8 +15,21 @@ bool parse_capacity(const wchar_t* text, std::uint64_t& value) {
     if (errno == ERANGE || !end || *end != L'\0') return false;
     value = parsed; return true;
 }
+void report_startup_failure(const mirage::FileSystemHost& host, NTSTATUS status) {
+    // One atomic protocol line: the service must not infer a cause from an
+    // independently drained stderr pipe or the many-to-one NTSTATUS mapping.
+    std::cout << "MIRAGE_STARTUP_ERROR host=" << MIRAGE_HOST_VERSION
+              << " stage=" << host.startup_stage()
+              << " engine_status=" << static_cast<int>(host.startup_engine_status())
+              << " ntstatus=0x" << std::hex << static_cast<unsigned long>(status)
+              << std::dec << "\n" << std::flush;
+}
 }
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--version") {
+        std::cout << "mirage-fs " << MIRAGE_HOST_VERSION << "\n";
+        return 0;
+    }
     if (argc != 5 && (argc < 8 || argc % 2 != 0 || argc > 26)) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache|--managed total-bytes free-bytes [--origin path] [--drive-manifest p --repository-key p]]\n  --managed: total-bytes = advertised volume size; free-bytes = dirty-payload budget unless --budget sets it separately\n  options: --origin --drive-manifest --repository-key --floor --label --budget --journal-root\n"; return 2; }
     const bool cache_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--cache";
     const bool managed_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--managed";
@@ -62,7 +75,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!journal_root.empty()) { if (!managed_mode) { std::wcerr << L"--journal-root requires --managed\n"; return 2; } host.set_journal_root(journal_root); }
     if (dirty_budget != 0) { if (!managed_mode) { std::wcerr << L"--budget requires --managed\n"; return 2; } host.set_dirty_budget(dirty_budget); }
     const auto status = host.mount(mount.wstring(), argv[2], argv[3], argv[4], cache_mode || managed_mode, managed_mode, total_bytes, free_bytes, origin, drive_manifest, repository_key, disk_floor);
-    if (!NT_SUCCESS(status)) { std::wcerr << L"mount failed status=0x" << std::hex << static_cast<unsigned long>(status) << L"\n"; return 1; }
+    if (!NT_SUCCESS(status)) { report_startup_failure(host, status); std::wcerr << L"mount failed status=0x" << std::hex << static_cast<unsigned long>(status) << L"\n"; return 1; }
     std::thread control;
     if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE) {
         control = std::thread([&host] {
@@ -81,6 +94,7 @@ int wmain(int argc, wchar_t** argv) {
         });
     }
     const auto result = host.run(); active = nullptr;
+    if (!NT_SUCCESS(result)) report_startup_failure(host, result);
     if (control.joinable()) control.join();
     std::wcerr << L"dispatcher stopped status=0x" << std::hex << static_cast<unsigned long>(result) << L"\n";
     return result == STATUS_SUCCESS ? 0 : 1;

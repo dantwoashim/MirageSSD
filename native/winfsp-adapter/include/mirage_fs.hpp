@@ -29,6 +29,8 @@ public:
     void stop() noexcept;
     bool writable() const noexcept { return writable_; }
     MirageEngineHandle* engine() const noexcept { return engine_; }
+    const char* startup_stage() const noexcept { return startup_stage_; }
+    MirageStatus startup_engine_status() const noexcept { return startup_engine_status_; }
     PSECURITY_DESCRIPTOR security() const noexcept { return security_descriptor_; }
     ULONG security_size() const noexcept { return security_size_; }
     ULONG async_delay_ms() const noexcept { return async_delay_ms_; }
@@ -46,6 +48,8 @@ public:
     void begin_pending() noexcept;
     void end_pending() noexcept;
 private:
+    const char* startup_stage_{"validate_capacity"};
+    MirageStatus startup_engine_status_{MIRAGE_OK};
     FSP_FILE_SYSTEM* fs_{};
     MirageEngineHandle* engine_{};
     PSECURITY_DESCRIPTOR security_descriptor_{};

@@ -135,7 +135,8 @@ impl MountControl for NativeMountControl {
             let tail = self.supervisor.stderr_tail(&id);
             let _ = self.supervisor.stop(&id);
             return Err(MirageError::provider_unavailable(format!(
-                "filesystem host operation failed: {error}{}",
+                "filesystem host operation failed (service {}): {error}{}",
+                env!("CARGO_PKG_VERSION"),
                 if tail.is_empty() {
                     String::new()
                 } else {

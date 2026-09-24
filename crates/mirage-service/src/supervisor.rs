@@ -103,17 +103,39 @@ pub struct StdChild {
     ready: Receiver<io::Result<()>>,
     lines: Receiver<io::Result<String>>,
     stderr_tail: Arc<Mutex<String>>,
+    stderr_done: Receiver<()>,
 }
 impl ManagedChild for StdChild {
     fn wait_ready(&mut self, timeout: Duration) -> io::Result<bool> {
-        match self.ready.recv_timeout(timeout) {
+        let result = match self.ready.recv_timeout(timeout) {
             Ok(result) => result.map(|()| true),
             Err(RecvTimeoutError::Timeout) => Ok(false),
             Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "filesystem host readiness channel closed",
             )),
+        };
+        if result.is_err() {
+            // The host's stdout and stderr are independent pipes. A failed
+            // readiness line/EOF can arrive before the diagnostic tail.
+            let _ = self.stderr_done.recv_timeout(Duration::from_secs(1));
         }
+        if let Err(error) = result {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; process_exit={}",
+                        status.code().map_or_else(
+                            || "unknown".to_owned(),
+                            |code| format!("0x{:08x}", code as u32)
+                        ),
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        result
     }
     fn try_exit(&mut self) -> io::Result<Option<HostExit>> {
         self.child.try_wait().map(|value| {
@@ -217,6 +239,7 @@ impl Launcher for StdLauncher {
             )
         })?;
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let (stderr_finished, stderr_done) = mpsc::sync_channel(1);
         if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&stderr_tail);
             // Persist host stderr to logs\host-<repo>.log (8 MiB, keep 5) —
@@ -236,6 +259,9 @@ impl Launcher for StdLauncher {
                         break;
                     }
                     let text = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    if let Ok(mut guard) = tail.lock() {
+                        append_stderr_tail(&mut guard, &text);
+                    }
                     for line in text.lines() {
                         if !line.trim().is_empty()
                             && let Some(log) = &host_log
@@ -243,10 +269,8 @@ impl Launcher for StdLauncher {
                             log.write_line(line);
                         }
                     }
-                    if let Ok(mut guard) = tail.lock() {
-                        append_stderr_tail(&mut guard, &text);
-                    }
                 }
+                let _ = stderr_finished.send(());
             });
         }
         let (sender, ready) = mpsc::sync_channel(1);
@@ -254,16 +278,9 @@ impl Launcher for StdLauncher {
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
-            let result = reader.read_line(&mut line).and_then(|read| {
-                if read != 0 && line.trim() == "MIRAGE_READY" {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "filesystem host did not emit the readiness marker",
-                    ))
-                }
-            });
+            let result = reader
+                .read_line(&mut line)
+                .and_then(|read| parse_startup_line(read, &line));
             let ready_ok = result.is_ok();
             let _ = sender.send(result);
             if !ready_ok {
@@ -293,8 +310,24 @@ impl Launcher for StdLauncher {
             ready,
             lines,
             stderr_tail,
+            stderr_done,
         })
     }
+}
+
+fn parse_startup_line(read: usize, line: &str) -> io::Result<()> {
+    if read != 0 && line.trim() == "MIRAGE_READY" {
+        return Ok(());
+    }
+    if let Some(detail) = line.trim().strip_prefix("MIRAGE_STARTUP_ERROR ") {
+        return Err(io::Error::other(format!(
+            "filesystem host startup failed: {detail}"
+        )));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "filesystem host did not emit the readiness marker (host exited without a structured startup report)",
+    ))
 }
 
 fn append_stderr_tail(tail: &mut String, text: &str) {
@@ -548,6 +581,24 @@ impl<L: Launcher> Supervisor<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_protocol_preserves_the_host_stage_and_version() {
+        assert!(parse_startup_line(13, "MIRAGE_READY\n").is_ok());
+        let report = "MIRAGE_STARTUP_ERROR host=0.1.15 stage=initialize_engine engine_status=8 ntstatus=0xc0000185\n";
+        let error = parse_startup_line(report.len(), report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("host=0.1.15"));
+        assert!(error.contains("stage=initialize_engine"));
+        assert!(error.contains("engine_status=8"));
+        assert!(
+            parse_startup_line(0, "")
+                .unwrap_err()
+                .to_string()
+                .contains("without a structured startup report")
+        );
+    }
 
     #[test]
     fn bounded_stderr_preserves_unicode_boundaries() {

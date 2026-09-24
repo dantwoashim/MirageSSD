@@ -869,6 +869,52 @@ fn fresh_managed_drive_reaches_real_host_and_survives_remount() {
     fresh_managed_drive(true);
 }
 
+#[cfg(windows)]
+#[test]
+fn failed_real_host_reports_stage_version_and_engine_status_without_external_logs() {
+    let state = tempfile::tempdir().unwrap();
+    let _database = Database::open(&state.path().join("control.db")).unwrap();
+    let index = state.path().join("invalid.idx");
+    std::fs::write(&index, b"deliberately invalid index").unwrap();
+    let executable = std::env::var_os("MIRAGE_FS_EXE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../build/windows-msvc-debug/native/winfsp-adapter/Debug/mirage-fs.exe")
+        });
+    let mut mount = mirage_service::NativeMountControl::new(executable);
+    let error = mount
+        .mount(
+            RepositoryId::from_bytes([0x71; 16]),
+            &state.path().join("mount"),
+            &index,
+            state.path(),
+            "S-1-1-0",
+            None,
+            (1_048_576, 1_048_576),
+            true,
+            None,
+            None,
+            "failure test",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(concat!("service ", env!("CARGO_PKG_VERSION"))),
+        "{error}"
+    );
+    assert!(
+        error.contains(concat!("host=", env!("CARGO_PKG_VERSION"))),
+        "{error}"
+    );
+    assert!(error.contains("stage=initialize_engine"), "{error}");
+    assert!(error.contains("engine_status=6"), "{error}");
+    assert!(error.contains("ntstatus=0xc0000185"), "{error}");
+    assert!(error.contains("host stderr:"), "{error}");
+}
+
 fn fresh_managed_drive(real_host: bool) {
     let directory = tempfile::tempdir().expect("directory");
     let database = Database::open(&directory.path().join("control.db")).expect("database");
