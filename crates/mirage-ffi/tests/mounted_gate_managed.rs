@@ -400,8 +400,13 @@ fn managed_mount_writes_survive_restart() {
     // The dirty-payload budget is 64 KiB: a write beyond it must surface the
     // OS disk-full error, not corrupt or wedge.
     let oversized = vec![0u8; 128 * 1024];
+    let admission_started = Instant::now();
     let error = std::fs::write(mount.join("too-big.bin"), &oversized)
         .expect_err("over-budget write must fail");
+    assert!(
+        admission_started.elapsed() < Duration::from_secs(10),
+        "offline full journal must fail promptly"
+    );
     assert_eq!(
         error.raw_os_error(),
         Some(112),
@@ -586,4 +591,162 @@ fn managed_host_evict_round_trip() {
     }
     stop(&mut host);
     assert!(replied, "host never replied MIRAGE_EVICTED to EVICT");
+}
+
+/// Exercise the ordinary buffered Windows copy path without exhausting host
+/// memory to reproduce WinFsp 2.1's kernel-cache deadlock. Even a small write
+/// must reach the journal before returning, proving that cache path is off.
+#[test]
+fn managed_buffered_copy_reaches_journal_and_survives_restart() {
+    let _mount_guard = MOUNT_LOCK.lock().unwrap();
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALLOCATION_INFO, FileAllocationInfo, SetFileInformationByHandle,
+    };
+
+    let source = tempfile::tempdir().expect("source");
+    std::fs::write(source.path().join("base.dat"), b"seed").expect("seed");
+    let objects = tempfile::tempdir().expect("objects");
+    let imported = import_local(&ImportPlan {
+        repository_id: RepositoryId::from_bytes([9; 16]),
+        generation_id: GenerationId::ZERO,
+        source_root: source.path().to_path_buf(),
+        files: vec![PlannedFile {
+            relative_path: "base.dat".into(),
+            class: FileClass::VirtualContainer,
+        }],
+        page_size: 64 * 1024,
+        pack_target: 2 * 1024 * 1024,
+        output_staging_directory: objects.path().to_path_buf(),
+        encryption: None,
+    })
+    .expect("import");
+    let index = objects.path().join("mount.idx");
+    mirage_index::compile_to_path(&imported.manifest, &index).expect("index");
+    let state = tempfile::tempdir().expect("state");
+    let letter = free_letter();
+    let mount = std::path::PathBuf::from(format!("{letter}:\\"));
+    let executable = adapter();
+    let spawn = || {
+        TestHost::spawn(
+            Command::new(&executable)
+                .arg(format!("{letter}:"))
+                .arg(&index)
+                .arg(state.path())
+                .arg("S-1-1-0")
+                .arg("--managed")
+                .arg("1073741824")
+                .arg("268435456")
+                .arg("--origin")
+                .arg(objects.path())
+                .env("PATH", runtime_path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+    };
+    let mut host = spawn();
+    wait_ready(&mut host, &mount.join("base.dat"));
+
+    let mut probe = std::fs::File::create(mount.join("probe.bin")).expect("probe");
+    let observer = std::fs::File::open(mount.join("probe.bin")).expect("observer");
+    let mut append = std::fs::OpenOptions::new()
+        .append(true)
+        .open(mount.join("probe.bin"))
+        .expect("append handle opened before initial write");
+    probe.write_all(&[0x5a; 512]).expect("buffered write");
+    let staged: u64 = std::fs::read_dir(state.path().join("journal"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "payload"))
+        // Directory enumeration on NTFS can retain length zero while the
+        // backing writer is open; inspect bytes through a fresh file handle.
+        .map(|entry| std::fs::read(entry.path()).expect("staged bytes").len() as u64)
+        .sum();
+    assert_eq!(
+        staged, 512,
+        "buffered writes must reach journal admission immediately"
+    );
+
+    // Copy tools reserve allocation space before writing. That reservation
+    // must not extend EOF.
+    let allocation = FILE_ALLOCATION_INFO {
+        AllocationSize: 128 << 20,
+    };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            probe.as_raw_handle(),
+            FileAllocationInfo,
+            (&allocation as *const FILE_ALLOCATION_INFO).cast(),
+            std::mem::size_of_val(&allocation) as u32,
+        )
+    };
+    assert_ne!(ok, 0, "allocation: {}", std::io::Error::last_os_error());
+    assert_eq!(probe.metadata().expect("probe stat").len(), 512);
+    append
+        .write_all(&[0xa5; 64])
+        .expect("append through second handle");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(observer.metadata().expect("expired metadata").len(), 576);
+    assert_eq!(
+        std::fs::read(mount.join("probe.bin")).expect("probe bytes"),
+        [&[0x5a; 512][..], &[0xa5; 64][..]].concat()
+    );
+    probe.sync_all().expect("probe flush");
+    drop(append);
+    drop(observer);
+    drop(probe);
+
+    // Cross three production 32 MiB segments using CopyFileEx (std::fs::copy
+    // on Windows), with bounded buffers and a timeout independent of I/O.
+    let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let original = source.path().join("large.bin");
+    let mut input = std::fs::File::create(&original).expect("source file");
+    let mut expected = blake3::Hasher::new();
+    for _ in 0..96 {
+        input.write_all(&chunk).expect("source write");
+        expected.update(&chunk);
+    }
+    input.sync_all().expect("source flush");
+    drop(input);
+    let destination = mount.join("large.bin");
+    let copy_to = destination.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::copy(original, &copy_to).and_then(|count| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(copy_to)?
+                .sync_all()?;
+            Ok(count)
+        });
+        let _ = tx.send(result);
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("copy/flush must finish within 60 seconds")
+            .expect("buffered copy"),
+        96 << 20,
+    );
+    stop(&mut host);
+    let mut host = spawn();
+    wait_ready(&mut host, &destination);
+    let mut copied = std::fs::File::open(destination).expect("copied file");
+    let mut actual = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = copied.read(&mut buffer).expect("remount read");
+        if count == 0 {
+            break;
+        }
+        actual.update(&buffer[..count]);
+    }
+    assert_eq!(
+        actual.finalize(),
+        expected.finalize(),
+        "copy hash after remount"
+    );
+    drop(copied);
+    stop(&mut host);
 }

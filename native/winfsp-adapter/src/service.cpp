@@ -111,7 +111,13 @@ NTSTATUS open_file(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32, UINT32, PVOID* conte
     *context = opened; fill_info(stat, info, host(fs)->writable()); return STATUS_SUCCESS;
 }
 void close_file(FSP_FILE_SYSTEM*, PVOID context) { mirage::release_file_context(static_cast<FileContext*>(context)); }
-NTSTATUS get_info(FSP_FILE_SYSTEM* fs, PVOID context, FSP_FSCTL_FILE_INFO* info) { auto* opened = static_cast<FileContext*>(context); if (!opened) return STATUS_INVALID_HANDLE; fill_info(opened->info, info, host(fs)->writable()); return STATUS_SUCCESS; }
+NTSTATUS get_info(FSP_FILE_SYSTEM* fs, PVOID context, FSP_FSCTL_FILE_INFO* info) {
+    auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
+    // With finite metadata caching, another open may have changed this inode.
+    const auto status=mirage_file_stat(opened->rust_handle,&opened->info);
+    if(status!=MIRAGE_OK)return mirage_status_to_ntstatus(status);
+    fill_info(opened->info,info,host(fs)->writable());return STATUS_SUCCESS;
+}
 struct Child { std::wstring name; MirageFileInfo info; };
 uint8_t collect_child(void* context, const uint16_t* name, size_t length, MirageFileInfo info) { static_cast<std::vector<Child>*>(context)->push_back({std::wstring(reinterpret_cast<const wchar_t*>(name), length), info}); return 1; }
 NTSTATUS read_dir(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR, PWSTR marker, PVOID buffer, ULONG length, PULONG transferred) {
@@ -153,6 +159,8 @@ NTSTATUS set_basic_info(FSP_FILE_SYSTEM* fs,PVOID context,UINT32,UINT64 creation
 NTSTATUS write_file(FSP_FILE_SYSTEM* fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,BOOLEAN write_to_end,BOOLEAN constrained,PULONG transferred,FSP_FSCTL_FILE_INFO* info){
     auto* opened=static_cast<FileContext*>(context); if(!opened||opened->info.directory) return STATUS_FILE_IS_A_DIRECTORY;
     if(!host(fs)->writable()) return STATUS_MEDIA_WRITE_PROTECTED;
+    const auto stat=mirage_file_stat(opened->rust_handle,&opened->info);
+    if(stat!=MIRAGE_OK)return mirage_status_to_ntstatus(stat);
     // WriteToEndOfFile: offset is the current EOF for a pure append.
     const uint64_t at = write_to_end ? opened->info.size : offset;
     // ConstrainedIo: writes may not extend past the current FileSize.
@@ -172,9 +180,20 @@ NTSTATUS overwrite(FSP_FILE_SYSTEM* fs,PVOID context,UINT32,BOOLEAN,UINT64,FSP_F
     if(status==MIRAGE_OK){ MirageFileInfo refreshed{}; if(mirage_file_stat(opened->rust_handle,&refreshed)==MIRAGE_OK) opened->info=refreshed; fill_info(opened->info,info,host(fs)->writable()); }
     return mirage_status_to_ntstatus(status);
 }
-NTSTATUS set_file_size(FSP_FILE_SYSTEM* fs,PVOID context,UINT64 new_size,BOOLEAN,FSP_FSCTL_FILE_INFO* info){
+NTSTATUS set_file_size(FSP_FILE_SYSTEM* fs,PVOID context,UINT64 new_size,BOOLEAN allocation,FSP_FSCTL_FILE_INFO* info){
     auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
     if(!host(fs)->writable()) return STATUS_MEDIA_WRITE_PROTECTED;
+    const auto stat=mirage_file_stat(opened->rust_handle,&opened->info);
+    if(stat!=MIRAGE_OK)return mirage_status_to_ntstatus(stat);
+    // Allocation growth is a reservation hint, not a change to EOF. CopyFile
+    // uses it before writing; treating it as truncate seals every growing
+    // segment and can reject a copy before any bytes have been admitted.
+    // Allocation shrink below EOF still truncates, as required by WinFsp.
+    if((allocation&&new_size>=opened->info.size)||new_size==opened->info.size){
+        fill_info(opened->info,info,host(fs)->writable());
+        if(allocation)info->AllocationSize=new_size;
+        return STATUS_SUCCESS;
+    }
     const auto status=mirage_truncate(opened->rust_handle,new_size);
     if(status==MIRAGE_OK){ MirageFileInfo refreshed{}; if(mirage_file_stat(opened->rust_handle,&refreshed)==MIRAGE_OK) opened->info=refreshed; fill_info(opened->info,info,host(fs)->writable()); }
     return mirage_status_to_ntstatus(status);
@@ -217,15 +236,13 @@ startup_stage_="initialize_engine";auto ffi=writable?mirage_engine_create_manage
     // a fresh FileContext per open and free it in Close, so UserContext2 semantics are required;
     // node semantics would let a second open see a stale/freed context.
     params.UmFileContextIsUserContext2=1;
-    // INFINITE FileInfoTimeout enables kernel data caching and read-ahead in
-    // WinFsp; with a finite timeout every 64 KiB read is a user-mode round
-    // trip (~0.3 ms) and small-buffer readers crawl at tens of MB/s. It is
-    // safe here because every mutation of a managed volume goes through this
-    // FSD (Write/SetFileSize/SetBasicInfo responses carry fresh FileInfo and
-    // the kernel FileNode keeps concurrent handles coherent); nothing changes
-    // file content behind WinFsp's back. Directory and volume info stay on a
-    // 1 s timeout so listings and free space refresh.
-    params.Version=sizeof(params);params.FileInfoTimeout=INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
+    // WinFsp 2.1 cached writes can deadlock under memory pressure while holding
+    // the FileNode lock (winfsp/winfsp#677). A finite FileInfoTimeout disables
+    // that kernel data-cache path: writes reach bounded journal admission
+    // before success, instead of building dirty pages outside our budget.
+    // Keep kernel read caching on immutable mounts. Managed reads still use
+    // the engine and backing-file caches, at the cost of user-mode callbacks.
+    params.Version=sizeof(params);params.FileInfoTimeout=writable?1000:INFINITE;params.VolumeInfoTimeoutValid=1;params.VolumeInfoTimeout=1000;params.DirInfoTimeoutValid=1;params.DirInfoTimeout=1000;
     startup_stage_="create_winfsp_filesystem";auto status=FspFileSystemCreate(const_cast<PWSTR>(L"" FSP_FSCTL_DISK_DEVICE_NAME),&params,const_cast<FSP_FILE_SYSTEM_INTERFACE*>(&winfsp_interface()),&fs_);if(dbg||!NT_SUCCESS(status))std::wcerr<<L"FspFileSystemCreate=0x"<<std::hex<<(unsigned long)status<<L"\n";if(!NT_SUCCESS(status))return status;fs_->UserContext=this;startup_stage_="set_mount_point";status=FspFileSystemSetMountPoint(fs_,const_cast<PWSTR>(path.c_str()));if(dbg||!NT_SUCCESS(status))std::wcerr<<L"SetMountPoint=0x"<<std::hex<<(unsigned long)status<<L"\n";if(!NT_SUCCESS(status)){FspFileSystemDelete(fs_);fs_=nullptr;}return status;
 }
 NTSTATUS FileSystemHost::run(){if(!fs_)return STATUS_INVALID_DEVICE_STATE;
