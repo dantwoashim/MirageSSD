@@ -24,7 +24,9 @@
         <ServiceInstall Id="MirageServiceInstall" Name="MirageSSD" DisplayName="MirageSSD Service" Description="MirageSSD repository and mount coordinator" Start="auto" Type="ownProcess" ErrorControl="normal" Account="LocalSystem">
           <PermissionEx Sddl="D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;BA)" />
         </ServiceInstall>
-        <ServiceControl Id="MirageServiceControl" Name="MirageSSD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <!-- Also remove an orphan left by an interrupted install, but only
+             after StopServices, with MSI's checked/elevated service actions. -->
+        <ServiceControl Id="MirageServiceControl" Name="MirageSSD" Start="install" Stop="both" Remove="both" Wait="yes" />
       </Component>
       <Component Id="DriveIconComponent" Guid="7F2E9C31-8A4B-4D2E-9C51-3B6A1E5D7F90" Bitness="always64">
         <!-- Per-user Explorer drive icon for managed letter mounts; the
