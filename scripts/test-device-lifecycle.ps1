@@ -177,6 +177,9 @@ class FakeMirage {
   Assert-Rejected { Clear-VfsCache 'D:\fixture\..' }
   $fixture.Cases += 2
   Write-Output "PASS: $($fixture.Cases) lifecycle scenarios; actual scripts and disposable files, simulated Google and Windows task/volume integration."
+  # Negative cases intentionally run scripts that exit 1. Do not leak their
+  # status to the CI caller after all assertions have passed.
+  $global:LASTEXITCODE = 0
 } finally {
   $env:LOCALAPPDATA = $originalLocal
   Microsoft.PowerShell.Management\Remove-Item Env:MIRAGE_TEST_ACCOUNT -ErrorAction SilentlyContinue

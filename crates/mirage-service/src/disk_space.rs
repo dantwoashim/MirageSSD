@@ -124,6 +124,7 @@ pub(crate) fn allocated_file_bytes(_path: &Path) -> Result<u64, MirageError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriveKind {
     Fixed,
+    #[cfg_attr(not(windows), allow(dead_code))]
     Other,
 }
 
