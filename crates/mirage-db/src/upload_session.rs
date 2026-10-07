@@ -123,14 +123,16 @@ pub fn create_session(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO publication_sessions
              (session_id, volume_id, kind, object_key, content_hash, phase,
               remote_upload_id, session_uri, chunk_offset, committed_bytes,
               total_bytes, next_ops, error_class, attempts, created_ns, updated_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, 'created', NULL, NULL, 0, 0,
                      ?6, ?7, NULL, 0, ?8, ?8)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 session.session_id.as_slice(),
                 session.volume_id.as_bytes().as_slice(),
                 session.kind.as_str(),
@@ -139,8 +141,8 @@ pub fn create_session(
                 session.total_bytes.map(|bytes| bytes as i64),
                 session.next_ops,
                 session.created_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "upload session insert failed"))?;
     Ok(())
 }
@@ -153,13 +155,17 @@ pub fn find_session_by_key(
     object_key: &str,
 ) -> Result<Option<UploadSession>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT session_id FROM publication_sessions
              WHERE volume_id = ?1 AND object_key = ?2
              ORDER BY created_ns DESC LIMIT 1",
-            params![volume_id.as_bytes().as_slice(), object_key],
-            |row| row.get::<_, Vec<u8>>(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), object_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "upload session lookup failed"))?
         .map(|bytes| {
@@ -185,14 +191,15 @@ fn load_session(
     session_id: &[u8; 16],
 ) -> Result<Option<UploadSession>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT session_id, volume_id, kind, object_key, content_hash,
                     phase, remote_upload_id, session_uri, chunk_offset,
                     committed_bytes, total_bytes, next_ops, error_class,
                     attempts, created_ns, updated_ns
              FROM publication_sessions WHERE session_id = ?1",
-            [session_id.as_slice()],
-            |row| {
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([session_id.as_slice()], |row| {
                 let hash: Option<Vec<u8>> = row.get(4)?;
                 Ok(UploadSession {
                     session_id: row
@@ -231,8 +238,8 @@ fn load_session(
                     created_ns: row.get(14)?,
                     updated_ns: row.get(15)?,
                 })
-            },
-        )
+            })
+        })
         .optional()
         .map_err(|e| sqlite(e, "upload session load failed"))
 }
@@ -256,7 +263,7 @@ pub fn advance_phase(
     now_ns: i64,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE publication_sessions SET
                 phase = ?1, remote_upload_id = COALESCE(?2, remote_upload_id),
                 session_uri = COALESCE(?3, session_uri), chunk_offset = ?4,
@@ -265,7 +272,9 @@ pub fn advance_phase(
              WHERE session_id = ?8 AND phase = ?9
                AND ?5 >= committed_bytes
                AND ?4 >= chunk_offset",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 phase.as_str(),
                 remote_upload_id,
                 session_uri,
@@ -275,8 +284,8 @@ pub fn advance_phase(
                 now_ns,
                 session_id.as_slice(),
                 expected_phase.as_str(),
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "upload session advance failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -293,7 +302,7 @@ pub fn unfinished_sessions(
     volume_id: RepositoryId,
 ) -> Result<Vec<UploadSession>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT session_id FROM publication_sessions
              WHERE volume_id = ?1
                AND phase NOT IN ('committed', 'aborted', 'done')

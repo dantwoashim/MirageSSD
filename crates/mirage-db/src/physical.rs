@@ -125,19 +125,21 @@ pub fn register_file(
     file: &PhysicalFileRecord,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT OR REPLACE INTO physical_files
              (file_id, path, zone, extent_bytes, extent_count, created_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 file.file_id.as_slice(),
                 file.path,
                 file.zone,
                 file.extent_bytes,
                 file.extent_count,
                 file.created_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "physical file registration failed"))?;
     Ok(())
 }
@@ -149,21 +151,35 @@ pub fn reserve_extent(
     extent: &PhysicalExtentRecord,
     reservation: &PhysicalReservationRecord,
 ) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin physical reservation"))?;
+    reserve_extent_in(&transaction, extent, reservation)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "physical reservation commit failed"))
+}
+
+/// Transaction-scoped form of [`reserve_extent`].
+pub fn reserve_extent_in(
+    transaction: &rusqlite::Transaction<'_>,
+    extent: &PhysicalExtentRecord,
+    reservation: &PhysicalReservationRecord,
+) -> Result<(), MirageError> {
     if extent.state != PhysicalExtentState::Reserved {
         return Err(MirageError::invalid_argument(
             "a new physical extent must start reserved",
         ));
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|e| sqlite(e, "failed to begin physical reservation"))?;
     // Free or dead slots may be reused; any other state conflicts.
     let occupying: Option<String> = transaction
-        .query_row(
-            "SELECT state FROM physical_extents WHERE file_id = ?1 AND slot_index = ?2",
-            params![extent.file_id.as_slice(), extent.slot_index],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT state FROM physical_extents WHERE file_id = ?1 AND slot_index = ?2")
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![extent.file_id.as_slice(), extent.slot_index],
+                |row| row.get(0),
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "physical slot lookup failed"))?;
     match occupying.as_deref() {
@@ -187,20 +203,22 @@ pub fn reserve_extent(
         }
         Some("dead") => {
             transaction
-                .execute(
+                .prepare_cached(
                     "UPDATE physical_extents SET extent_id = ?1, state = 'reserved',
                         length_bytes = ?2, page_hash = NULL, checksum = NULL,
                         pin_count = 0, generation = ?3, updated_ns = ?4
                      WHERE file_id = ?5 AND slot_index = ?6 AND state = 'dead'",
-                    params![
+                )
+                .and_then(|mut stmt| {
+                    stmt.execute(params![
                         extent.extent_id.as_slice(),
                         extent.length_bytes,
                         extent.generation,
                         extent.updated_ns,
                         extent.file_id.as_slice(),
                         extent.slot_index,
-                    ],
-                )
+                    ])
+                })
                 .map_err(|e| sqlite(e, "physical extent reclaim failed"))?;
         }
         Some(_) => {
@@ -209,21 +227,18 @@ pub fn reserve_extent(
             ));
         }
     }
-    transaction
-        .execute(
+    transaction.prepare_cached(
             "INSERT OR REPLACE INTO physical_reservations(extent_id, owner_epoch, created_ns, expires_ns)
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?1, ?2, ?3, ?4)").and_then(|mut stmt| stmt.execute(
             params![
                 extent.extent_id.as_slice(),
                 reservation.owner_epoch.as_slice(),
                 extent.updated_ns,
                 reservation.expires_ns,
             ],
-        )
+        ))
         .map_err(|e| sqlite(e, "physical reservation insert failed"))?;
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "physical reservation commit failed"))
+    Ok(())
 }
 
 /// Commits a reserved extent to alive with its content hash and checksum;
@@ -239,17 +254,19 @@ pub fn commit_extent(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin physical commit"))?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE physical_extents
              SET state = 'alive', page_hash = ?1, checksum = ?2, updated_ns = ?3
              WHERE extent_id = ?4 AND state = 'reserved'",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 page_hash.as_bytes().as_slice(),
                 checksum.as_slice(),
                 now_ns,
                 extent_id.as_slice(),
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "physical extent commit failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -257,10 +274,8 @@ pub fn commit_extent(
         ));
     }
     transaction
-        .execute(
-            "DELETE FROM physical_reservations WHERE extent_id = ?1",
-            [extent_id.as_slice()],
-        )
+        .prepare_cached("DELETE FROM physical_reservations WHERE extent_id = ?1")
+        .and_then(|mut stmt| stmt.execute([extent_id.as_slice()]))
         .map_err(|e| sqlite(e, "physical reservation release failed"))?;
     transaction
         .commit()
@@ -281,22 +296,19 @@ pub fn release_extent(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin physical release"))?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
              WHERE extent_id = ?2 AND state = 'reserved' AND pin_count = 0",
-            params![now_ns, extent_id.as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute(params![now_ns, extent_id.as_slice()]))
         .map_err(|e| sqlite(e, "physical extent release failed"))?;
     if changed != 1 {
         // Either the extent is alive (committed — its bytes may be
         // referenced) or it is pinned; releasing either would lose live
         // data. Report the distinction honestly.
         let state: Option<String> = transaction
-            .query_row(
-                "SELECT state FROM physical_extents WHERE extent_id = ?1",
-                [extent_id.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT state FROM physical_extents WHERE extent_id = ?1")
+            .and_then(|mut stmt| stmt.query_row([extent_id.as_slice()], |row| row.get(0)))
             .optional()
             .map_err(|e| sqlite(e, "physical extent lookup failed"))?;
         return Err(match state.as_deref() {
@@ -310,10 +322,8 @@ pub fn release_extent(
         });
     }
     transaction
-        .execute(
-            "DELETE FROM physical_reservations WHERE extent_id = ?1",
-            [extent_id.as_slice()],
-        )
+        .prepare_cached("DELETE FROM physical_reservations WHERE extent_id = ?1")
+        .and_then(|mut stmt| stmt.execute([extent_id.as_slice()]))
         .map_err(|e| sqlite(e, "physical reservation release failed"))?;
     transaction
         .commit()
@@ -328,11 +338,11 @@ pub fn mark_extent_dead(
     now_ns: i64,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
              WHERE extent_id = ?2 AND state = 'alive' AND pin_count = 0",
-            params![now_ns, extent_id.as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute(params![now_ns, extent_id.as_slice()]))
         .map_err(|e| sqlite(e, "physical extent eviction failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -362,27 +372,26 @@ pub fn revive_extent(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin physical revive"))?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE physical_extents
              SET state = 'alive', page_hash = ?1, checksum = ?2,
                  length_bytes = ?3, updated_ns = ?4
              WHERE extent_id = ?5 AND state = 'dead'",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 page_hash.as_bytes().as_slice(),
                 checksum.as_slice(),
                 length_bytes,
                 now_ns,
                 extent_id.as_slice(),
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "physical extent revive failed"))?;
     if changed == 0 {
         let state: Option<String> = transaction
-            .query_row(
-                "SELECT state FROM physical_extents WHERE extent_id = ?1",
-                [extent_id.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT state FROM physical_extents WHERE extent_id = ?1")
+            .and_then(|mut stmt| stmt.query_row([extent_id.as_slice()], |row| row.get(0)))
             .optional()
             .map_err(|e| sqlite(e, "physical extent lookup failed"))?;
         match state.as_deref() {
@@ -425,11 +434,11 @@ pub fn adjust_extent_pin(
     delta: i64,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE physical_extents SET pin_count = pin_count + ?1
              WHERE extent_id = ?2 AND state = 'alive' AND pin_count + ?1 >= 0",
-            params![delta, extent_id.as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute(params![delta, extent_id.as_slice()]))
         .map_err(|e| sqlite(e, "physical extent pin update failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -449,7 +458,7 @@ pub fn reap_expired_reservations(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin reservation reap"))?;
     let expired: Vec<Vec<u8>> = transaction
-        .prepare("SELECT extent_id FROM physical_reservations WHERE expires_ns <= ?1")
+        .prepare_cached("SELECT extent_id FROM physical_reservations WHERE expires_ns <= ?1")
         .and_then(|mut statement| {
             statement
                 .query_map([now_ns], |row| row.get::<_, Vec<u8>>(0))?
@@ -458,17 +467,15 @@ pub fn reap_expired_reservations(
         .map_err(|e| sqlite(e, "expired reservation scan failed"))?;
     for extent_id in &expired {
         transaction
-            .execute(
+            .prepare_cached(
                 "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
                  WHERE extent_id = ?2 AND state = 'reserved'",
-                params![now_ns, extent_id.as_slice()],
             )
+            .and_then(|mut stmt| stmt.execute(params![now_ns, extent_id.as_slice()]))
             .map_err(|e| sqlite(e, "expired reservation extent release failed"))?;
         transaction
-            .execute(
-                "DELETE FROM physical_reservations WHERE extent_id = ?1",
-                [extent_id.as_slice()],
-            )
+            .prepare_cached("DELETE FROM physical_reservations WHERE extent_id = ?1")
+            .and_then(|mut stmt| stmt.execute([extent_id.as_slice()]))
             .map_err(|e| sqlite(e, "expired reservation delete failed"))?;
     }
     let count = u64::try_from(expired.len())
@@ -491,7 +498,7 @@ pub type PhysicalState = (
 pub fn load_physical_state(connection: &Connection) -> Result<PhysicalState, MirageError> {
     let files: Vec<PhysicalFileRecord> = {
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT file_id, path, zone, extent_bytes, extent_count, created_ns
                  FROM physical_files",
             )
@@ -526,7 +533,7 @@ pub fn load_physical_state(connection: &Connection) -> Result<PhysicalState, Mir
     };
     let reservations: Vec<PhysicalReservationRecord> = {
         let mut statement = connection
-            .prepare("SELECT extent_id, owner_epoch, expires_ns FROM physical_reservations")
+            .prepare_cached("SELECT extent_id, owner_epoch, expires_ns FROM physical_reservations")
             .map_err(|e| sqlite(e, "physical reservation scan prepare failed"))?;
         statement
             .query_map([], |row| {

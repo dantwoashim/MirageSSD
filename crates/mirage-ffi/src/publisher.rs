@@ -461,6 +461,7 @@ fn publish_one(
         plaintext_hash: *blake3::hash(&plaintext).as_bytes(),
         frame_hashes,
         published_ns: now_ns_i64_pub(),
+        member_offset: 0,
     };
     match db.writer().payload_published(record) {
         Ok(()) => Ok(()),

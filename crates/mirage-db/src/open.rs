@@ -10,7 +10,25 @@ use crate::error::sqlite;
 pub const APPLICATION_ID: i32 = 0x4D49_5247;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn writer_connection(path: &Path) -> Result<Connection, MirageError> {
+/// Commit durability for the writer connection.
+///
+/// `Strict` fsyncs every commit (`PRAGMA synchronous = FULL` — the previous
+/// behavior). `Group` commits under `synchronous = NORMAL` (WAL unchanged:
+/// commits still reach the OS immediately and crash-consistent; a power loss
+/// can roll back only commits younger than the last barrier) and relies on
+/// [`DbWriter::durability_barrier`](crate::DbWriter::durability_barrier) —
+/// a FULL commit that fsyncs the WAL and thereby makes every earlier NORMAL
+/// commit durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    Strict,
+    Group,
+}
+
+pub(crate) fn writer_connection(
+    path: &Path,
+    durability: Durability,
+) -> Result<Connection, MirageError> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -29,6 +47,15 @@ pub(crate) fn writer_connection(path: &Path) -> Result<Connection, MirageError> 
              PRAGMA trusted_schema = OFF;",
         )
         .map_err(|error| sqlite(error, "failed to configure durable database pragmas"))?;
+    if durability == Durability::Group {
+        // NORMAL after migration/safety checks run under FULL — group
+        // commits land in the WAL without the per-commit fsync; the barrier
+        // makes them durable at most 250 ms later.
+        connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(|error| sqlite(error, "failed to set group-commit sync level"))?;
+    }
+    connection.set_prepared_statement_cache_capacity(256);
     validate_or_initialize_application_id(&connection, true)?;
     Ok(connection)
 }
@@ -49,6 +76,7 @@ pub(crate) fn read_connection(path: &Path) -> Result<Connection, MirageError> {
              PRAGMA trusted_schema = OFF;",
         )
         .map_err(|error| sqlite(error, "failed to configure read-only database pragmas"))?;
+    connection.set_prepared_statement_cache_capacity(256);
     validate_or_initialize_application_id(&connection, false)?;
     Ok(connection)
 }
@@ -182,7 +210,7 @@ mod tests {
     fn checked_out_connections_are_bounded_and_waiters_resume() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.db");
-        let _writer = writer_connection(&path).unwrap();
+        let _writer = writer_connection(&path, Durability::Strict).unwrap();
         let pool = ReadPool::new(path);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let active = Arc::new(AtomicUsize::new(0));
@@ -208,7 +236,8 @@ mod tests {
                     }
                     assert_eq!(
                         connection
-                            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                            .prepare_cached("SELECT 1")
+                            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
                             .unwrap(),
                         1
                     );

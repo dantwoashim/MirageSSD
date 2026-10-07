@@ -125,15 +125,17 @@ pub fn replace_extents_with_eof(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin extent replace"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "DELETE FROM byte_extents
              WHERE volume_id = ?1 AND inode = ?2 AND version = ?3",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice(),
                 version,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "extent replace delete failed"))?;
     let mut previous_end = 0u64;
     for (index, extent) in extents.iter().enumerate() {
@@ -156,12 +158,14 @@ pub fn replace_extents_with_eof(
         }
         previous_end = extent.start.saturating_add(extent.length);
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO byte_extents
                  (extent_id, volume_id, inode, version, start, length, kind,
                   page_hash, base_offset, payload_id, payload_offset, created_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     extent.extent_id.as_slice(),
                     volume_id.as_bytes().as_slice(),
                     inode.as_bytes().as_slice(),
@@ -174,28 +178,30 @@ pub fn replace_extents_with_eof(
                     extent.payload_id.map(|id| id.to_vec()),
                     extent.payload_offset.map(|offset| offset as i64),
                     now_ns,
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "extent insert failed"))?;
     }
     // Monotonic version head: an out-of-order older version never lowers the
     // recorded head, and an empty extent set still records the new EOF.
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO byte_extent_heads (volume_id, inode, version, eof, updated_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(volume_id, inode) DO UPDATE SET
                 version = excluded.version, eof = excluded.eof,
                 updated_ns = excluded.updated_ns
              WHERE excluded.version > byte_extent_heads.version",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice(),
                 version,
                 eof as i64,
                 now_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "extent head write failed"))?;
     transaction
         .commit()
@@ -209,18 +215,22 @@ pub fn extent_head(
     inode: InodeId,
 ) -> Result<Option<(i64, u64)>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT version, eof FROM byte_extent_heads
              WHERE volume_id = ?1 AND inode = ?2",
-            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    u64::try_from(row.get::<_, i64>(1)?)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?,
-                ))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        u64::try_from(row.get::<_, i64>(1)?)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?,
+                    ))
+                },
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "extent head lookup failed"))
 }
@@ -233,7 +243,7 @@ pub fn extents_at(
     version: i64,
 ) -> Result<Vec<ByteExtent>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT extent_id, volume_id, inode, version, start, length, kind,
                     page_hash, base_offset, payload_id, payload_offset, created_ns
              FROM byte_extents
@@ -313,16 +323,20 @@ pub fn latest_version(
     inode: InodeId,
 ) -> Result<Option<i64>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT MAX(version) FROM (
                  SELECT version FROM byte_extent_heads
                  WHERE volume_id = ?1 AND inode = ?2
                  UNION ALL
                  SELECT version FROM byte_extents
                  WHERE volume_id = ?1 AND inode = ?2)",
-            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice(),],
-            |row| row.get::<_, Option<i64>>(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice(),],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+        })
         .map_err(|e| sqlite(e, "extent version lookup failed"))
 }
 
@@ -335,7 +349,7 @@ pub fn extents_before(
     min_version: i64,
 ) -> Result<Vec<[u8; 16]>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT extent_id FROM byte_extents
              WHERE volume_id = ?1 AND inode = ?2 AND version < ?3",
         )
@@ -365,7 +379,7 @@ pub fn referenced_payload_ids(
     volume_id: RepositoryId,
 ) -> Result<std::collections::BTreeSet<[u8; 16]>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT DISTINCT payload_id FROM byte_extents
              WHERE volume_id = ?1 AND payload_id IS NOT NULL",
         )
@@ -399,7 +413,7 @@ pub fn compact_volume(
         .map_err(|e| sqlite(e, "failed to begin volume compaction"))?;
     let heads: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
-            .prepare("SELECT inode, version FROM byte_extent_heads WHERE volume_id = ?1")
+            .prepare_cached("SELECT inode, version FROM byte_extent_heads WHERE volume_id = ?1")
             .map_err(|e| sqlite(e, "extent head scan prepare failed"))?;
         let rows = statement
             .query_map([volume_id.as_bytes().as_slice()], |row| {
@@ -411,16 +425,18 @@ pub fn compact_volume(
     };
     for (inode, version) in &heads {
         transaction
-            .execute(
+            .prepare_cached(
                 "DELETE FROM byte_extents
                  WHERE volume_id = ?1 AND inode = ?2 AND version < ?3",
-                params![volume_id.as_bytes().as_slice(), inode, version],
             )
+            .and_then(|mut stmt| {
+                stmt.execute(params![volume_id.as_bytes().as_slice(), inode, version])
+            })
             .map_err(|e| sqlite(e, "superseded extent drop failed"))?;
     }
     let referenced: std::collections::BTreeSet<Vec<u8>> = {
         let mut statement = transaction
-            .prepare(
+            .prepare_cached(
                 "SELECT DISTINCT payload_id FROM byte_extents
                  WHERE volume_id = ?1 AND payload_id IS NOT NULL",
             )
@@ -435,7 +451,7 @@ pub fn compact_volume(
     };
     let alive: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
-            .prepare(
+            .prepare_cached(
                 "SELECT extent_id, length_bytes FROM physical_extents
                  WHERE file_id = ?1 AND state = 'alive'",
             )
@@ -456,11 +472,11 @@ pub fn compact_volume(
         // Pinned or not-alive extents stay put — a failed mark leaves the
         // payload referenced by the ledger and out of the delete set.
         let changed = transaction
-            .execute(
+            .prepare_cached(
                 "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
                  WHERE extent_id = ?2 AND state = 'alive' AND pin_count = 0",
-                params![now_ns, extent_id.as_slice()],
             )
+            .and_then(|mut stmt| stmt.execute(params![now_ns, extent_id.as_slice()]))
             .map_err(|e| sqlite(e, "journal extent dead mark failed"))?;
         if changed == 1 {
             dead.push((
@@ -485,15 +501,17 @@ pub fn drop_versions_before(
     keep_from: i64,
 ) -> Result<u64, MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "DELETE FROM byte_extents
              WHERE volume_id = ?1 AND inode = ?2 AND version < ?3",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice(),
                 keep_from,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "old extent drop failed"))?;
     u64::try_from(changed)
         .map_err(|_| MirageError::internal_invariant("extent drop count overflowed"))

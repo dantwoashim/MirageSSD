@@ -153,6 +153,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "0028_repository_cache_roots.sql",
         sql: include_str!("../../../migrations/0028_repository_cache_roots.sql"),
     },
+    Migration {
+        version: 29,
+        name: "0029_durability_barrier.sql",
+        sql: include_str!("../../../migrations/0029_durability_barrier.sql"),
+    },
+    Migration {
+        version: 30,
+        name: "0030_payload_member_offset.sql",
+        sql: include_str!("../../../migrations/0030_payload_member_offset.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

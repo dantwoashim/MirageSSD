@@ -22,22 +22,22 @@ pub(crate) fn set_cache_root(
                 ));
             }
             connection
-                .execute(
+                .prepare_cached(
                     "INSERT INTO repository_cache_roots(repository_id, cache_root, updated_ns)
                      VALUES(?1, ?2, ?3)
                      ON CONFLICT(repository_id) DO UPDATE SET
                        cache_root = excluded.cache_root,
                        updated_ns = excluded.updated_ns",
-                    params![repository_id.as_bytes().as_slice(), root, now_ns],
                 )
+                .and_then(|mut stmt| {
+                    stmt.execute(params![repository_id.as_bytes().as_slice(), root, now_ns])
+                })
                 .map_err(|e| sqlite(e, "cache root upsert failed"))?;
         }
         None => {
             connection
-                .execute(
-                    "DELETE FROM repository_cache_roots WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                )
+                .prepare_cached("DELETE FROM repository_cache_roots WHERE repository_id = ?1")
+                .and_then(|mut stmt| stmt.execute([repository_id.as_bytes().as_slice()]))
                 .map_err(|e| sqlite(e, "cache root delete failed"))?;
         }
     }
@@ -63,11 +63,14 @@ impl Database {
     ) -> Result<Option<String>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT cache_root FROM repository_cache_roots WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get::<_, String>(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "cache root lookup failed"))
         })

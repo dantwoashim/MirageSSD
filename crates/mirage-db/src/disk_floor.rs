@@ -28,23 +28,24 @@ pub(crate) fn set_floor(connection: &mut Connection, floor: DiskFloor) -> Result
         return Err(MirageError::invalid_argument("disk floor must be positive"));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO disk_floors(volume_root, floor_bytes, hysteresis_bytes, updated_ns)
              VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(volume_root) DO UPDATE SET
                floor_bytes = excluded.floor_bytes,
                hysteresis_bytes = excluded.hysteresis_bytes,
                updated_ns = excluded.updated_ns",
-            params![
-                floor.volume_root,
-                i64::try_from(floor.floor_bytes)
-                    .map_err(|_| MirageError::invalid_argument("disk floor overflows"))?,
-                i64::try_from(floor.hysteresis_bytes).map_err(|_| {
-                    MirageError::invalid_argument("disk floor hysteresis overflows")
-                })?,
-                floor.updated_ns,
-            ],
         )
+        .map_err(|e| sqlite(e, "disk floor upsert failed"))?
+        .execute(params![
+            floor.volume_root,
+            i64::try_from(floor.floor_bytes)
+                .map_err(|_| MirageError::invalid_argument("disk floor overflows"))?,
+            i64::try_from(floor.hysteresis_bytes).map_err(|_| {
+                MirageError::invalid_argument("disk floor hysteresis overflows")
+            })?,
+            floor.updated_ns,
+        ])
         .map_err(|e| sqlite(e, "disk floor upsert failed"))?;
     Ok(())
 }
@@ -54,10 +55,8 @@ pub(crate) fn clear_floor(
     volume_root: &str,
 ) -> Result<bool, MirageError> {
     Ok(connection
-        .execute(
-            "DELETE FROM disk_floors WHERE volume_root = ?1",
-            [volume_root],
-        )
+        .prepare_cached("DELETE FROM disk_floors WHERE volume_root = ?1")
+        .and_then(|mut stmt| stmt.execute([volume_root]))
         .map_err(|e| sqlite(e, "disk floor delete failed"))?
         > 0)
 }
@@ -72,27 +71,28 @@ pub(crate) fn record_run(
         .transaction()
         .map_err(|e| sqlite(e, "disk floor run transaction failed"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO disk_floor_runs(volume_root, at_ns, target_bytes, freed_bytes, outcome)
              VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                run.volume_root,
-                run.at_ns,
-                i64::try_from(run.target_bytes)
-                    .map_err(|_| MirageError::invalid_argument("reclaim target overflows"))?,
-                i64::try_from(run.freed_bytes)
-                    .map_err(|_| MirageError::invalid_argument("reclaim freed overflows"))?,
-                run.outcome,
-            ],
         )
+        .map_err(|e| sqlite(e, "disk floor run insert failed"))?
+        .execute(params![
+            run.volume_root,
+            run.at_ns,
+            i64::try_from(run.target_bytes)
+                .map_err(|_| MirageError::invalid_argument("reclaim target overflows"))?,
+            i64::try_from(run.freed_bytes)
+                .map_err(|_| MirageError::invalid_argument("reclaim freed overflows"))?,
+            run.outcome,
+        ])
         .map_err(|e| sqlite(e, "disk floor run insert failed"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "DELETE FROM disk_floor_runs WHERE volume_root = ?1 AND id NOT IN (
                SELECT id FROM disk_floor_runs WHERE volume_root = ?1
                ORDER BY at_ns DESC, id DESC LIMIT 100)",
-            [&run.volume_root],
         )
+        .and_then(|mut stmt| stmt.execute([&run.volume_root]))
         .map_err(|e| sqlite(e, "disk floor run prune failed"))?;
     transaction
         .commit()
@@ -134,7 +134,7 @@ impl Database {
     pub fn disk_floors(&self) -> Result<Vec<DiskFloor>, MirageError> {
         self.reads().with_connection(|connection| {
             let mut statement = connection
-                .prepare(
+                .prepare_cached(
                     "SELECT volume_root, floor_bytes, hysteresis_bytes, updated_ns
                      FROM disk_floors ORDER BY volume_root",
                 )
@@ -150,12 +150,11 @@ impl Database {
     pub fn disk_floor(&self, volume_root: &str) -> Result<Option<DiskFloor>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT volume_root, floor_bytes, hysteresis_bytes, updated_ns
                      FROM disk_floors WHERE volume_root = ?1",
-                    [volume_root],
-                    decode_floor,
                 )
+                .and_then(|mut stmt| stmt.query_row([volume_root], decode_floor))
                 .optional()
                 .map_err(|e| sqlite(e, "disk floor lookup failed"))
         })
@@ -167,13 +166,12 @@ impl Database {
     ) -> Result<Option<DiskFloorRun>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT volume_root, at_ns, target_bytes, freed_bytes, outcome
                      FROM disk_floor_runs WHERE volume_root = ?1
                      ORDER BY at_ns DESC, id DESC LIMIT 1",
-                    [volume_root],
-                    decode_run,
                 )
+                .and_then(|mut stmt| stmt.query_row([volume_root], decode_run))
                 .optional()
                 .map_err(|e| sqlite(e, "disk floor run lookup failed"))
         })

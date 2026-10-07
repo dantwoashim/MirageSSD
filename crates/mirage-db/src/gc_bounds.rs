@@ -52,21 +52,23 @@ pub struct UnreachableCandidate {
 /// Sets (idempotently) the retention bound for a history stream.
 pub fn set_bound(connection: &mut Connection, bound: &GcBound) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO gc_bounds(volume_id, kind, retain_from, min_keep, set_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(volume_id, kind) DO UPDATE SET
                 retain_from = excluded.retain_from,
                 min_keep = excluded.min_keep,
                 set_ns = excluded.set_ns",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 bound.volume_id.as_bytes().as_slice(),
                 bound.kind.as_str(),
                 bound.retain_from,
                 bound.min_keep,
                 bound.set_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "gc bound write failed"))?;
     Ok(())
 }
@@ -78,20 +80,24 @@ pub fn bound(
     kind: GcKind,
 ) -> Result<Option<GcBound>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT retain_from, min_keep, set_ns FROM gc_bounds
              WHERE volume_id = ?1 AND kind = ?2",
-            params![volume_id.as_bytes().as_slice(), kind.as_str()],
-            |row| {
-                Ok(GcBound {
-                    volume_id,
-                    kind,
-                    retain_from: row.get(0)?,
-                    min_keep: row.get(1)?,
-                    set_ns: row.get(2)?,
-                })
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), kind.as_str()],
+                |row| {
+                    Ok(GcBound {
+                        volume_id,
+                        kind,
+                        retain_from: row.get(0)?,
+                        min_keep: row.get(1)?,
+                        set_ns: row.get(2)?,
+                    })
+                },
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "gc bound lookup failed"))
 }
@@ -109,11 +115,13 @@ pub fn record_run(
     let mut run_id = [0u8; 16];
     let _ = getrandom::fill(&mut run_id);
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO gc_runs
              (run_id, volume_id, kind, boundary, reclaimed_count, started_ns, completed_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 run_id.as_slice(),
                 volume_id.as_bytes().as_slice(),
                 kind.as_str(),
@@ -121,8 +129,8 @@ pub fn record_run(
                 reclaimed as i64,
                 started_ns,
                 now_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "gc run record failed"))?;
     Ok(())
 }
@@ -138,18 +146,20 @@ pub fn mark_unreachable(
     now_ns: i64,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT OR REPLACE INTO unreachable_candidates
              (volume_id, object_key, unreachable_at_commit, detected_ns, reclaim_after_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 object_key,
                 at_commit.as_slice(),
                 now_ns,
                 reclaim_after_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "unreachable mark failed"))?;
     Ok(())
 }
@@ -163,7 +173,7 @@ pub fn reclaimable(
     now_ns: i64,
 ) -> Result<Vec<String>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT object_key FROM unreachable_candidates
              WHERE volume_id = ?1 AND unreachable_at_commit != ?2
                AND reclaim_after_ns <= ?3
@@ -191,10 +201,10 @@ pub fn clear_unreachable(
     object_key: &str,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "DELETE FROM unreachable_candidates WHERE volume_id = ?1 AND object_key = ?2",
-            params![volume_id.as_bytes().as_slice(), object_key],
         )
+        .and_then(|mut stmt| stmt.execute(params![volume_id.as_bytes().as_slice(), object_key]))
         .map_err(|e| sqlite(e, "unreachable clear failed"))?;
     Ok(())
 }

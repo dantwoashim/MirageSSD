@@ -69,15 +69,14 @@ impl DivergenceStatus {
 /// advances when a page was applied, which the caller decides; the ledger
 /// records what it is told and keeps the newest observed head.
 pub fn observe_head(connection: &mut Connection, head: &RemoteHead) -> Result<(), MirageError> {
-    connection
-        .execute(
+    connection.prepare_cached(
             "INSERT INTO remote_heads(volume_id, head_commit, head_seq, changes_cursor, observed_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(volume_id) DO UPDATE SET
                 head_commit = excluded.head_commit,
                 head_seq = excluded.head_seq,
                 changes_cursor = excluded.changes_cursor,
-                observed_ns = excluded.observed_ns",
+                observed_ns = excluded.observed_ns").and_then(|mut stmt| stmt.execute(
             params![
                 head.volume_id.as_bytes().as_slice(),
                 head.head_commit.as_slice(),
@@ -85,7 +84,7 @@ pub fn observe_head(connection: &mut Connection, head: &RemoteHead) -> Result<()
                 head.changes_cursor,
                 head.observed_ns,
             ],
-        )
+        ))
         .map_err(|e| sqlite(e, "remote head observe failed"))?;
     Ok(())
 }
@@ -102,21 +101,23 @@ pub fn record_change(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin remote change record"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT OR IGNORE INTO remote_change_entries
              (volume_id, entry_seq, cursor, change_kind, payload, observed_ns)
              VALUES (?1,
                      (SELECT COALESCE(MAX(entry_seq) + 1, 1)
                       FROM remote_change_entries WHERE volume_id = ?1),
                      ?2, ?3, ?4, ?5)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 change.volume_id.as_bytes().as_slice(),
                 change.cursor,
                 change.change_kind,
                 change.payload,
                 change.observed_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "remote change record failed"))?;
     transaction
         .commit()
@@ -133,7 +134,7 @@ pub fn changes_after(
     cursor: &str,
 ) -> Result<Vec<RemoteChange>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT volume_id, cursor, change_kind, payload, observed_ns
              FROM remote_change_entries
              WHERE volume_id = ?1 AND entry_seq > (
@@ -169,7 +170,7 @@ pub fn record_divergence(
     divergence: &Divergence,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO divergence_state
              (volume_id, base_commit, local_head, remote_head, status, detected_ns, resolved_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
@@ -180,15 +181,17 @@ pub fn record_divergence(
                 status = excluded.status,
                 detected_ns = excluded.detected_ns,
                 resolved_ns = excluded.resolved_ns",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 divergence.volume_id.as_bytes().as_slice(),
                 divergence.base_commit.map(|bytes| bytes.to_vec()),
                 divergence.local_head.as_slice(),
                 divergence.remote_head.as_slice(),
                 divergence.status.as_str(),
                 divergence.detected_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "divergence record failed"))?;
     Ok(())
 }
@@ -199,11 +202,12 @@ pub fn divergence(
     volume_id: RepositoryId,
 ) -> Result<Option<Divergence>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT base_commit, local_head, remote_head, status, detected_ns, resolved_ns
              FROM divergence_state WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |row| {
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
                 let base: Option<Vec<u8>> = row.get(0)?;
                 Ok(Divergence {
                     volume_id,
@@ -224,8 +228,8 @@ pub fn divergence(
                     detected_ns: row.get(4)?,
                     resolved_ns: row.get(5)?,
                 })
-            },
-        )
+            })
+        })
         .optional()
         .map_err(|e| sqlite(e, "divergence lookup failed"))
 }
@@ -243,11 +247,17 @@ pub fn resolve_divergence(
         ));
     }
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE divergence_state SET status = ?1, resolved_ns = ?2
              WHERE volume_id = ?3 AND status = 'diverged'",
-            params![status.as_str(), now_ns, volume_id.as_bytes().as_slice(),],
         )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                status.as_str(),
+                now_ns,
+                volume_id.as_bytes().as_slice(),
+            ])
+        })
         .map_err(|e| sqlite(e, "divergence resolve failed"))?;
     if changed == 0 {
         return Err(MirageError::repository_conflict(

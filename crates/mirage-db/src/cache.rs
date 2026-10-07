@@ -161,13 +161,12 @@ pub(crate) fn reserve_batch(
             continue;
         }
         let reserved = transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT shard_id, slot_index, generation, state, page_hash, logical_length
                  FROM cache_slots WHERE page_hash=?1 AND state=1
                  ORDER BY shard_id, slot_index LIMIT 1",
-                [hash.as_bytes().as_slice()],
-                decode_slot,
             )
+            .and_then(|mut stmt| stmt.query_row([hash.as_bytes().as_slice()], decode_slot))
             .optional()
             .map_err(|error| sqlite(error, "failed to query existing cache reservation"))?;
         if let Some(reserved) = reserved {
@@ -184,7 +183,7 @@ pub(crate) fn reserve_batch(
     let mut free = Vec::with_capacity(missing.len());
     {
         let mut statement = transaction
-            .prepare(
+            .prepare_cached(
                 "SELECT shard_id, slot_index, generation FROM cache_slots
                  WHERE state=0 ORDER BY shard_id, slot_index LIMIT ?1",
             )
@@ -216,17 +215,18 @@ pub(crate) fn reserve_batch(
             .checked_add(1)
             .ok_or_else(|| MirageError::internal_invariant("cache generation overflows"))?;
         let changed = transaction
-            .execute(
+            .prepare_cached(
                 "UPDATE cache_slots SET generation=?3, state=1, page_hash=?4, logical_length=?5
                  WHERE shard_id=?1 AND slot_index=?2 AND state=0",
-                params![
-                    shard_id,
-                    slot_index,
-                    sqlite_integer(generation, "cache generation")?,
-                    hash.as_bytes().as_slice(),
-                    i64::from(logical_length),
-                ],
             )
+            .map_err(|error| sqlite(error, "failed to reserve cache batch slot"))?
+            .execute(params![
+                shard_id,
+                slot_index,
+                sqlite_integer(generation, "cache generation")?,
+                hash.as_bytes().as_slice(),
+                i64::from(logical_length),
+            ])
             .map_err(|error| sqlite(error, "failed to reserve cache batch slot"))?;
         if changed != 1 {
             return Err(conflict("free cache slot changed during batch reservation"));
@@ -268,9 +268,9 @@ pub(crate) fn register_shard(
     let transaction = connection
         .transaction()
         .map_err(|error| sqlite(error, "failed to begin cache shard transaction"))?;
-    transaction.execute("INSERT INTO cache_shards(shard_id, relative_path, page_size, slot_count, format_version) VALUES (?1, ?2, ?3, ?4, 1)", params![value.shard_id, value.relative_path, sqlite_integer(value.page_size.as_u64(), "cache page size")?, i64::from(value.slot_count)]).map_err(|error| sqlite(error, "failed to insert cache shard"))?;
+    transaction.prepare_cached("INSERT INTO cache_shards(shard_id, relative_path, page_size, slot_count, format_version) VALUES (?1, ?2, ?3, ?4, 1)").map_err(|error| sqlite(error, "failed to insert cache shard"))?.execute( params![value.shard_id, value.relative_path, sqlite_integer(value.page_size.as_u64(), "cache page size")?, i64::from(value.slot_count)]).map_err(|error| sqlite(error, "failed to insert cache shard"))?;
     {
-        let mut statement = transaction.prepare("INSERT INTO cache_slots(shard_id, slot_index, generation, state, page_hash, logical_length) VALUES (?1, ?2, 0, 0, NULL, 0)").map_err(|error| sqlite(error, "failed to prepare cache slots"))?;
+        let mut statement = transaction.prepare_cached("INSERT INTO cache_slots(shard_id, slot_index, generation, state, page_hash, logical_length) VALUES (?1, ?2, 0, 0, NULL, 0)").map_err(|error| sqlite(error, "failed to prepare cache slots"))?;
         for slot in 0..value.slot_count {
             statement
                 .execute(params![value.shard_id, i64::from(slot)])
@@ -298,12 +298,12 @@ pub(crate) fn reserve(
     if let Some(existing) = query_hash(&transaction, hash, CacheSlotState::Resident)? {
         return Ok(ReserveCacheSlotOutcome::Existing(existing));
     }
-    let free = transaction.query_row("SELECT shard_id, slot_index, generation FROM cache_slots WHERE state = 0 ORDER BY shard_id, slot_index LIMIT 1", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))).optional().map_err(|error| sqlite(error, "failed to select free cache slot"))?.ok_or_else(|| MirageError::cache_full("cache has no free slot"))?;
+    let free = transaction.prepare_cached("SELECT shard_id, slot_index, generation FROM cache_slots WHERE state = 0 ORDER BY shard_id, slot_index LIMIT 1").and_then(|mut stmt| stmt.query_row( [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))).optional().map_err(|error| sqlite(error, "failed to select free cache slot"))?.ok_or_else(|| MirageError::cache_full("cache has no free slot"))?;
     let generation = u64::try_from(free.2)
         .map_err(|_| MirageError::integrity_mismatch("cache generation is negative"))?
         .checked_add(1)
         .ok_or_else(|| MirageError::internal_invariant("cache generation overflows"))?;
-    transaction.execute("UPDATE cache_slots SET generation=?3, state=1, page_hash=?4, logical_length=?5 WHERE shard_id=?1 AND slot_index=?2 AND state=0", params![free.0, free.1, sqlite_integer(generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(logical_length)]).map_err(|error| sqlite(error, "failed to reserve cache slot"))?;
+    transaction.prepare_cached("UPDATE cache_slots SET generation=?3, state=1, page_hash=?4, logical_length=?5 WHERE shard_id=?1 AND slot_index=?2 AND state=0").map_err(|error| sqlite(error, "failed to reserve cache slot"))?.execute( params![free.0, free.1, sqlite_integer(generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(logical_length)]).map_err(|error| sqlite(error, "failed to reserve cache slot"))?;
     transaction
         .commit()
         .map_err(|error| sqlite(error, "failed to commit cache reservation"))?;
@@ -334,7 +334,7 @@ pub(crate) fn commit_slot(
             .map_err(|error| sqlite(error, "failed to resolve duplicate cache slot"))?;
         return Ok(CommitCacheSlotOutcome::Existing(existing));
     }
-    let changed = transaction.execute("UPDATE cache_slots SET state=2 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=1 AND page_hash=?4 AND logical_length=?5", params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(record.logical_length)]).map_err(|error| sqlite(error, "failed to commit resident cache slot"))?;
+    let changed = transaction.prepare_cached("UPDATE cache_slots SET state=2 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=1 AND page_hash=?4 AND logical_length=?5").map_err(|error| sqlite(error, "failed to commit resident cache slot"))?.execute( params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(record.logical_length)]).map_err(|error| sqlite(error, "failed to commit resident cache slot"))?;
     if changed != 1 {
         return Err(conflict("cache reservation changed before commit"));
     }
@@ -377,8 +377,8 @@ pub(crate) fn commit_batch(
         if query_hash(&transaction, hash, CacheSlotState::Resident)?.is_some() {
             return Err(conflict("cache batch page became resident before commit"));
         }
-        let changed = transaction.execute(
-            "UPDATE cache_slots SET state=2 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=1 AND page_hash=?4 AND logical_length=?5",
+        let changed = transaction.prepare_cached(
+            "UPDATE cache_slots SET state=2 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=1 AND page_hash=?4 AND logical_length=?5").map_err(|error| sqlite(error, "failed to publish cache batch slot"))?.execute(
             params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, hash.as_bytes().as_slice(), i64::from(record.logical_length)],
         ).map_err(|error| sqlite(error, "failed to publish cache batch slot"))?;
         if changed != 1 {
@@ -414,7 +414,7 @@ pub(crate) fn begin_eviction(
     record: CacheSlotRecord,
 ) -> Result<CacheSlotRecord, MirageError> {
     require(record, CacheSlotState::Resident)?;
-    let changed = connection.execute("UPDATE cache_slots SET state=3 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=2 AND page_hash=?4", params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, record.page_hash.expect("validated").as_bytes().as_slice()]).map_err(|error| sqlite(error, "failed to begin cache eviction"))?;
+    let changed = connection.prepare_cached("UPDATE cache_slots SET state=3 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=2 AND page_hash=?4").map_err(|error| sqlite(error, "failed to begin cache eviction"))?.execute( params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, record.page_hash.expect("validated").as_bytes().as_slice()]).map_err(|error| sqlite(error, "failed to begin cache eviction"))?;
     if changed != 1 {
         return Err(conflict("resident cache slot changed before eviction"));
     }
@@ -435,7 +435,7 @@ pub(crate) fn finish_deallocation(
             "cache slot is not awaiting deallocation",
         ));
     }
-    let changed = connection.execute("UPDATE cache_slots SET state=0, page_hash=NULL, logical_length=0 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state IN (3,4)", params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?]).map_err(|error| sqlite(error, "failed to finish cache deallocation"))?;
+    let changed = connection.prepare_cached("UPDATE cache_slots SET state=0, page_hash=NULL, logical_length=0 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state IN (3,4)").map_err(|error| sqlite(error, "failed to finish cache deallocation"))?.execute( params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?]).map_err(|error| sqlite(error, "failed to finish cache deallocation"))?;
     if changed != 1 {
         return Err(conflict("cache slot changed before deallocation completed"));
     }
@@ -445,7 +445,7 @@ pub(crate) fn mark_retry(
     connection: &mut Connection,
     record: CacheSlotRecord,
 ) -> Result<(), MirageError> {
-    let changed = connection.execute("UPDATE cache_slots SET state=4 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=3", params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?]).map_err(|error| sqlite(error, "failed to mark cache deallocation retry"))?;
+    let changed = connection.prepare_cached("UPDATE cache_slots SET state=4 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=3").map_err(|error| sqlite(error, "failed to mark cache deallocation retry"))?.execute( params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?]).map_err(|error| sqlite(error, "failed to mark cache deallocation retry"))?;
     if changed != 1 {
         return Err(conflict("evicting cache slot changed before retry"));
     }
@@ -457,9 +457,8 @@ fn transition_to_evicting(
     record: CacheSlotRecord,
     state: CacheSlotState,
 ) -> Result<(), MirageError> {
-    let changed = connection
-        .execute(
-            "UPDATE cache_slots SET state=3 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=?4",
+    let changed = connection.prepare_cached(
+            "UPDATE cache_slots SET state=3 WHERE shard_id=?1 AND slot_index=?2 AND generation=?3 AND state=?4").map_err(|error| sqlite(error, "failed to quarantine cache slot"))?.execute(
             params![record.shard_id, i64::from(record.slot_index), sqlite_integer(record.generation, "cache generation")?, state as i64],
         )
         .map_err(|error| sqlite(error, "failed to quarantine cache slot"))?;
@@ -482,10 +481,10 @@ fn query_hash(
     hash: PageHash,
     state: CacheSlotState,
 ) -> Result<Option<CacheSlotRecord>, MirageError> {
-    connection.query_row("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots WHERE page_hash=?1 AND state=?2", params![hash.as_bytes().as_slice(), state as i64], decode_slot).optional().map_err(|error| sqlite(error, "failed to query cache hash"))
+    connection.prepare_cached("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots WHERE page_hash=?1 AND state=?2").and_then(|mut stmt| stmt.query_row( params![hash.as_bytes().as_slice(), state as i64], decode_slot)).optional().map_err(|error| sqlite(error, "failed to query cache hash"))
 }
 fn load_residents(connection: &Connection) -> Result<Vec<CacheSlotRecord>, MirageError> {
-    let mut statement = connection.prepare("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots WHERE state=2 ORDER BY shard_id, slot_index").map_err(|error| sqlite(error, "failed to prepare resident cache load"))?;
+    let mut statement = connection.prepare_cached("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots WHERE state=2 ORDER BY shard_id, slot_index").map_err(|error| sqlite(error, "failed to prepare resident cache load"))?;
     statement
         .query_map([], decode_slot)
         .map_err(|error| sqlite(error, "failed to load resident cache slots"))?
@@ -493,7 +492,7 @@ fn load_residents(connection: &Connection) -> Result<Vec<CacheSlotRecord>, Mirag
         .map_err(|error| sqlite(error, "failed to decode resident cache slot"))
 }
 fn load_all(connection: &Connection) -> Result<Vec<CacheSlotRecord>, MirageError> {
-    let mut statement = connection.prepare("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots ORDER BY shard_id, slot_index").map_err(|error| sqlite(error, "failed to prepare cache slot load"))?;
+    let mut statement = connection.prepare_cached("SELECT shard_id, slot_index, generation, state, page_hash, logical_length FROM cache_slots ORDER BY shard_id, slot_index").map_err(|error| sqlite(error, "failed to prepare cache slot load"))?;
     statement
         .query_map([], decode_slot)
         .map_err(|error| sqlite(error, "failed to load cache slots"))?
@@ -502,7 +501,7 @@ fn load_all(connection: &Connection) -> Result<Vec<CacheSlotRecord>, MirageError
 }
 fn load_shards(connection: &Connection) -> Result<Vec<CacheShardSpec>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT shard_id, relative_path, page_size, slot_count
              FROM cache_shards ORDER BY shard_id",
         )

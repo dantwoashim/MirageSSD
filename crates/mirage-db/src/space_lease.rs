@@ -110,11 +110,10 @@ impl Database {
         lease_id: SpaceLeaseId,
     ) -> Result<Option<SpaceLeaseRecord>, MirageError> {
         self.reads.with_connection(|connection| {
-            connection
-                .query_row(
+            connection.prepare_cached(
                     "SELECT repository_id, target_volume_id, requested_bytes, planned_reclaim_bytes, state, \
                             created_at_ns, updated_at_ns, expires_at_ns \
-                     FROM space_leases WHERE lease_id = ?1",
+                     FROM space_leases WHERE lease_id = ?1").and_then(|mut stmt| stmt.query_row(
                     [lease_id.as_bytes().as_slice()],
                     |row| {
                         Ok((
@@ -128,7 +127,7 @@ impl Database {
                             row.get::<_, i64>(7)?,
                         ))
                     },
-                )
+                ))
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load Space Lease"))?
                 .map(
@@ -174,12 +173,13 @@ impl Database {
     ) -> Result<u64, MirageError> {
         self.reads.with_connection(|connection| {
             let bytes: i64 = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT coalesce(sum(requested_bytes), 0) FROM space_leases \
                      WHERE repository_id = ?1 AND state IN ('preparing', 'ready', 'consumed')",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| row.get(0))
+                })
                 .map_err(|error| sqlite(error, "failed to total active Space Leases"))?;
             nonnegative(bytes, "active Space Lease bytes")
         })
@@ -197,14 +197,15 @@ impl Database {
         }
         self.reads.with_connection(|connection| {
             let bytes: i64 = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT coalesce(sum(requested_bytes), 0) FROM space_leases \
                      WHERE target_volume_id = ?1 \
                        AND state IN ('preparing', 'ready', 'consumed') \
                        AND expires_at_ns > ?2",
-                    params![target_volume_id, at_ns],
-                    |row| row.get(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row(params![target_volume_id, at_ns], |row| row.get(0))
+                })
                 .map_err(|error| sqlite(error, "failed to total active volume Space Leases"))?;
             nonnegative(bytes, "active volume Space Lease bytes")
         })
@@ -227,12 +228,11 @@ pub(crate) fn create(connection: &mut Connection, lease: NewSpaceLease) -> Resul
             "Space Lease timestamps are invalid",
         ));
     }
-    connection
-        .execute(
+    connection.prepare_cached(
             "INSERT INTO space_leases( \
                 lease_id, repository_id, target_volume_id, requested_bytes, planned_reclaim_bytes, state, \
                 created_at_ns, updated_at_ns, expires_at_ns \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'preparing', ?6, ?6, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'preparing', ?6, ?6, ?7)").map_err(|error| sqlite(error, "failed to create Space Lease"))?.execute(
             params![
                 lease.lease_id.as_bytes().as_slice(),
                 lease.repository_id.as_bytes().as_slice(),
@@ -263,11 +263,14 @@ pub(crate) fn transition(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| sqlite(error, "failed to begin Space Lease transition"))?;
     let stored: Option<(String, i64, i64)> = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT state, updated_at_ns, expires_at_ns FROM space_leases WHERE lease_id = ?1",
-            [change.lease_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row([change.lease_id.as_bytes().as_slice()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to read Space Lease transition state"))?;
     let (stored, previous_at_ns, expires_at_ns) =
@@ -290,17 +293,19 @@ pub(crate) fn transition(
     }
     let next = next_state(current, change.event)?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE space_leases SET state = ?2, updated_at_ns = ?3 \
              WHERE lease_id = ?1 AND state = ?4 AND updated_at_ns = ?5",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 change.lease_id.as_bytes().as_slice(),
                 next.as_str(),
                 change.at_ns,
                 current.as_str(),
                 previous_at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to update Space Lease state"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(

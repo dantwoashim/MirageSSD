@@ -85,27 +85,31 @@ pub fn create_volume(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace volume transaction"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO namespace_volumes(volume_id, naming_version, root_inode, created_ns)
              VALUES (?1, ?2, ?3, ?4)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 mirage_types::NAMING_POLICY_VERSION,
                 root.as_bytes().as_slice(),
                 now_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "failed to create namespace volume"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO inodes(volume_id, inode, kind, size, created_ns, modified_ns)
              VALUES (?1, ?2, 'directory', 0, ?3, ?3)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 root.as_bytes().as_slice(),
                 now_ns
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "failed to seed namespace root"))?;
     transaction
         .commit()
@@ -123,28 +127,32 @@ pub fn lookup(
 ) -> Result<Option<DirEntry>, MirageError> {
     let folded = fold_name(name)?;
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size,
                     i.created_ns, i.modified_ns
              FROM dirents d JOIN inodes i
                ON i.volume_id = d.volume_id AND i.inode = d.child_inode
              WHERE d.volume_id = ?1 AND d.parent_inode = ?2 AND d.folded_name = ?3",
-            params![
-                volume_id.as_bytes().as_slice(),
-                parent.as_bytes().as_slice(),
-                folded,
-            ],
-            |row| {
-                let inode: Vec<u8> = row.get(0)?;
-                let display: String = row.get(1)?;
-                let folded: String = row.get(2)?;
-                let kind: String = row.get(3)?;
-                let size: i64 = row.get(4)?;
-                let created_ns: i64 = row.get(5)?;
-                let modified_ns: i64 = row.get(6)?;
-                Ok((inode, display, folded, kind, size, created_ns, modified_ns))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    parent.as_bytes().as_slice(),
+                    folded,
+                ],
+                |row| {
+                    let inode: Vec<u8> = row.get(0)?;
+                    let display: String = row.get(1)?;
+                    let folded: String = row.get(2)?;
+                    let kind: String = row.get(3)?;
+                    let size: i64 = row.get(4)?;
+                    let created_ns: i64 = row.get(5)?;
+                    let modified_ns: i64 = row.get(6)?;
+                    Ok((inode, display, folded, kind, size, created_ns, modified_ns))
+                },
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "namespace lookup failed"))?
         .map(
@@ -172,22 +180,26 @@ pub fn stat(
     inode: InodeId,
 ) -> Result<Option<NamespaceStat>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT inode, kind, size, version_root, extent_root, created_ns, modified_ns
              FROM inodes WHERE volume_id = ?1 AND inode = ?2",
-            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                ))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "namespace stat failed"))?
         .map(
@@ -223,7 +235,7 @@ pub fn list_children(
         ));
     }
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT d.child_inode, d.display_name, d.folded_name, i.kind, i.size,
                     i.created_ns, i.modified_ns
              FROM dirents d JOIN inodes i
@@ -300,11 +312,15 @@ pub fn resolve_legacy(
     legacy_path: &str,
 ) -> Result<Option<InodeId>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT inode FROM legacy_inode_map WHERE volume_id = ?1 AND legacy_path = ?2",
-            params![volume_id.as_bytes().as_slice(), legacy_path],
-            |row| row.get::<_, Vec<u8>>(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), legacy_path],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "legacy inode lookup failed"))?
         .map(|bytes| decode_inode(&bytes))
@@ -319,20 +335,17 @@ fn allocate_inode(
     volume_id: RepositoryId,
 ) -> Result<InodeId, MirageError> {
     let sequence: i64 = transaction
-        .query_row(
-            "SELECT next_sequence FROM namespace_volumes WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT next_sequence FROM namespace_volumes WHERE volume_id = ?1")
+        .and_then(|mut stmt| stmt.query_row([volume_id.as_bytes().as_slice()], |row| row.get(0)))
         .optional()
         .map_err(|e| sqlite(e, "namespace allocator lookup failed"))?
         .ok_or_else(|| MirageError::invalid_argument("namespace volume does not exist"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE namespace_volumes SET next_sequence = next_sequence + 1
              WHERE volume_id = ?1 AND next_sequence = ?2",
-            params![volume_id.as_bytes().as_slice(), sequence],
         )
+        .and_then(|mut stmt| stmt.execute(params![volume_id.as_bytes().as_slice(), sequence]))
         .map_err(|e| sqlite(e, "namespace allocator update failed"))?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"MirageSSD inode v1\0");
@@ -355,38 +368,56 @@ pub fn create_node(
     kind: NamespaceNodeKind,
     now_ns: i64,
 ) -> Result<DirEntry, MirageError> {
-    let folded = fold_name(display_name)?;
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace create"))?;
-    let parent_stat = stat(&transaction, volume_id, parent)?
+    let entry = create_node_in(&transaction, volume_id, parent, display_name, kind, now_ns)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace create commit failed"))?;
+    Ok(entry)
+}
+
+/// Transaction-scoped form of [`create_node`]: the caller owns the
+/// transaction so the change can commit alongside other journal state.
+pub fn create_node_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    parent: InodeId,
+    display_name: &str,
+    kind: NamespaceNodeKind,
+    now_ns: i64,
+) -> Result<DirEntry, MirageError> {
+    let folded = fold_name(display_name)?;
+    let parent_stat = stat(transaction, volume_id, parent)?
         .ok_or_else(|| MirageError::invalid_argument("namespace parent inode is missing"))?;
     if parent_stat.kind != NamespaceNodeKind::Directory {
         return Err(MirageError::invalid_argument(
             "namespace parent is not a directory",
         ));
     }
-    let inode = allocate_inode(&transaction, volume_id)?;
+    let inode = allocate_inode(transaction, volume_id)?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO inodes(volume_id, inode, kind, size, created_ns, modified_ns)
              VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice(),
                 kind.as_str(),
                 now_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace inode insert failed"))?;
     // OR IGNORE turns a name collision into `changed == 0` so the caller sees
     // a conflict (ERROR_ALREADY_EXISTS at the filesystem) rather than a raw
     // constraint failure surfacing as an I/O error; the transaction drops
     // and rolls back the inode row.
-    let changed = transaction
-        .execute(
+    let changed = transaction.prepare_cached(
             "INSERT OR IGNORE INTO dirents(volume_id, parent_inode, folded_name, display_name, child_inode)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5)").and_then(|mut stmt| stmt.execute(
             params![
                 volume_id.as_bytes().as_slice(),
                 parent.as_bytes().as_slice(),
@@ -394,7 +425,7 @@ pub fn create_node(
                 display_name,
                 inode.as_bytes().as_slice(),
             ],
-        )
+        ))
         .map_err(|e| sqlite(e, "namespace dirent insert failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -402,7 +433,7 @@ pub fn create_node(
         ));
     }
     record_delta(
-        &transaction,
+        transaction,
         volume_id,
         mirage_manifest::namespace::NamespaceOp::Create {
             parent,
@@ -414,9 +445,6 @@ pub fn create_node(
         },
         now_ns,
     )?;
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "namespace create commit failed"))?;
     Ok(DirEntry {
         inode,
         display_name: display_name.to_owned(),
@@ -440,14 +468,38 @@ pub fn rename(
     to_name: &str,
     now_ns: i64,
 ) -> Result<(), MirageError> {
-    let from_folded = fold_name(from_name)?;
-    let to_folded = fold_name(to_name)?;
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace rename"))?;
-    let entry = lookup(&transaction, volume_id, from_parent, from_name)?
+    rename_in(
+        &transaction,
+        volume_id,
+        from_parent,
+        from_name,
+        to_parent,
+        to_name,
+        now_ns,
+    )?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace rename commit failed"))
+}
+
+/// Transaction-scoped form of [`rename`].
+pub fn rename_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    from_parent: InodeId,
+    from_name: &str,
+    to_parent: InodeId,
+    to_name: &str,
+    now_ns: i64,
+) -> Result<(), MirageError> {
+    let from_folded = fold_name(from_name)?;
+    let to_folded = fold_name(to_name)?;
+    let entry = lookup(transaction, volume_id, from_parent, from_name)?
         .ok_or_else(|| MirageError::invalid_argument("namespace rename source is missing"))?;
-    let to_stat = stat(&transaction, volume_id, to_parent)?.ok_or_else(|| {
+    let to_stat = stat(transaction, volume_id, to_parent)?.ok_or_else(|| {
         MirageError::invalid_argument("namespace rename target parent is missing")
     })?;
     if to_stat.kind != NamespaceNodeKind::Directory {
@@ -470,15 +522,19 @@ pub fn rename(
                 ));
             }
             let parent: Option<Vec<u8>> = transaction
-                .query_row(
+                .prepare_cached(
                     "SELECT parent_inode FROM dirents
                      WHERE volume_id = ?1 AND child_inode = ?2",
-                    params![
-                        volume_id.as_bytes().as_slice(),
-                        ancestor.as_bytes().as_slice()
-                    ],
-                    |row| row.get(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row(
+                        params![
+                            volume_id.as_bytes().as_slice(),
+                            ancestor.as_bytes().as_slice()
+                        ],
+                        |row| row.get(0),
+                    )
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "namespace ancestor lookup failed"))?;
             match parent {
@@ -493,22 +549,26 @@ pub fn rename(
             }
         }
     }
-    if let Some(victim) = lookup(&transaction, volume_id, to_parent, to_name)?
+    if let Some(victim) = lookup(transaction, volume_id, to_parent, to_name)?
         && victim.inode != entry.inode
     {
-        let victim_stat = stat(&transaction, volume_id, victim.inode)?
+        let victim_stat = stat(transaction, volume_id, victim.inode)?
             .ok_or_else(|| MirageError::integrity_mismatch("namespace victim inode is missing"))?;
         if victim_stat.kind == NamespaceNodeKind::Directory {
             let child_count: i64 = transaction
-                .query_row(
+                .prepare_cached(
                     "SELECT COUNT(*) FROM dirents
                      WHERE volume_id = ?1 AND parent_inode = ?2",
-                    params![
-                        volume_id.as_bytes().as_slice(),
-                        victim.inode.as_bytes().as_slice()
-                    ],
-                    |row| row.get(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row(
+                        params![
+                            volume_id.as_bytes().as_slice(),
+                            victim.inode.as_bytes().as_slice()
+                        ],
+                        |row| row.get(0),
+                    )
+                })
                 .map_err(|e| sqlite(e, "namespace victim emptiness check failed"))?;
             if child_count != 0 {
                 return Err(MirageError::repository_conflict(
@@ -516,27 +576,26 @@ pub fn rename(
                 ));
             }
         }
-        transaction
-            .execute(
-                "DELETE FROM dirents WHERE volume_id = ?1 AND parent_inode = ?2 AND folded_name = ?3",
+        transaction.prepare_cached(
+                "DELETE FROM dirents WHERE volume_id = ?1 AND parent_inode = ?2 AND folded_name = ?3").and_then(|mut stmt| stmt.execute(
                 params![
                     volume_id.as_bytes().as_slice(),
                     to_parent.as_bytes().as_slice(),
                     victim.folded_name,
                 ],
-            )
+            ))
             .map_err(|e| sqlite(e, "namespace victim dirent removal failed"))?;
         transaction
-            .execute(
-                "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2",
-                params![
+            .prepare_cached("DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2")
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     volume_id.as_bytes().as_slice(),
                     victim.inode.as_bytes().as_slice()
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "namespace victim inode removal failed"))?;
         record_delta(
-            &transaction,
+            transaction,
             volume_id,
             mirage_manifest::namespace::NamespaceOp::Delete {
                 parent: to_parent,
@@ -547,18 +606,20 @@ pub fn rename(
         )?;
     }
     let moved = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE dirents SET parent_inode = ?1, folded_name = ?2, display_name = ?3
              WHERE volume_id = ?4 AND parent_inode = ?5 AND folded_name = ?6",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 to_parent.as_bytes().as_slice(),
                 &to_folded,
                 to_name,
                 volume_id.as_bytes().as_slice(),
                 from_parent.as_bytes().as_slice(),
                 &from_folded,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace rename move failed"))?;
     if moved != 1 {
         return Err(MirageError::repository_conflict(
@@ -566,17 +627,17 @@ pub fn rename(
         ));
     }
     transaction
-        .execute(
-            "UPDATE inodes SET modified_ns = ?1 WHERE volume_id = ?2 AND inode = ?3",
-            params![
+        .prepare_cached("UPDATE inodes SET modified_ns = ?1 WHERE volume_id = ?2 AND inode = ?3")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 now_ns,
                 volume_id.as_bytes().as_slice(),
                 entry.inode.as_bytes().as_slice()
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace rename inode touch failed"))?;
     record_delta(
-        &transaction,
+        transaction,
         volume_id,
         mirage_manifest::namespace::NamespaceOp::Rename {
             inode: entry.inode,
@@ -587,10 +648,7 @@ pub fn rename(
             folded_name: to_folded,
         },
         now_ns,
-    )?;
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "namespace rename commit failed"))
+    )
 }
 
 /// Deletes an entry. A directory must be empty; the inode row is removed with
@@ -602,23 +660,41 @@ pub fn delete_node(
     name: &str,
     now_ns: i64,
 ) -> Result<(), MirageError> {
-    let folded = fold_name(name)?;
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace delete"))?;
-    let entry = lookup(&transaction, volume_id, parent, name)?
+    delete_node_in(&transaction, volume_id, parent, name, now_ns)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "namespace delete commit failed"))
+}
+
+/// Transaction-scoped form of [`delete_node`].
+pub fn delete_node_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    parent: InodeId,
+    name: &str,
+    now_ns: i64,
+) -> Result<(), MirageError> {
+    let folded = fold_name(name)?;
+    let entry = lookup(transaction, volume_id, parent, name)?
         .ok_or_else(|| MirageError::invalid_argument("namespace delete target is missing"))?;
     if entry.kind == NamespaceNodeKind::Directory {
         let child_count: i64 = transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT COUNT(*) FROM dirents
                  WHERE volume_id = ?1 AND parent_inode = ?2",
-                params![
-                    volume_id.as_bytes().as_slice(),
-                    entry.inode.as_bytes().as_slice()
-                ],
-                |row| row.get(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![
+                        volume_id.as_bytes().as_slice(),
+                        entry.inode.as_bytes().as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+            })
             .map_err(|e| sqlite(e, "namespace delete emptiness check failed"))?;
         if child_count != 0 {
             return Err(MirageError::repository_conflict(
@@ -627,35 +703,37 @@ pub fn delete_node(
         }
     }
     transaction
-        .execute(
+        .prepare_cached(
             "DELETE FROM dirents WHERE volume_id = ?1 AND parent_inode = ?2 AND folded_name = ?3",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 parent.as_bytes().as_slice(),
                 &folded,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace dirent delete failed"))?;
     transaction
-        .execute(
-            "DELETE FROM legacy_inode_map WHERE volume_id = ?1 AND inode = ?2",
-            params![
+        .prepare_cached("DELETE FROM legacy_inode_map WHERE volume_id = ?1 AND inode = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 entry.inode.as_bytes().as_slice()
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace legacy binding delete failed"))?;
     transaction
-        .execute(
-            "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2",
-            params![
+        .prepare_cached("DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 entry.inode.as_bytes().as_slice()
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace inode delete failed"))?;
     record_delta(
-        &transaction,
+        transaction,
         volume_id,
         mirage_manifest::namespace::NamespaceOp::Delete {
             parent,
@@ -663,10 +741,7 @@ pub fn delete_node(
             inode: entry.inode,
         },
         now_ns,
-    )?;
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "namespace delete commit failed"))
+    )
 }
 
 /// Sets explicit created/modified timestamps on an inode; `None` leaves the
@@ -679,18 +754,20 @@ pub fn set_times(
     modified_ns: Option<i64>,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE inodes
              SET created_ns = COALESCE(?1, created_ns),
                  modified_ns = COALESCE(?2, modified_ns)
              WHERE volume_id = ?3 AND inode = ?4",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 created_ns,
                 modified_ns,
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice()
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace set times failed"))?;
     if changed != 1 {
         return Err(MirageError::invalid_argument("namespace inode is missing"));
@@ -712,20 +789,21 @@ pub fn set_file_roots(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace roots update"))?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE inodes
              SET size = ?1, version_root = ?2, extent_root = ?3, modified_ns = ?4
              WHERE volume_id = ?5 AND inode = ?6 AND kind = 'file'",
-            params![
-                i64::try_from(size)
-                    .map_err(|_| MirageError::invalid_argument("namespace size overflows"))?,
-                version_root.as_ref().map(|root| root.as_slice()),
-                extent_root.as_ref().map(|root| root.as_slice()),
-                now_ns,
-                volume_id.as_bytes().as_slice(),
-                inode.as_bytes().as_slice(),
-            ],
         )
+        .map_err(|e| sqlite(e, "namespace root update failed"))?
+        .execute(params![
+            i64::try_from(size)
+                .map_err(|_| MirageError::invalid_argument("namespace size overflows"))?,
+            version_root.as_ref().map(|root| root.as_slice()),
+            extent_root.as_ref().map(|root| root.as_slice()),
+            now_ns,
+            volume_id.as_bytes().as_slice(),
+            inode.as_bytes().as_slice(),
+        ])
         .map_err(|e| sqlite(e, "namespace root update failed"))?;
     if changed != 1 {
         return Err(MirageError::invalid_argument(
@@ -756,15 +834,17 @@ pub fn record_legacy(
     inode: InodeId,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT OR REPLACE INTO legacy_inode_map(volume_id, legacy_path, inode)
              VALUES (?1, ?2, ?3)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 legacy_path,
                 inode.as_bytes().as_slice(),
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "legacy inode map write failed"))?;
     Ok(())
 }
@@ -816,11 +896,12 @@ impl crate::Database {
     pub fn namespace_root(&self, volume_id: RepositoryId) -> Result<Option<InodeId>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
-                    "SELECT 1 FROM namespace_volumes WHERE volume_id = ?1",
-                    [volume_id.as_bytes().as_slice()],
-                    |row| row.get::<_, i64>(0),
-                )
+                .prepare_cached("SELECT 1 FROM namespace_volumes WHERE volume_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
                 .optional()
                 .map(|present| present.map(|_| root_inode(volume_id)))
                 .map_err(|e| sqlite(e, "namespace root lookup failed"))
@@ -855,11 +936,14 @@ impl crate::Database {
     ) -> Result<Option<[u8; 32]>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT commit_hash FROM managed_namespace_seeds WHERE volume_id = ?1",
-                    [volume_id.as_bytes().as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "managed seed marker lookup failed"))?
                 .map(|bytes| {
@@ -932,6 +1016,56 @@ impl crate::Database {
     ) -> Result<(), MirageError> {
         self.writer()
             .namespace_delete(volume_id, parent, name, now_ns)
+    }
+
+    /// Create plus its journal entry in one transaction.
+    pub fn namespace_create_journaled(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        kind: NamespaceNodeKind,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<DirEntry, MirageError> {
+        self.writer()
+            .namespace_create_journaled(volume_id, parent, name, kind, now_ns, journal)
+    }
+
+    /// Rename plus its journal entry in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn namespace_rename_journaled(
+        &self,
+        volume_id: RepositoryId,
+        from_parent: InodeId,
+        from_name: &str,
+        to_parent: InodeId,
+        to_name: &str,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<(), MirageError> {
+        self.writer().namespace_rename_journaled(
+            volume_id,
+            from_parent,
+            from_name,
+            to_parent,
+            to_name,
+            now_ns,
+            journal,
+        )
+    }
+
+    /// Delete plus its journal entry in one transaction.
+    pub fn namespace_delete_journaled(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<(), MirageError> {
+        self.writer()
+            .namespace_delete_journaled(volume_id, parent, name, now_ns, journal)
     }
 
     /// Pins an inode (file or directory); descendants of a pinned directory
@@ -1011,12 +1145,16 @@ impl crate::Database {
     ) -> Result<Option<String>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT legacy_path FROM legacy_inode_map
                      WHERE volume_id = ?1 AND inode = ?2",
-                    params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
-                    |row| row.get(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row(
+                        params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                        |row| row.get(0),
+                    )
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "legacy path lookup failed"))
         })
@@ -1074,35 +1212,36 @@ fn seed_volume_body(
     let root = root_inode(volume_id);
     {
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO namespace_volumes(volume_id, naming_version, root_inode, created_ns)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     volume_id.as_bytes().as_slice(),
                     mirage_types::NAMING_POLICY_VERSION,
                     root.as_bytes().as_slice(),
                     now_ns,
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "namespace volume insert failed"))?;
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO inodes(volume_id, inode, kind, size, created_ns, modified_ns)
                  VALUES (?1, ?2, 'directory', 0, ?3, ?3)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     volume_id.as_bytes().as_slice(),
                     root.as_bytes().as_slice(),
                     now_ns
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "namespace root insert failed"))?;
     }
     let mut sequence: i64 = transaction
-        .query_row(
-            "SELECT next_sequence FROM namespace_volumes WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT next_sequence FROM namespace_volumes WHERE volume_id = ?1")
+        .and_then(|mut stmt| stmt.query_row([volume_id.as_bytes().as_slice()], |row| row.get(0)))
         .map_err(|e| sqlite(e, "namespace allocator read failed"))?;
     let allocate = |sequence: &mut i64| -> Result<InodeId, MirageError> {
         let mut hasher = blake3::Hasher::new();
@@ -1122,20 +1261,19 @@ fn seed_volume_body(
         std::collections::HashMap::new();
     path_inode.insert(String::new(), root);
     let mut seeded = 0usize;
-    let mut insert_inode = transaction
-        .prepare(
+    let mut insert_inode = transaction.prepare_cached(
             "INSERT INTO inodes(volume_id, inode, kind, size, version_root, created_ns, modified_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         )
         .map_err(|e| sqlite(e, "namespace seed inode prepare failed"))?;
     let mut insert_dirent = transaction
-        .prepare(
+        .prepare_cached(
             "INSERT INTO dirents(volume_id, parent_inode, folded_name, display_name, child_inode)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .map_err(|e| sqlite(e, "namespace seed dirent prepare failed"))?;
     let mut insert_legacy = transaction
-        .prepare(
+        .prepare_cached(
             "INSERT OR REPLACE INTO legacy_inode_map(volume_id, legacy_path, inode)
              VALUES (?1, ?2, ?3)",
         )
@@ -1214,10 +1352,8 @@ fn seed_volume_body(
     drop(insert_dirent);
     drop(insert_inode);
     transaction
-        .execute(
-            "UPDATE namespace_volumes SET next_sequence = ?1 WHERE volume_id = ?2",
-            params![sequence, volume_id.as_bytes().as_slice()],
-        )
+        .prepare_cached("UPDATE namespace_volumes SET next_sequence = ?1 WHERE volume_id = ?2")
+        .and_then(|mut stmt| stmt.execute(params![sequence, volume_id.as_bytes().as_slice()]))
         .map_err(|e| sqlite(e, "namespace allocator commit failed"))?;
     Ok(seeded)
 }
@@ -1238,11 +1374,8 @@ pub fn seed_managed_volume(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin managed namespace seed"))?;
     let existing: Option<Vec<u8>> = transaction
-        .query_row(
-            "SELECT commit_hash FROM managed_namespace_seeds WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT commit_hash FROM managed_namespace_seeds WHERE volume_id = ?1")
+        .and_then(|mut stmt| stmt.query_row([volume_id.as_bytes().as_slice()], |row| row.get(0)))
         .optional()
         .map_err(|e| sqlite(e, "managed seed marker lookup failed"))?;
     if let Some(bytes) = existing {
@@ -1255,11 +1388,8 @@ pub fn seed_managed_volume(
         return Ok(Some(hash));
     }
     let volume_exists: bool = transaction
-        .query_row(
-            "SELECT 1 FROM namespace_volumes WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM namespace_volumes WHERE volume_id = ?1")
+        .and_then(|mut stmt| stmt.query_row([volume_id.as_bytes().as_slice()], |_| Ok(())))
         .optional()
         .map_err(|e| sqlite(e, "namespace volume lookup failed"))?
         .is_some();
@@ -1267,15 +1397,17 @@ pub fn seed_managed_volume(
         seed_volume_body(&transaction, volume_id, nodes, now_ns)?;
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO managed_namespace_seeds(volume_id, commit_hash, seeded_ns)
              VALUES (?1, ?2, ?3)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 commit_hash.as_slice(),
                 now_ns
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "managed seed marker insert failed"))?;
     transaction
         .commit()
@@ -1311,12 +1443,16 @@ pub fn entry_of_child(
     inode: InodeId,
 ) -> Result<Option<(InodeId, String)>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT parent_inode, display_name FROM dirents
              WHERE volume_id = ?1 AND child_inode = ?2",
-            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "namespace child entry lookup failed"))?
         .map(|(parent, name)| decode_inode(&parent).map(|inode| (inode, name)))
@@ -1336,15 +1472,17 @@ pub fn pin(
     pinned_ns: i64,
 ) -> Result<(), MirageError> {
     connection
-        .execute(
+        .prepare_cached(
             "INSERT OR REPLACE INTO namespace_pins(volume_id, inode, pinned_ns)
              VALUES (?1, ?2, ?3)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 inode.as_bytes().as_slice(),
                 pinned_ns
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace pin insert failed"))?;
     Ok(())
 }
@@ -1356,10 +1494,13 @@ pub fn unpin(
     inode: InodeId,
 ) -> Result<bool, MirageError> {
     let changed = connection
-        .execute(
-            "DELETE FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
-            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
-        )
+        .prepare_cached("DELETE FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                volume_id.as_bytes().as_slice(),
+                inode.as_bytes().as_slice()
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace pin delete failed"))?;
     Ok(changed == 1)
 }
@@ -1367,7 +1508,7 @@ pub fn unpin(
 /// Every pinned inode of the volume.
 pub fn pins(connection: &Connection, volume_id: RepositoryId) -> Result<Vec<InodeId>, MirageError> {
     connection
-        .prepare("SELECT inode FROM namespace_pins WHERE volume_id = ?1")
+        .prepare_cached("SELECT inode FROM namespace_pins WHERE volume_id = ?1")
         .map_err(|e| sqlite(e, "namespace pin scan prepare failed"))?
         .query_map([volume_id.as_bytes().as_slice()], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -1390,14 +1531,16 @@ pub fn pin_held(
     let mut current = inode;
     for _ in 0..128 {
         let pinned: Option<i64> = connection
-            .query_row(
-                "SELECT 1 FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
-                params![
-                    volume_id.as_bytes().as_slice(),
-                    current.as_bytes().as_slice()
-                ],
-                |row| row.get::<_, i64>(0),
-            )
+            .prepare_cached("SELECT 1 FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2")
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![
+                        volume_id.as_bytes().as_slice(),
+                        current.as_bytes().as_slice()
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
             .optional()
             .map_err(|e| sqlite(e, "namespace pin check failed"))?;
         if pinned.is_some() {
@@ -1422,11 +1565,8 @@ pub fn ensure_device_id(
     now_ns: i64,
 ) -> Result<mirage_types::DeviceId, MirageError> {
     if let Some(bytes) = connection
-        .query_row(
-            "SELECT device_id FROM device_identity WHERE singleton = 1",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
+        .prepare_cached("SELECT device_id FROM device_identity WHERE singleton = 1")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, Vec<u8>>(0)))
         .optional()
         .map_err(|e| sqlite(e, "device identity lookup failed"))?
     {
@@ -1439,10 +1579,10 @@ pub fn ensure_device_id(
     getrandom::fill(&mut bytes)
         .map_err(|_| MirageError::internal_invariant("device identity generation failed"))?;
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO device_identity(singleton, device_id, created_ns) VALUES (1, ?1, ?2)",
-            params![bytes.as_slice(), now_ns],
         )
+        .and_then(|mut stmt| stmt.execute(params![bytes.as_slice(), now_ns]))
         .map_err(|e| sqlite(e, "device identity insert failed"))?;
     Ok(mirage_types::DeviceId::from_bytes(bytes))
 }
@@ -1452,12 +1592,15 @@ fn current_delta_segment(
     volume_id: RepositoryId,
 ) -> Result<(i64, [u8; 32]), MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT checkpoint_seq, document_hash FROM namespace_checkpoints
              WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
-            [volume_id.as_bytes().as_slice()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+        })
         .optional()
         .map_err(|e| sqlite(e, "namespace checkpoint lookup failed"))?
         .map(|(seq, hash)| {
@@ -1480,12 +1623,16 @@ fn record_delta(
 ) -> Result<(), MirageError> {
     let (checkpoint_seq, base_hash) = current_delta_segment(transaction, volume_id)?;
     let delta_seq: i64 = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT COALESCE(MAX(delta_seq) + 1, 0) FROM namespace_deltas
              WHERE volume_id = ?1 AND checkpoint_seq = ?2",
-            params![volume_id.as_bytes().as_slice(), checkpoint_seq],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), checkpoint_seq],
+                |row| row.get(0),
+            )
+        })
         .map_err(|e| sqlite(e, "namespace delta sequence failed"))?;
     let op_name = match &op {
         mirage_manifest::namespace::NamespaceOp::Create { .. } => "create",
@@ -1509,11 +1656,13 @@ fn record_delta(
     }
     let payload_hash = blake3::hash(&payload);
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO namespace_deltas(volume_id, checkpoint_seq, delta_seq, op,
                 payload_hash, payload, created_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
                 checkpoint_seq,
                 delta_seq,
@@ -1521,8 +1670,8 @@ fn record_delta(
                 payload_hash.as_bytes().as_slice(),
                 payload,
                 now_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "namespace delta record failed"))?;
     Ok(())
 }
@@ -1531,12 +1680,16 @@ fn record_delta(
 pub fn delta_backlog(connection: &Connection, volume_id: RepositoryId) -> Result<i64, MirageError> {
     let (checkpoint_seq, _) = current_delta_segment(connection, volume_id)?;
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT COUNT(*) FROM namespace_deltas
              WHERE volume_id = ?1 AND checkpoint_seq = ?2",
-            params![volume_id.as_bytes().as_slice(), checkpoint_seq],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), checkpoint_seq],
+                |row| row.get(0),
+            )
+        })
         .map_err(|e| sqlite(e, "namespace delta backlog failed"))
 }
 
@@ -1552,7 +1705,7 @@ pub fn create_checkpoint(
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin namespace checkpoint"))?;
     let mut statement = transaction
-        .prepare(
+        .prepare_cached(
             "SELECT i.inode, d.parent_inode, d.folded_name, d.display_name,
                     i.kind, i.size, i.version_root, i.extent_root
              FROM inodes i
@@ -1609,23 +1762,24 @@ pub fn create_checkpoint(
     let document = mirage_manifest::namespace::encode_checkpoint(&checkpoint)?;
     let document_hash = mirage_manifest::namespace::checkpoint_hash(&document);
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO namespace_checkpoints(volume_id, checkpoint_seq, document_hash,
                 document, parent_commit, entry_count, created_ns)
              VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            params![
-                volume_id.as_bytes().as_slice(),
-                i64::try_from(checkpoint_seq).map_err(|_| {
-                    MirageError::internal_invariant("namespace checkpoint sequence overflows")
-                })?,
-                document_hash.as_slice(),
-                document,
-                i64::try_from(entry_count).map_err(|_| {
-                    MirageError::internal_invariant("namespace entry count overflows")
-                })?,
-                now_ns,
-            ],
         )
+        .map_err(|e| sqlite(e, "namespace checkpoint insert failed"))?
+        .execute(params![
+            volume_id.as_bytes().as_slice(),
+            i64::try_from(checkpoint_seq).map_err(|_| {
+                MirageError::internal_invariant("namespace checkpoint sequence overflows")
+            })?,
+            document_hash.as_slice(),
+            document,
+            i64::try_from(entry_count).map_err(|_| {
+                MirageError::internal_invariant("namespace entry count overflows")
+            })?,
+            now_ns,
+        ])
         .map_err(|e| sqlite(e, "namespace checkpoint insert failed"))?;
     transaction
         .commit()
@@ -1663,12 +1817,15 @@ impl crate::Database {
     ) -> Result<Option<i64>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT checkpoint_seq FROM namespace_checkpoints
                      WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
-                    [volume_id.as_bytes().as_slice()],
-                    |row| row.get::<_, i64>(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "namespace checkpoint seq read failed"))
         })
@@ -1681,12 +1838,15 @@ impl crate::Database {
     ) -> Result<Option<Vec<u8>>, MirageError> {
         self.reads().with_connection(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT document FROM namespace_checkpoints
                      WHERE volume_id = ?1 ORDER BY checkpoint_seq DESC LIMIT 1",
-                    [volume_id.as_bytes().as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([volume_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                })
                 .optional()
                 .map_err(|e| sqlite(e, "namespace checkpoint document read failed"))
         })

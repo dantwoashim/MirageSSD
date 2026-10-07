@@ -40,7 +40,7 @@ fn check(path: &Path, depth: CheckDepth) -> Result<DatabaseCheckReport, MirageEr
         CheckDepth::Full => pragma_messages(&connection, "PRAGMA integrity_check")?,
     };
     let mut statement = connection
-        .prepare("PRAGMA foreign_key_check")
+        .prepare_cached("PRAGMA foreign_key_check")
         .map_err(|error| sqlite(error, "failed to prepare foreign-key check"))?;
     let rows = statement
         .query_map([], |row| {
@@ -85,7 +85,7 @@ fn pragma_messages(
     pragma: &str,
 ) -> Result<Vec<String>, MirageError> {
     let mut statement = connection
-        .prepare(pragma)
+        .prepare_cached(pragma)
         .map_err(|error| sqlite(error, "failed to prepare database integrity check"))?;
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))

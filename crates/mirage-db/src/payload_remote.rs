@@ -33,6 +33,9 @@ pub struct PayloadRemoteObject {
     /// Concatenated blake3 hashes, one per 4 MiB plaintext frame.
     pub frame_hashes: Vec<[u8; 32]>,
     pub published_ns: i64,
+    /// Byte offset of this payload's encoded object inside the provider
+    /// object — 0 for single-object publications (the pack case).
+    pub member_offset: i64,
 }
 
 /// A committed, still-referenced payload that has no remote object yet.
@@ -97,12 +100,14 @@ fn decode_record(row: &rusqlite::Row<'_>) -> Result<PayloadRemoteObject, rusqlit
             .map(|chunk| chunk.try_into().expect("chunk is 32 bytes"))
             .collect(),
         published_ns: row.get(9)?,
+        member_offset: row.get(10)?,
     })
 }
 
 const RECORD_COLUMNS: &str =
     "volume_id, payload_id, provider_object_id, immutable_revision, object_length,
-     object_hash, plaintext_length, plaintext_hash, frame_hashes, published_ns";
+     object_hash, plaintext_length, plaintext_hash, frame_hashes, published_ns,
+     member_offset";
 
 /// Records a payload's remote publication. Fails when the payload is no
 /// longer referenced by any byte extent — the uploaded object is then an
@@ -114,16 +119,48 @@ pub fn record_payload_publication(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "payload publication begin failed"))?;
+    record_payload_publication_in(&transaction, record)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "payload publication commit failed"))
+}
+
+/// Records a whole pack's members in ONE transaction — each row gets the
+/// same referenced check and upsert as [`record_payload_publication`]; any
+/// violation rolls the batch back (the pack is retried next pass).
+pub fn record_payload_publications(
+    connection: &mut Connection,
+    records: &[PayloadRemoteObject],
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "payload publication begin failed"))?;
+    for record in records {
+        record_payload_publication_in(&transaction, record)?;
+    }
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "payload publication commit failed"))
+}
+
+fn record_payload_publication_in(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &PayloadRemoteObject,
+) -> Result<(), MirageError> {
     let referenced: Option<i64> = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT 1 FROM byte_extents
              WHERE volume_id = ?1 AND payload_id = ?2 LIMIT 1",
-            params![
-                record.volume_id.as_bytes().as_slice(),
-                record.payload_id.as_slice()
-            ],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    record.volume_id.as_bytes().as_slice(),
+                    record.payload_id.as_slice()
+                ],
+                |row| row.get(0),
+            )
+        })
         .optional()
         .map_err(|e| sqlite(e, "payload publication reference check failed"))?;
     if referenced.is_none() {
@@ -136,12 +173,12 @@ pub fn record_payload_publication(
         frame_blob.extend_from_slice(hash);
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO payload_remote_objects
              (volume_id, payload_id, provider_object_id, immutable_revision,
               object_length, object_hash, plaintext_length, plaintext_hash,
-              frame_hashes, published_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              frame_hashes, published_ns, member_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(payload_id) DO UPDATE SET
                 provider_object_id = excluded.provider_object_id,
                 immutable_revision = excluded.immutable_revision,
@@ -150,8 +187,11 @@ pub fn record_payload_publication(
                 plaintext_length = excluded.plaintext_length,
                 plaintext_hash = excluded.plaintext_hash,
                 frame_hashes = excluded.frame_hashes,
-                published_ns = excluded.published_ns",
-            params![
+                published_ns = excluded.published_ns,
+                member_offset = excluded.member_offset",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 record.volume_id.as_bytes().as_slice(),
                 record.payload_id.as_slice(),
                 record.provider_object_id,
@@ -162,12 +202,11 @@ pub fn record_payload_publication(
                 record.plaintext_hash.as_slice(),
                 frame_blob,
                 record.published_ns,
-            ],
-        )
+                record.member_offset,
+            ])
+        })
         .map_err(|e| sqlite(e, "payload publication insert failed"))?;
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "payload publication commit failed"))
+    Ok(())
 }
 
 /// The remote identity of one published payload, when it exists.
@@ -196,7 +235,7 @@ pub fn unpublished_payloads(
     volume_id: RepositoryId,
 ) -> Result<Vec<UnpublishedPayload>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT p.payload_id, p.path, p.bytes, p.checksum, o.device_seq
              FROM operation_payloads p
              JOIN local_operations o ON o.operation_id = p.operation_id
@@ -252,7 +291,7 @@ pub fn published_payloads_evictable(
     volume_id: RepositoryId,
 ) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT r.payload_id, r.plaintext_length, r.published_ns
              FROM payload_remote_objects r
              JOIN physical_extents x ON x.extent_id = r.payload_id
@@ -306,7 +345,7 @@ pub fn payload_publication_stats(
     journal_file_id: &[u8; 16],
 ) -> Result<PayloadPublicationStats, MirageError> {
     let pending: (i64, Option<i64>) = connection
-        .query_row(
+        .prepare_cached(
             "SELECT count(*), sum(p.bytes)
              FROM operation_payloads p
              JOIN local_operations o ON o.operation_id = p.operation_id
@@ -321,24 +360,28 @@ pub fn payload_publication_stats(
                AND NOT EXISTS (SELECT 1 FROM physical_extents x
                                WHERE x.extent_id = p.payload_id
                                  AND x.state = 'dead')",
-            [volume_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .map_err(|e| sqlite(e, "pending payload stats failed"))?
+        .query_row([volume_id.as_bytes().as_slice()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .map_err(|e| sqlite(e, "pending payload stats failed"))?;
     let published: (i64, Option<i64>) = connection
-        .query_row(
+        .prepare_cached(
             "SELECT count(*), sum(r.plaintext_length)
              FROM payload_remote_objects r
              WHERE r.volume_id = ?1
                AND EXISTS (SELECT 1 FROM byte_extents e
                             WHERE e.volume_id = r.volume_id
                               AND e.payload_id = r.payload_id)",
-            [volume_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .map_err(|e| sqlite(e, "published payload stats failed"))?
+        .query_row([volume_id.as_bytes().as_slice()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .map_err(|e| sqlite(e, "published payload stats failed"))?;
     let evicted: i64 = connection
-        .query_row(
+        .prepare_cached(
             "SELECT count(*)
              FROM payload_remote_objects r
              JOIN physical_extents x ON x.extent_id = r.payload_id
@@ -346,9 +389,13 @@ pub fn payload_publication_stats(
                AND EXISTS (SELECT 1 FROM byte_extents e
                             WHERE e.volume_id = r.volume_id
                               AND e.payload_id = r.payload_id)",
-            params![volume_id.as_bytes().as_slice(), journal_file_id.as_slice()],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), journal_file_id.as_slice()],
+                |row| row.get(0),
+            )
+        })
         .map_err(|e| sqlite(e, "evicted payload stats failed"))?;
     Ok(PayloadPublicationStats {
         pending_payloads: pending.0.max(0) as u64,
@@ -368,7 +415,7 @@ pub fn payload_inodes(
     payload_id: &[u8; 16],
 ) -> Result<Vec<mirage_types::InodeId>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT DISTINCT inode FROM byte_extents
              WHERE volume_id = ?1 AND payload_id = ?2",
         )

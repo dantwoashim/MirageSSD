@@ -51,11 +51,8 @@ pub(crate) fn pin(
     validate_owner(&transaction, reason)?;
     for page in &pages {
         let resident = transaction
-            .query_row(
-                "SELECT 1 FROM cache_slots WHERE page_hash=?1 AND state=2",
-                [page.as_bytes().as_slice()],
-                |_| Ok(()),
-            )
+            .prepare_cached("SELECT 1 FROM cache_slots WHERE page_hash=?1 AND state=2")
+            .and_then(|mut stmt| stmt.query_row([page.as_bytes().as_slice()], |_| Ok(())))
             .optional()
             .map_err(|error| sqlite(error, "failed to verify cache pin resident"))?
             .is_some();
@@ -68,10 +65,10 @@ pub(crate) fn pin(
     let (kind, owner) = encode_reason(reason);
     for page in pages {
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT OR IGNORE INTO cache_pins(page_hash, reason, owner_id) VALUES (?1, ?2, ?3)",
-                params![page.as_bytes().as_slice(), kind, owner],
             )
+            .and_then(|mut stmt| stmt.execute(params![page.as_bytes().as_slice(), kind, owner]))
             .map_err(|error| sqlite(error, "failed to insert cache pin"))?;
     }
     transaction
@@ -85,16 +82,14 @@ pub(crate) fn release(
 ) -> Result<(), MirageError> {
     let (kind, owner) = encode_reason(reason);
     connection
-        .execute(
-            "DELETE FROM cache_pins WHERE reason=?1 AND owner_id=?2",
-            params![kind, owner],
-        )
+        .prepare_cached("DELETE FROM cache_pins WHERE reason=?1 AND owner_id=?2")
+        .and_then(|mut stmt| stmt.execute(params![kind, owner]))
         .map_err(|error| sqlite(error, "failed to release cache pins"))?;
     Ok(())
 }
 
 fn load(connection: &Connection) -> Result<Vec<CachePinRecord>, MirageError> {
-    let mut statement = connection.prepare("SELECT page_hash, reason, owner_id FROM cache_pins ORDER BY page_hash, reason, owner_id").map_err(|error| sqlite(error, "failed to prepare cache pin load"))?;
+    let mut statement = connection.prepare_cached("SELECT page_hash, reason, owner_id FROM cache_pins ORDER BY page_hash, reason, owner_id").map_err(|error| sqlite(error, "failed to prepare cache pin load"))?;
     statement
         .query_map([], |row| {
             let hash = PageHash::from_bytes(
@@ -128,7 +123,8 @@ fn validate_owner(connection: &Connection, reason: PersistentPinReason) -> Resul
     };
     if let Some((sql, owner)) = query
         && connection
-            .query_row(sql, [owner], |_| Ok(()))
+            .prepare_cached(sql)
+            .and_then(|mut stmt| stmt.query_row([owner], |_| Ok(())))
             .optional()
             .map_err(|error| sqlite(error, "failed to verify cache pin owner"))?
             .is_none()

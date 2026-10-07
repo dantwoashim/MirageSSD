@@ -40,7 +40,7 @@ pub fn check_uninstall_safety(path: &Path) -> Result<UninstallSafetyReport, Mira
     let mut blocking_repositories = 0_u64;
     {
         let mut statement = connection
-            .prepare("SELECT state FROM repositories ORDER BY repository_id")
+            .prepare_cached("SELECT state FROM repositories ORDER BY repository_id")
             .map_err(|error| sqlite(error, "failed to inspect repository state for uninstall"))?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -121,7 +121,8 @@ fn count(
     label: &'static str,
 ) -> Result<u64, MirageError> {
     let count: i64 = connection
-        .query_row(query, [], |row| row.get(0))
+        .prepare_cached(query)
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
         .map_err(|error| sqlite(error, "failed to count uninstall blockers"))?;
     nonnegative(count, label)
 }

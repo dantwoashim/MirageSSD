@@ -1,7 +1,8 @@
 use std::fmt;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use mirage_types::{MirageError, RepositoryState, SessionState, UpdateState};
 use rusqlite::Connection;
@@ -11,7 +12,7 @@ use crate::cache::{
 };
 use crate::cache_root;
 use crate::disk_floor::{self, DiskFloor, DiskFloorRun};
-use crate::error::writer_unavailable;
+use crate::error::{sqlite, writer_unavailable};
 use crate::generation::{self, Activation, VerifiedGeneration};
 use crate::namespace::{self, DirEntry, NamespaceNodeKind, NamespaceSeedNode};
 use crate::operation::{self, OperationPayloadRecord, OperationRecord};
@@ -94,6 +95,34 @@ enum Command {
         Reply<()>,
     ),
     NamespaceDelete(RepositoryId, InodeId, String, i64, Reply<()>),
+    NamespaceCreateJournaled(
+        RepositoryId,
+        InodeId,
+        String,
+        NamespaceNodeKind,
+        i64,
+        crate::operation::JournalEntry,
+        Reply<DirEntry>,
+    ),
+    NamespaceRenameJournaled(
+        RepositoryId,
+        InodeId,
+        String,
+        InodeId,
+        String,
+        i64,
+        crate::operation::JournalEntry,
+        Reply<()>,
+    ),
+    NamespaceDeleteJournaled(
+        RepositoryId,
+        InodeId,
+        String,
+        i64,
+        crate::operation::JournalEntry,
+        Reply<()>,
+    ),
+    SequencedMutationCommit(Box<crate::operation::SequencedMutation>, Reply<()>),
     NamespaceSetFileRoots(
         RepositoryId,
         InodeId,
@@ -155,6 +184,8 @@ enum Command {
     /// Records one payload's remote publication; fails when the payload is
     /// no longer referenced by any byte extent.
     PayloadPublished(crate::payload_remote::PayloadRemoteObject, Reply<()>),
+    /// One transaction recording every member of a packed remote object.
+    PayloadsPublished(Vec<crate::payload_remote::PayloadRemoteObject>, Reply<()>),
     ExtentReplace(
         RepositoryId,
         mirage_types::InodeId,
@@ -204,7 +235,44 @@ enum Command {
     UpsertOverlayPage(OverlayPage, Reply<()>),
     UpsertNativeSnapshot(NativeSnapshot, Reply<()>),
     TransitionUpdate(UpdateTransition, Reply<UpdateState>),
+    /// One FULL-mode commit of the durability_barrier row: fsyncs the WAL so
+    /// every earlier NORMAL commit is durable (Strict mode: already FULL, so
+    /// this is just one more durable commit).
+    DurabilityBarrier(Reply<()>),
+    #[doc(hidden)]
+    SynchronousLevel(Reply<i64>),
     Shutdown(SyncSender<()>),
+}
+
+/// The group-commit window: the writer thread barriers when the oldest
+/// un-barriered commit ages past this, bounding power-loss rollback.
+const GROUP_BARRIER_AGE: Duration = Duration::from_millis(250);
+
+/// One FULL commit bumping `durability_barrier.seq`. The WAL fsync inside
+/// that commit makes every earlier NORMAL commit durable — WAL checkpoint
+/// is NOT used for this because it can skip the sync when readers block
+/// backfill. `group` restores `synchronous = NORMAL` afterwards; a Strict
+/// connection stays at FULL either way.
+fn durability_barrier(connection: &mut Connection, group: bool) -> Result<(), MirageError> {
+    connection
+        .execute_batch("PRAGMA synchronous = FULL;")
+        .map_err(|e| sqlite(e, "failed to raise sync level for barrier"))?;
+    let result = (|| {
+        let transaction = connection
+            .transaction()
+            .map_err(|e| sqlite(e, "failed to begin durability barrier"))?;
+        transaction
+            .prepare_cached("UPDATE durability_barrier SET seq = seq + 1 WHERE id = 1")
+            .and_then(|mut stmt| stmt.execute([]))
+            .map_err(|e| sqlite(e, "durability barrier update failed"))?;
+        transaction
+            .commit()
+            .map_err(|e| sqlite(e, "durability barrier commit failed"))
+    })();
+    if group {
+        let _ = connection.execute_batch("PRAGMA synchronous = NORMAL;");
+    }
+    result
 }
 
 struct WriterInner {
@@ -241,12 +309,61 @@ impl fmt::Debug for DbWriter {
 }
 
 impl DbWriter {
-    pub(crate) fn start(mut connection: Connection) -> Result<Self, MirageError> {
+    pub(crate) fn start(
+        mut connection: Connection,
+        durability: crate::open::Durability,
+    ) -> Result<Self, MirageError> {
         let (sender, receiver) = sync_channel(COMMAND_CAPACITY);
+        let group = durability == crate::open::Durability::Group;
         let thread = thread::Builder::new()
             .name("mirage-db-writer".to_string())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                // Group mode: `oldest_unbarriered` ages the earliest commit
+                // since the last barrier; once it crosses GROUP_BARRIER_AGE
+                // the loop barriers even while idle.
+                let mut oldest_unbarriered: Option<Instant> = None;
+                loop {
+                    let command = if group && oldest_unbarriered.is_some() {
+                        let oldest = oldest_unbarriered.expect("checked");
+                        let wait = GROUP_BARRIER_AGE.saturating_sub(oldest.elapsed());
+                        if wait.is_zero() {
+                            if let Err(error) = durability_barrier(&mut connection, true) {
+                                eprintln!("durability barrier failed: {error:?}");
+                            }
+                            oldest_unbarriered = None;
+                            continue;
+                        }
+                        match receiver.recv_timeout(wait) {
+                            Ok(command) => command,
+                            Err(RecvTimeoutError::Timeout) => {
+                                if let Err(error) = durability_barrier(&mut connection, true) {
+                                    eprintln!("durability barrier failed: {error:?}");
+                                }
+                                oldest_unbarriered = None;
+                                continue;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        match receiver.recv() {
+                            Ok(command) => command,
+                            Err(_) => break,
+                        }
+                    };
+                    // Every dispatched command may commit — age the oldest
+                    // un-barriered one. The barrier clears it; Shutdown
+                    // barriers before breaking; the read-only probe does not
+                    // count.
+                    if group
+                        && !matches!(
+                            command,
+                            Command::DurabilityBarrier(_)
+                                | Command::SynchronousLevel(_)
+                                | Command::Shutdown(_)
+                        )
+                    {
+                        oldest_unbarriered.get_or_insert_with(Instant::now);
+                    }
                     match command {
                         Command::PinCachePages(reason, pages, reply) => {
                             respond(reply, pin::pin(&mut connection, reason, pages));
@@ -430,6 +547,78 @@ impl DbWriter {
                                     &name,
                                     now_ns,
                                 ),
+                            );
+                        }
+                        Command::NamespaceCreateJournaled(
+                            volume_id,
+                            parent,
+                            name,
+                            kind,
+                            now_ns,
+                            journal,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                operation::namespace_create_journaled(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    kind,
+                                    now_ns,
+                                    journal,
+                                ),
+                            );
+                        }
+                        Command::NamespaceRenameJournaled(
+                            volume_id,
+                            from_parent,
+                            from_name,
+                            to_parent,
+                            to_name,
+                            now_ns,
+                            journal,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                operation::namespace_rename_journaled(
+                                    &mut connection,
+                                    volume_id,
+                                    from_parent,
+                                    &from_name,
+                                    to_parent,
+                                    &to_name,
+                                    now_ns,
+                                    journal,
+                                ),
+                            );
+                        }
+                        Command::NamespaceDeleteJournaled(
+                            volume_id,
+                            parent,
+                            name,
+                            now_ns,
+                            journal,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                operation::namespace_delete_journaled(
+                                    &mut connection,
+                                    volume_id,
+                                    parent,
+                                    &name,
+                                    now_ns,
+                                    journal,
+                                ),
+                            );
+                        }
+                        Command::SequencedMutationCommit(mutation, reply) => {
+                            respond(
+                                reply,
+                                operation::sequenced_mutation_commit(&mut connection, *mutation),
                             );
                         }
                         Command::NamespaceSetTimes(
@@ -647,6 +836,15 @@ impl DbWriter {
                                 ),
                             );
                         }
+                        Command::PayloadsPublished(records, reply) => {
+                            respond(
+                                reply,
+                                crate::payload_remote::record_payload_publications(
+                                    &mut connection,
+                                    &records,
+                                ),
+                            );
+                        }
                         Command::ExtentCompactVolume(volume_id, file_id, now, reply) => {
                             respond(
                                 reply,
@@ -818,7 +1016,24 @@ impl DbWriter {
                         Command::TransitionUpdate(value, reply) => {
                             respond(reply, update::transition_state(&mut connection, value));
                         }
+                        Command::DurabilityBarrier(reply) => {
+                            respond(reply, durability_barrier(&mut connection, group));
+                            oldest_unbarriered = None;
+                        }
+                        Command::SynchronousLevel(reply) => {
+                            respond(
+                                reply,
+                                connection
+                                    .pragma_query_value(None, "synchronous", |row| row.get(0))
+                                    .map_err(|e| sqlite(e, "failed to read sync level")),
+                            );
+                        }
                         Command::Shutdown(reply) => {
+                            // One last barrier so an acknowledged write is
+                            // durable before the writer reports stopped.
+                            if group && oldest_unbarriered.is_some() {
+                                let _ = durability_barrier(&mut connection, true);
+                            }
                             let _ = reply.send(());
                             break;
                         }
@@ -835,6 +1050,18 @@ impl DbWriter {
                 thread: Mutex::new(Some(thread)),
             }),
         })
+    }
+
+    /// Durability barrier: one FULL-mode commit that fsyncs the WAL, making
+    /// every earlier NORMAL commit durable. In Strict mode every commit is
+    /// already fsynced, so this is just one more durable commit.
+    pub fn durability_barrier(&self) -> Result<(), MirageError> {
+        self.request(Command::DurabilityBarrier)
+    }
+
+    #[doc(hidden)]
+    pub fn writer_synchronous(&self) -> Result<i64, MirageError> {
+        self.request(Command::SynchronousLevel)
     }
 
     pub fn register_cache_shard(&self, value: CacheShardSpec) -> Result<(), MirageError> {
@@ -1078,6 +1305,76 @@ impl DbWriter {
         self.request(|reply| Command::NamespaceDelete(volume_id, parent, name, now_ns, reply))
     }
 
+    /// Namespace create plus its journal entry in one transaction — either
+    /// the whole change lands or neither half does.
+    pub fn namespace_create_journaled(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        kind: NamespaceNodeKind,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<DirEntry, MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| {
+            Command::NamespaceCreateJournaled(volume_id, parent, name, kind, now_ns, journal, reply)
+        })
+    }
+
+    /// Namespace rename plus its journal entry in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn namespace_rename_journaled(
+        &self,
+        volume_id: RepositoryId,
+        from_parent: InodeId,
+        from_name: &str,
+        to_parent: InodeId,
+        to_name: &str,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<(), MirageError> {
+        let from_name = from_name.to_owned();
+        let to_name = to_name.to_owned();
+        self.request(|reply| {
+            Command::NamespaceRenameJournaled(
+                volume_id,
+                from_parent,
+                from_name,
+                to_parent,
+                to_name,
+                now_ns,
+                journal,
+                reply,
+            )
+        })
+    }
+
+    /// Namespace delete plus its journal entry in one transaction.
+    pub fn namespace_delete_journaled(
+        &self,
+        volume_id: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        now_ns: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<(), MirageError> {
+        let name = name.to_owned();
+        self.request(|reply| {
+            Command::NamespaceDeleteJournaled(volume_id, parent, name, now_ns, journal, reply)
+        })
+    }
+
+    /// The whole durable mutation commit — reservation, sequence, extent
+    /// mutation, operation, payloads, physical commit, mtime — in one
+    /// transaction.
+    pub fn sequenced_mutation_commit(
+        &self,
+        mutation: crate::operation::SequencedMutation,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::SequencedMutationCommit(Box::new(mutation), reply))
+    }
+
     /// Pins an inode; descendants of a pinned directory inherit protection.
     pub fn namespace_pin(
         &self,
@@ -1175,6 +1472,15 @@ impl DbWriter {
         record: crate::payload_remote::PayloadRemoteObject,
     ) -> Result<(), MirageError> {
         self.request(|reply| Command::PayloadPublished(record, reply))
+    }
+
+    /// Records a whole pack's members in one transaction — every member of a
+    /// packed remote object becomes evictable together.
+    pub fn payloads_published(
+        &self,
+        records: Vec<crate::payload_remote::PayloadRemoteObject>,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| Command::PayloadsPublished(records, reply))
     }
 
     /// Snapshots the live namespace into an immutable checkpoint document;

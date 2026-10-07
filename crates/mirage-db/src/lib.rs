@@ -46,9 +46,10 @@ pub use generation::{ActiveGeneration, VerifiedGeneration};
 pub use integrity::{DatabaseCheckReport, check_database};
 pub use lease::LeaseSpec;
 pub use namespace::{DirEntry, NamespaceNodeKind, NamespaceSeedNode, NamespaceStat};
-pub use open::{APPLICATION_ID, ReadPool};
+pub use open::{APPLICATION_ID, Durability, ReadPool};
 pub use operation::{
-    ExtentMutation, OperationKind, OperationPayloadRecord, OperationRecord, OperationStatus,
+    ExtentMutation, JournalEntry, OperationKind, OperationPayloadRecord, OperationRecord,
+    OperationStatus, SequencedMutation,
 };
 pub use physical::{
     PhysicalCommit, PhysicalExtentRecord, PhysicalExtentState, PhysicalFileRecord,
@@ -75,8 +76,18 @@ pub struct Database {
 }
 
 impl Database {
+    /// Strict durability: every commit fsyncs (synchronous=FULL).
     pub fn open(path: &Path) -> Result<Self, MirageError> {
-        let mut connection = open::writer_connection(path)?;
+        Self::open_with_durability(path, Durability::Strict)
+    }
+
+    /// `Group` commits under synchronous=NORMAL on the writer connection
+    /// (WAL unchanged — commits still reach the OS immediately) and relies
+    /// on the writer's 250 ms barrier plus explicit
+    /// [`durability_barrier`](DbWriter::durability_barrier) calls for
+    /// power-loss durability.
+    pub fn open_with_durability(path: &Path, durability: Durability) -> Result<Self, MirageError> {
+        let mut connection = open::writer_connection(path, durability)?;
         migrate::apply_all(&mut connection)?;
         let report = integrity::quick_check_database(path)?;
         if !report.quick_check_ok || report.foreign_key_violation_count != 0 {
@@ -84,10 +95,27 @@ impl Database {
                 "database startup recovery check failed",
             ));
         }
-        let writer = DbWriter::start(connection)?;
+        let writer = DbWriter::start(connection, durability)?;
         Ok(Self {
             writer,
             reads: ReadPool::new(path.to_path_buf()),
+        })
+    }
+
+    /// Durability barrier: one FULL commit making every earlier commit
+    /// durable — a no-op cost-wise in Strict mode.
+    pub fn durability_barrier(&self) -> Result<(), MirageError> {
+        self.writer.durability_barrier()
+    }
+
+    /// Current barrier epoch — test/diagnostic accessor.
+    #[doc(hidden)]
+    pub fn durability_barrier_seq(&self) -> Result<i64, MirageError> {
+        self.reads.with_connection(|connection| {
+            connection
+                .prepare_cached("SELECT seq FROM durability_barrier WHERE id = 1")
+                .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+                .map_err(|error| crate::error::sqlite(error, "failed to read barrier epoch"))
         })
     }
 

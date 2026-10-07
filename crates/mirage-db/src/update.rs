@@ -69,21 +69,22 @@ impl Database {
     ) -> Result<Option<ActiveUpdate>, MirageError> {
         self.reads.with_connection(|connection| {
             let row = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT update_id, base_generation, target_generation, state
                      FROM update_journals
                      WHERE repository_id = ?1 AND state NOT IN ('committed', 'rolled_back')
                      ORDER BY created_at_ns DESC LIMIT 1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| {
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, String>(3)?,
                         ))
-                    },
-                )
+                    })
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load active update"))?;
             row.map(|(id, base, target, state)| {
@@ -140,11 +141,10 @@ impl Database {
     ) -> Result<Option<UpdateState>, MirageError> {
         self.reads.with_connection(|connection| {
             let state: Option<String> = connection
-                .query_row(
-                    "SELECT state FROM update_journals WHERE update_id = ?1",
-                    [update_id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT state FROM update_journals WHERE update_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([update_id.as_bytes().as_slice()], |row| row.get(0))
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load update state"))?;
             state.map(|value| state_codec::update(&value)).transpose()
@@ -165,12 +165,15 @@ pub(crate) fn create_journal(
     }
     let journal_path = path_text(&journal.journal_path)?;
     let active: Option<Vec<u8>> = connection
-        .query_row(
+        .prepare_cached(
             "SELECT update_id FROM update_journals
              WHERE repository_id = ?1 AND state NOT IN ('committed', 'rolled_back')",
-            [journal.repository_id.as_bytes().as_slice()],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row([journal.repository_id.as_bytes().as_slice()], |row| {
+                row.get(0)
+            })
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to query active update journal"))?;
     if active.is_some() {
@@ -181,11 +184,15 @@ pub(crate) fn create_journal(
         ));
     }
     let verified: Option<i64> = connection
-        .query_row(
+        .prepare_cached(
             "SELECT verified FROM generations WHERE repository_id = ?1 AND generation = ?2",
-            params![journal.repository_id.as_bytes().as_slice(), base],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![journal.repository_id.as_bytes().as_slice(), base],
+                |row| row.get(0),
+            )
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to validate update base generation"))?;
     if verified != Some(1) {
@@ -197,12 +204,14 @@ pub(crate) fn create_journal(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| sqlite(error, "failed to begin update-journal transaction"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO update_journals(
                 update_id, repository_id, base_generation, target_generation,
                 state, journal_path, created_at_ns, updated_at_ns
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 journal.update_id.as_bytes().as_slice(),
                 journal.repository_id.as_bytes().as_slice(),
                 base,
@@ -210,18 +219,20 @@ pub(crate) fn create_journal(
                 UpdateState::Created.as_str(),
                 journal_path,
                 journal.created_at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to create update journal"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO journal_events(update_id, sequence, event_kind, details, created_at_ns)
              VALUES (?1, 0, 'created', '', ?2)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 journal.update_id.as_bytes().as_slice(),
                 journal.created_at_ns
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to create initial journal event"))?;
     transaction
         .commit()
@@ -247,7 +258,7 @@ pub(crate) fn upsert_overlay(
         .map(|value| sqlite_integer(value.as_u64(), "encoded length"))
         .transpose()?;
     let changed = connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO overlay_pages(
                 update_id, file_id, page_index, state, arena_id, slot_index,
                 page_hash, staging_object_key, staging_offset, encoded_length
@@ -260,7 +271,9 @@ pub(crate) fn upsert_overlay(
                 staging_object_key = excluded.staging_object_key,
                 staging_offset = excluded.staging_offset,
                 encoded_length = excluded.encoded_length",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 page.update_id.as_bytes().as_slice(),
                 file_id,
                 page_index,
@@ -271,8 +284,8 @@ pub(crate) fn upsert_overlay(
                 page.staging_object_key.map(|hash| *hash.as_bytes()),
                 staging_offset,
                 encoded_length,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to persist overlay page"))?;
     if changed != 1 {
         return Err(MirageError::internal_invariant(
@@ -289,7 +302,7 @@ pub(crate) fn upsert_snapshot(
     bounded_text(&snapshot.relative_path, 1, 32_767, "snapshot relative path")?;
     let snapshot_path = path_text(&snapshot.snapshot_path)?;
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO native_snapshots(
                 update_id, relative_path, snapshot_path, byte_length, content_hash
              ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -297,14 +310,15 @@ pub(crate) fn upsert_snapshot(
                 snapshot_path = excluded.snapshot_path,
                 byte_length = excluded.byte_length,
                 content_hash = excluded.content_hash",
-            params![
-                snapshot.update_id.as_bytes().as_slice(),
-                snapshot.relative_path,
-                snapshot_path,
-                sqlite_integer(snapshot.byte_length.as_u64(), "snapshot length")?,
-                snapshot.content_hash.as_bytes().as_slice(),
-            ],
         )
+        .map_err(|error| sqlite(error, "failed to persist native snapshot"))?
+        .execute(params![
+            snapshot.update_id.as_bytes().as_slice(),
+            snapshot.relative_path,
+            snapshot_path,
+            sqlite_integer(snapshot.byte_length.as_u64(), "snapshot length")?,
+            snapshot.content_hash.as_bytes().as_slice(),
+        ])
         .map_err(|error| sqlite(error, "failed to persist native snapshot"))?;
     Ok(())
 }
@@ -322,11 +336,10 @@ pub(crate) fn transition_state(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| sqlite(error, "failed to begin update transition"))?;
     let actual: String = transaction
-        .query_row(
-            "SELECT state FROM update_journals WHERE update_id = ?1",
-            [change.update_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT state FROM update_journals WHERE update_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_row([change.update_id.as_bytes().as_slice()], |row| row.get(0))
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to load update transition state"))?
         .ok_or_else(|| MirageError::invalid_argument("update journal does not exist"))?;
@@ -336,36 +349,41 @@ pub(crate) fn transition_state(
     }
     let next = transition_update(actual, change.event).map_err(transition)?;
     let next_sequence: i64 = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT COALESCE(max(sequence), -1) + 1 FROM journal_events WHERE update_id = ?1",
-            [change.update_id.as_bytes().as_slice()],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row([change.update_id.as_bytes().as_slice()], |row| row.get(0))
+        })
         .map_err(|error| sqlite(error, "failed to allocate journal event sequence"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE update_journals SET state = ?1, updated_at_ns = ?2
              WHERE update_id = ?3 AND state = ?4",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 next.as_str(),
                 change.at_ns,
                 change.update_id.as_bytes().as_slice(),
                 actual.as_str(),
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to persist update transition"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO journal_events(update_id, sequence, event_kind, details, created_at_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 change.update_id.as_bytes().as_slice(),
                 next_sequence,
                 change.event.as_str(),
                 change.details,
                 change.at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to append update journal event"))?;
     transaction
         .commit()

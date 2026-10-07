@@ -67,13 +67,15 @@ pub fn declare(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO workspace_leases
              (lease_id, volume_id, path_prefix, bytes_declared, bytes_verified,
               pages_pinned, status, evidence, expires_ns, created_ns, verified_ns)
              VALUES (?1, ?2, ?3, ?4, 0, 0, 'declared', ?5, ?6, ?7, NULL)
              ON CONFLICT(volume_id, path_prefix) DO NOTHING",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 lease.lease_id.as_slice(),
                 lease.volume_id.as_bytes().as_slice(),
                 lease.path_prefix,
@@ -81,8 +83,8 @@ pub fn declare(
                 lease.evidence,
                 lease.expires_ns,
                 lease.created_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "lease declare failed"))?;
     Ok(
         lease_by_prefix(connection, lease.volume_id, &lease.path_prefix)?
@@ -101,19 +103,21 @@ pub fn mark_verified(
     now_ns: i64,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE workspace_leases SET
                 status = 'verified', bytes_verified = ?1, pages_pinned = ?2,
                 evidence = ?3, verified_ns = ?4
              WHERE lease_id = ?5 AND status IN ('declared', 'verifying')",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 bytes_verified as i64,
                 pages_pinned as i64,
                 evidence,
                 now_ns,
                 lease_id.as_slice(),
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "lease verify failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict(
@@ -130,12 +134,11 @@ pub fn revoke(
     lease_id: &[u8; 16],
     now_ns: i64,
 ) -> Result<(), MirageError> {
-    let changed = connection
-        .execute(
+    let changed = connection.prepare_cached(
             "UPDATE workspace_leases SET status = 'revoked', verified_ns = COALESCE(verified_ns, ?1)
-             WHERE lease_id = ?2 AND status != 'revoked'",
+             WHERE lease_id = ?2 AND status != 'revoked'").and_then(|mut stmt| stmt.execute(
             params![now_ns, lease_id.as_slice()],
-        )
+        ))
         .map_err(|e| sqlite(e, "lease revoke failed"))?;
     if changed == 0 {
         return Err(MirageError::repository_conflict("lease is already revoked"));
@@ -154,7 +157,7 @@ pub fn is_admitted(
     // Prefix match is literal — LIKE would treat `_`/`%` inside a stored
     // lease prefix as wildcards and admit unrelated directories.
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT 1 FROM workspace_leases
              WHERE volume_id = ?1 AND status = 'verified'
                AND (expires_ns IS NULL OR expires_ns > ?2)
@@ -164,9 +167,13 @@ pub fn is_admitted(
                         AND substr(?3, length(path_prefix) + 1, 1) = '/')
                     OR path_prefix = '')
              LIMIT 1",
-            params![volume_id.as_bytes().as_slice(), now_ns, path],
-            |row| row.get::<_, i64>(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), now_ns, path],
+                |row| row.get::<_, i64>(0),
+            )
+        })
         .optional()
         .map(|present| present.is_some())
         .map_err(|e| sqlite(e, "lease admission check failed"))
@@ -178,12 +185,13 @@ fn lease_by_prefix(
     prefix: &str,
 ) -> Result<Option<WorkspaceLease>, MirageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT lease_id, bytes_declared, bytes_verified, pages_pinned,
                     status, evidence, expires_ns, created_ns, verified_ns
              FROM workspace_leases WHERE volume_id = ?1 AND path_prefix = ?2",
-            params![volume_id.as_bytes().as_slice(), prefix],
-            |row| {
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(params![volume_id.as_bytes().as_slice(), prefix], |row| {
                 Ok(WorkspaceLease {
                     lease_id: row
                         .get::<_, Vec<u8>>(0)?
@@ -204,8 +212,8 @@ fn lease_by_prefix(
                     created_ns: row.get(7)?,
                     verified_ns: row.get(8)?,
                 })
-            },
-        )
+            })
+        })
         .optional()
         .map_err(|e| sqlite(e, "lease lookup failed"))
 }
@@ -216,7 +224,7 @@ pub fn leases(
     volume_id: RepositoryId,
 ) -> Result<Vec<WorkspaceLease>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT lease_id, path_prefix, bytes_declared, bytes_verified,
                     pages_pinned, status, evidence, expires_ns, created_ns, verified_ns
              FROM workspace_leases WHERE volume_id = ?1 ORDER BY path_prefix",

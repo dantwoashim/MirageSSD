@@ -10,11 +10,12 @@
 //! `operation_id`; payloads no longer referenced by any non-reclaimed
 //! operation are reclaimable.
 
-use mirage_types::{MirageError, RepositoryId};
+use mirage_types::{InodeId, MirageError, RepositoryId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Database;
 use crate::error::sqlite;
+use crate::namespace::{DirEntry, NamespaceNodeKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -110,10 +111,52 @@ pub struct OperationPayloadRecord {
     pub flushed_ns: Option<i64>,
 }
 
+/// Journal entry recorded in the same transaction as the change it describes.
+#[derive(Debug, Clone)]
+pub struct JournalEntry {
+    pub operation_id: [u8; 16],
+    pub kind: OperationKind,
+    pub payload: Vec<u8>,
+    pub created_ns: i64,
+}
+
+/// One fully-sequenced durable mutation: optional physical reservation,
+/// extent map, journal operation, payload records, physical ledger commit,
+/// and a trailing inode `modified_ns` stamp — all inside one transaction.
+/// `operation.device_seq` is ignored; the allocator assigns it inside the
+/// transaction.
+pub struct SequencedMutation {
+    pub reservation: Option<(
+        crate::physical::PhysicalExtentRecord,
+        crate::physical::PhysicalReservationRecord,
+    )>,
+    pub extents: Option<ExtentMutation>,
+    pub operation: OperationRecord,
+    pub payloads: Vec<OperationPayloadRecord>,
+    pub physical: Option<crate::physical::PhysicalCommit>,
+    pub modified_ns: Option<(mirage_types::InodeId, i64)>,
+    pub now_ns: i64,
+}
+
 /// Inserts a pending operation with its payload references. `device_seq`
 /// must be the caller's next local sequence for the volume.
 pub fn begin_operation(
     connection: &mut Connection,
+    operation: &OperationRecord,
+    payloads: &[OperationPayloadRecord],
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin operation journal"))?;
+    begin_operation_in(&transaction, operation, payloads)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "operation journal commit failed"))
+}
+
+/// Transaction-scoped form of [`begin_operation`].
+pub fn begin_operation_in(
+    transaction: &rusqlite::Transaction<'_>,
     operation: &OperationRecord,
     payloads: &[OperationPayloadRecord],
 ) -> Result<(), MirageError> {
@@ -122,16 +165,10 @@ pub fn begin_operation(
             "a new operation must start pending",
         ));
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|e| sqlite(e, "failed to begin operation journal"))?;
     if let Some(parent) = operation.depends_on {
         let parent_status: Option<String> = transaction
-            .query_row(
-                "SELECT status FROM local_operations WHERE operation_id = ?1",
-                [parent.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT status FROM local_operations WHERE operation_id = ?1")
+            .and_then(|mut stmt| stmt.query_row([parent.as_slice()], |row| row.get(0)))
             .optional()
             .map_err(|e| sqlite(e, "operation dependency lookup failed"))?;
         if parent_status.is_none() {
@@ -141,12 +178,14 @@ pub fn begin_operation(
         }
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO local_operations
              (operation_id, device_seq, volume_id, base_commit, kind, payload,
               status, flush_group, depends_on, created_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 operation.operation_id.as_slice(),
                 operation.device_seq,
                 operation.volume_id.as_bytes().as_slice(),
@@ -156,28 +195,28 @@ pub fn begin_operation(
                 operation.flush_group,
                 operation.depends_on.map(|bytes| bytes.to_vec()),
                 operation.created_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "operation insert failed"))?;
     for payload in payloads {
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO operation_payloads
                  (payload_id, operation_id, path, bytes, checksum, flushed_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     payload.payload_id.as_slice(),
                     operation.operation_id.as_slice(),
                     payload.path,
                     payload.bytes,
                     payload.checksum.map(|bytes| bytes.to_vec()),
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "operation payload insert failed"))?;
     }
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "operation journal commit failed"))
+    Ok(())
 }
 
 /// Marks a payload flushed after its bytes have been durably written.
@@ -189,20 +228,19 @@ pub fn mark_payload_flushed(
     now_ns: i64,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE operation_payloads SET flushed_ns = ?1, checksum = ?2
              WHERE payload_id = ?3 AND flushed_ns IS NULL",
-            params![now_ns, checksum.as_slice(), payload_id.as_slice()],
         )
+        .and_then(|mut stmt| {
+            stmt.execute(params![now_ns, checksum.as_slice(), payload_id.as_slice()])
+        })
         .map_err(|e| sqlite(e, "payload flush mark failed"))?;
     if changed == 0 {
         // Idempotent replay: already flushed or unknown — only unknown fails.
         let exists: Option<i64> = connection
-            .query_row(
-                "SELECT 1 FROM operation_payloads WHERE payload_id = ?1",
-                [payload_id.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT 1 FROM operation_payloads WHERE payload_id = ?1")
+            .and_then(|mut stmt| stmt.query_row([payload_id.as_slice()], |row| row.get(0)))
             .optional()
             .map_err(|e| sqlite(e, "payload lookup failed"))?;
         if exists.is_none() {
@@ -220,13 +258,26 @@ pub fn commit_operation(
     connection: &mut Connection,
     operation_id: &[u8; 16],
 ) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin operation commit"))?;
+    commit_operation_in(&transaction, operation_id)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "operation commit failed"))
+}
+
+/// Transaction-scoped form of [`commit_operation`].
+pub fn commit_operation_in(
+    connection: &rusqlite::Transaction<'_>,
+    operation_id: &[u8; 16],
+) -> Result<(), MirageError> {
     let unflushed: i64 = connection
-        .query_row(
+        .prepare_cached(
             "SELECT count(*) FROM operation_payloads
              WHERE operation_id = ?1 AND flushed_ns IS NULL",
-            [operation_id.as_slice()],
-            |row| row.get(0),
         )
+        .and_then(|mut stmt| stmt.query_row([operation_id.as_slice()], |row| row.get(0)))
         .map_err(|e| sqlite(e, "payload flush check failed"))?;
     if unflushed > 0 {
         return Err(MirageError::repository_conflict(
@@ -234,11 +285,11 @@ pub fn commit_operation(
         ));
     }
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE local_operations SET status = 'committed'
              WHERE operation_id = ?1 AND status = 'pending'",
-            [operation_id.as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute([operation_id.as_slice()]))
         .map_err(|e| sqlite(e, "operation commit failed"))?;
     if changed != 1 {
         return Err(MirageError::repository_conflict("operation is not pending"));
@@ -257,19 +308,19 @@ pub fn open_flush_group(
         .transaction()
         .map_err(|e| sqlite(e, "failed to open flush group"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO flush_groups(volume_id, opened_ns, flushed_ns)
              VALUES (?1, ?2, NULL)",
-            params![volume_id.as_bytes().as_slice(), now_ns],
         )
+        .and_then(|mut stmt| stmt.execute(params![volume_id.as_bytes().as_slice(), now_ns]))
         .map_err(|e| sqlite(e, "flush group insert failed"))?;
     let group_id = transaction.last_insert_rowid();
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE local_operations SET flush_group = ?1
              WHERE volume_id = ?2 AND status = 'committed' AND flush_group IS NULL",
-            params![group_id, volume_id.as_bytes().as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute(params![group_id, volume_id.as_bytes().as_slice()]))
         .map_err(|e| sqlite(e, "flush group assignment failed"))?;
     transaction
         .commit()
@@ -288,18 +339,18 @@ pub fn mark_group_flushed(
         .transaction()
         .map_err(|e| sqlite(e, "failed to flush group"))?;
     let changed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE local_operations SET status = 'flushed'
              WHERE flush_group = ?1 AND status = 'committed'",
-            [group_id],
         )
+        .and_then(|mut stmt| stmt.execute([group_id]))
         .map_err(|e| sqlite(e, "flush group operation update failed"))?;
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE flush_groups SET flushed_ns = ?1
              WHERE group_id = ?2 AND flushed_ns IS NULL",
-            params![now_ns, group_id],
         )
+        .and_then(|mut stmt| stmt.execute(params![now_ns, group_id]))
         .map_err(|e| sqlite(e, "flush group mark failed"))?;
     transaction
         .commit()
@@ -318,11 +369,11 @@ pub fn mark_published(
     let mut changed = 0usize;
     for id in operation_ids {
         changed += transaction
-            .execute(
+            .prepare_cached(
                 "UPDATE local_operations SET status = 'published'
                  WHERE operation_id = ?1 AND status = 'flushed'",
-                [id.as_slice()],
             )
+            .and_then(|mut stmt| stmt.execute([id.as_slice()]))
             .map_err(|e| sqlite(e, "operation publish mark failed"))?;
     }
     transaction
@@ -339,7 +390,7 @@ pub fn replayable(
     volume_id: RepositoryId,
 ) -> Result<Vec<OperationRecord>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT operation_id, device_seq, volume_id, base_commit, kind,
                     payload, status, flush_group, depends_on, created_ns
              FROM local_operations
@@ -392,7 +443,7 @@ pub fn reclaimable_payloads(
     volume_id: RepositoryId,
 ) -> Result<Vec<[u8; 16]>, MirageError> {
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT p.payload_id FROM operation_payloads p
              JOIN local_operations o ON o.operation_id = p.operation_id
              WHERE o.volume_id = ?1 AND o.status IN ('pending', 'reclaimed')",
@@ -418,11 +469,11 @@ pub fn reclaim_pending(
 ) -> Result<u64, MirageError> {
     let _ = now_ns;
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE local_operations SET status = 'reclaimed'
              WHERE volume_id = ?1 AND status = 'pending'",
-            [volume_id.as_bytes().as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute([volume_id.as_bytes().as_slice()]))
         .map_err(|e| sqlite(e, "pending operation reclaim failed"))?;
     u64::try_from(changed).map_err(|_| MirageError::internal_invariant("reclaim count overflowed"))
 }
@@ -441,28 +492,184 @@ pub fn allocate_device_seq(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin sequence allocation"))?;
-    let journal_max: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(device_seq) + 1, 0) FROM local_operations
-             WHERE volume_id = ?1",
-            [volume_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(|e| sqlite(e, "device sequence lookup failed"))?;
-    let allocated: i64 = transaction
-        .query_row(
-            "INSERT INTO journal_sequences (volume_id, next_seq) VALUES (?1, ?2)
-             ON CONFLICT(volume_id) DO UPDATE SET
-                next_seq = MAX(journal_sequences.next_seq, excluded.next_seq) + 1
-             RETURNING next_seq - 1",
-            params![volume_id.as_bytes().as_slice(), journal_max],
-            |row| row.get(0),
-        )
-        .map_err(|e| sqlite(e, "device sequence allocation failed"))?;
+    let allocated = allocate_device_seq_in(&transaction, volume_id)?;
     transaction
         .commit()
         .map_err(|e| sqlite(e, "sequence allocation commit failed"))?;
     Ok(allocated)
+}
+
+/// Transaction-scoped form of [`allocate_device_seq`].
+pub fn allocate_device_seq_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+) -> Result<i64, MirageError> {
+    let journal_max: i64 = transaction
+        .prepare_cached(
+            "SELECT COALESCE(MAX(device_seq) + 1, 0) FROM local_operations
+             WHERE volume_id = ?1",
+        )
+        .and_then(|mut stmt| stmt.query_row([volume_id.as_bytes().as_slice()], |row| row.get(0)))
+        .map_err(|e| sqlite(e, "device sequence lookup failed"))?;
+    let allocated: i64 = transaction
+        .prepare_cached(
+            "INSERT INTO journal_sequences (volume_id, next_seq) VALUES (?1, ?2)
+             ON CONFLICT(volume_id) DO UPDATE SET
+                next_seq = MAX(journal_sequences.next_seq, excluded.next_seq) + 1
+             RETURNING next_seq - 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![volume_id.as_bytes().as_slice(), journal_max],
+                |row| row.get(0),
+            )
+        })
+        .map_err(|e| sqlite(e, "device sequence allocation failed"))?;
+    Ok(allocated)
+}
+
+/// Records the journal entry a namespace change describes inside the
+/// caller's transaction: sequence allocation, pending begin, and commit —
+/// one durable unit with the change itself.
+fn journal_entry_commit_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    journal: JournalEntry,
+) -> Result<(), MirageError> {
+    let device_seq = allocate_device_seq_in(transaction, volume_id)?;
+    begin_operation_in(
+        transaction,
+        &OperationRecord {
+            operation_id: journal.operation_id,
+            device_seq,
+            volume_id,
+            base_commit: None,
+            kind: journal.kind,
+            payload: journal.payload,
+            status: OperationStatus::Pending,
+            flush_group: None,
+            depends_on: None,
+            created_ns: journal.created_ns,
+        },
+        &[],
+    )?;
+    commit_operation_in(transaction, &journal.operation_id)
+}
+
+/// One transaction: the namespace create plus its journal entry. Any error
+/// rolls back both halves.
+pub fn namespace_create_journaled(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    parent: InodeId,
+    name: &str,
+    kind: NamespaceNodeKind,
+    now_ns: i64,
+    journal: JournalEntry,
+) -> Result<DirEntry, MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin journaled namespace create"))?;
+    let entry =
+        crate::namespace::create_node_in(&transaction, volume_id, parent, name, kind, now_ns)?;
+    journal_entry_commit_in(&transaction, volume_id, journal)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "journaled namespace create commit failed"))?;
+    Ok(entry)
+}
+
+/// One transaction: the namespace rename plus its journal entry.
+#[allow(clippy::too_many_arguments)]
+pub fn namespace_rename_journaled(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    from_parent: InodeId,
+    from_name: &str,
+    to_parent: InodeId,
+    to_name: &str,
+    now_ns: i64,
+    journal: JournalEntry,
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin journaled namespace rename"))?;
+    crate::namespace::rename_in(
+        &transaction,
+        volume_id,
+        from_parent,
+        from_name,
+        to_parent,
+        to_name,
+        now_ns,
+    )?;
+    journal_entry_commit_in(&transaction, volume_id, journal)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "journaled namespace rename commit failed"))
+}
+
+/// One transaction: the namespace delete plus its journal entry.
+pub fn namespace_delete_journaled(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    parent: InodeId,
+    name: &str,
+    now_ns: i64,
+    journal: JournalEntry,
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin journaled namespace delete"))?;
+    crate::namespace::delete_node_in(&transaction, volume_id, parent, name, now_ns)?;
+    journal_entry_commit_in(&transaction, volume_id, journal)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "journaled namespace delete commit failed"))
+}
+
+/// One transaction for the whole durable commit: optional physical
+/// reservation, sequence allocation, extent + operation + payload + physical
+/// commit, then the trailing inode `modified_ns` stamp. A missing-inode
+/// `set_times` result is ignored (the seal path tolerates it); every other
+/// error aborts and rolls everything back.
+pub fn sequenced_mutation_commit(
+    connection: &mut Connection,
+    mutation: SequencedMutation,
+) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin sequenced mutation commit"))?;
+    if let Some((extent, reservation)) = &mutation.reservation {
+        crate::physical::reserve_extent_in(&transaction, extent, reservation)?;
+    }
+    let device_seq = allocate_device_seq_in(&transaction, mutation.operation.volume_id)?;
+    let mut operation = mutation.operation;
+    operation.device_seq = device_seq;
+    commit_mutation_in(
+        &transaction,
+        mutation.extents.as_ref(),
+        &operation,
+        &mutation.payloads,
+        mutation.physical.as_ref(),
+        mutation.now_ns,
+    )?;
+    if let Some((inode, modified)) = mutation.modified_ns {
+        match crate::namespace::set_times(
+            &transaction,
+            operation.volume_id,
+            inode,
+            None,
+            Some(modified),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind == mirage_types::MirageErrorKind::InvalidArgument => {}
+            Err(error) => return Err(error),
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "sequenced mutation commit failed"))
 }
 
 /// One extent mutation to land atomically with its journal operation.
@@ -488,21 +695,33 @@ pub fn commit_mutation(
     physical: Option<&crate::physical::PhysicalCommit>,
     now_ns: i64,
 ) -> Result<(), MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin mutation commit"))?;
+    commit_mutation_in(&transaction, extents, operation, payloads, physical, now_ns)?;
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "mutation commit failed"))
+}
+
+/// Transaction-scoped form of [`commit_mutation`].
+pub fn commit_mutation_in(
+    transaction: &rusqlite::Transaction<'_>,
+    extents: Option<&ExtentMutation>,
+    operation: &OperationRecord,
+    payloads: &[OperationPayloadRecord],
+    physical: Option<&crate::physical::PhysicalCommit>,
+    now_ns: i64,
+) -> Result<(), MirageError> {
     if operation.status != OperationStatus::Pending {
         return Err(MirageError::invalid_argument(
             "a new operation must start pending",
         ));
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|e| sqlite(e, "failed to begin mutation commit"))?;
     if let Some(parent) = operation.depends_on {
         let parent_status: Option<String> = transaction
-            .query_row(
-                "SELECT status FROM local_operations WHERE operation_id = ?1",
-                [parent.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT status FROM local_operations WHERE operation_id = ?1")
+            .and_then(|mut stmt| stmt.query_row([parent.as_slice()], |row| row.get(0)))
             .optional()
             .map_err(|e| sqlite(e, "operation dependency lookup failed"))?;
         if parent_status.is_none() {
@@ -512,12 +731,14 @@ pub fn commit_mutation(
         }
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO local_operations
              (operation_id, device_seq, volume_id, base_commit, kind, payload,
               status, flush_group, depends_on, created_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 operation.operation_id.as_slice(),
                 operation.device_seq,
                 operation.volume_id.as_bytes().as_slice(),
@@ -527,8 +748,8 @@ pub fn commit_mutation(
                 operation.flush_group,
                 operation.depends_on.map(|bytes| bytes.to_vec()),
                 operation.created_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|e| sqlite(e, "operation insert failed"))?;
     for payload in payloads {
         if payload.operation_id != operation.operation_id {
@@ -539,19 +760,21 @@ pub fn commit_mutation(
         // Payloads arrive durable: the staged file was fsynced before the
         // commit ran, so the durable-flush marker is recorded inline.
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO operation_payloads
                  (payload_id, operation_id, path, bytes, checksum, flushed_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     payload.payload_id.as_slice(),
                     operation.operation_id.as_slice(),
                     payload.path,
                     payload.bytes,
                     payload.checksum.map(|bytes| bytes.to_vec()),
                     now_ns,
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "operation payload insert failed"))?;
     }
     if let Some(mutation) = extents {
@@ -571,24 +794,28 @@ pub fn commit_mutation(
             previous_end = extent.start.saturating_add(extent.length);
         }
         transaction
-            .execute(
+            .prepare_cached(
                 "DELETE FROM byte_extents
                  WHERE volume_id = ?1 AND inode = ?2 AND version = ?3",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     mutation.volume_id.as_bytes().as_slice(),
                     mutation.inode.as_bytes().as_slice(),
                     mutation.version,
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "extent replace delete failed"))?;
         for extent in &mutation.extents {
             transaction
-                .execute(
+                .prepare_cached(
                     "INSERT INTO byte_extents
                      (extent_id, volume_id, inode, version, start, length, kind,
                       page_hash, base_offset, payload_id, payload_offset, created_ns)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
+                )
+                .and_then(|mut stmt| {
+                    stmt.execute(params![
                         extent.extent_id.as_slice(),
                         mutation.volume_id.as_bytes().as_slice(),
                         mutation.inode.as_bytes().as_slice(),
@@ -601,34 +828,36 @@ pub fn commit_mutation(
                         extent.payload_id.map(|id| id.to_vec()),
                         extent.payload_offset.map(|offset| offset as i64),
                         now_ns,
-                    ],
-                )
+                    ])
+                })
                 .map_err(|e| sqlite(e, "extent insert failed"))?;
         }
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO byte_extent_heads (volume_id, inode, version, eof, updated_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(volume_id, inode) DO UPDATE SET
                     version = excluded.version, eof = excluded.eof,
                     updated_ns = excluded.updated_ns
                  WHERE excluded.version > byte_extent_heads.version",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     mutation.volume_id.as_bytes().as_slice(),
                     mutation.inode.as_bytes().as_slice(),
                     mutation.version,
                     mutation.eof as i64,
                     now_ns,
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "extent head write failed"))?;
     }
     let committed = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE local_operations SET status = 'committed'
              WHERE operation_id = ?1 AND status = 'pending'",
-            [operation.operation_id.as_slice()],
         )
+        .and_then(|mut stmt| stmt.execute([operation.operation_id.as_slice()]))
         .map_err(|e| sqlite(e, "operation commit failed"))?;
     if committed != 1 {
         return Err(MirageError::repository_conflict("operation is not pending"));
@@ -638,17 +867,19 @@ pub fn commit_mutation(
         // mutation: the payload's bytes become ledger-visible exactly when
         // the extent rows referencing them do.
         let committed_extent = transaction
-            .execute(
+            .prepare_cached(
                 "UPDATE physical_extents
                  SET state = 'alive', page_hash = ?1, checksum = ?2, updated_ns = ?3
                  WHERE extent_id = ?4 AND state = 'reserved'",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     physical.page_hash.as_bytes().as_slice(),
                     physical.checksum.as_slice(),
                     now_ns,
                     physical.extent_id.as_slice(),
-                ],
-            )
+                ])
+            })
             .map_err(|e| sqlite(e, "physical extent commit failed"))?;
         if committed_extent != 1 {
             return Err(MirageError::repository_conflict(
@@ -656,15 +887,11 @@ pub fn commit_mutation(
             ));
         }
         transaction
-            .execute(
-                "DELETE FROM physical_reservations WHERE extent_id = ?1",
-                [physical.extent_id.as_slice()],
-            )
+            .prepare_cached("DELETE FROM physical_reservations WHERE extent_id = ?1")
+            .and_then(|mut stmt| stmt.execute([physical.extent_id.as_slice()]))
             .map_err(|e| sqlite(e, "physical reservation release failed"))?;
     }
-    transaction
-        .commit()
-        .map_err(|e| sqlite(e, "mutation commit failed"))
+    Ok(())
 }
 
 impl Database {
@@ -682,6 +909,16 @@ impl Database {
     /// so two callers can never receive the same sequence.
     pub fn next_operation_seq(&self, volume_id: RepositoryId) -> Result<i64, MirageError> {
         self.writer().operation_alloc_seq(volume_id)
+    }
+
+    /// The whole durable mutation commit — reservation, sequence, extent
+    /// mutation, operation, payloads, physical commit, mtime — in one
+    /// transaction.
+    pub fn sequenced_mutation_commit(
+        &self,
+        mutation: SequencedMutation,
+    ) -> Result<(), MirageError> {
+        self.writer().sequenced_mutation_commit(mutation)
     }
 
     /// Payload ids whose operations never committed — safe to delete during

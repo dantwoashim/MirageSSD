@@ -76,11 +76,10 @@ impl Database {
     ) -> Result<Option<String>, MirageError> {
         self.reads.with_connection(|connection| {
             connection
-                .query_row(
-                    "SELECT owner_sid FROM repositories WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT owner_sid FROM repositories WHERE repository_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| row.get(0))
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load repository owner SID"))
         })
@@ -92,11 +91,14 @@ impl Database {
     ) -> Result<Option<bool>, MirageError> {
         self.reads.with_connection(|connection| {
             let value = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT content_encrypted FROM repositories WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get::<_, i64>(0),
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load repository encryption policy"))?;
             value
@@ -117,11 +119,10 @@ impl Database {
     ) -> Result<Option<VolumeMode>, MirageError> {
         self.reads.with_connection(|connection| {
             let value: Option<String> = connection
-                .query_row(
-                    "SELECT volume_mode FROM repositories WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT volume_mode FROM repositories WHERE repository_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| row.get(0))
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load repository volume mode"))?;
             value.map(|value| VolumeMode::parse(&value)).transpose()
@@ -134,11 +135,12 @@ impl Database {
     ) -> Result<Option<PathBuf>, MirageError> {
         self.reads.with_connection(|connection| {
             let value = connection
-                .query_row(
-                    "SELECT local_root FROM repositories WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get::<_, String>(0),
-                )
+                .prepare_cached("SELECT local_root FROM repositories WHERE repository_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load repository root"))?;
             value.map(crate::value::stored_path).transpose()
@@ -147,8 +149,7 @@ impl Database {
 
     pub fn list_repositories(&self) -> Result<Vec<RepositorySummary>, MirageError> {
         self.reads.with_connection(|connection| {
-            let mut statement = connection
-                .prepare(
+            let mut statement = connection.prepare_cached(
                     "SELECT repository_id, display_name, state, active_generation, active_commit_hash
                      FROM repositories ORDER BY repository_id",
                 )
@@ -245,11 +246,10 @@ impl Database {
     ) -> Result<Option<RepositoryState>, MirageError> {
         self.reads.with_connection(|connection| {
             let value: Option<String> = connection
-                .query_row(
-                    "SELECT state FROM repositories WHERE repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT state FROM repositories WHERE repository_id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| row.get(0))
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load repository state"))?;
             value
@@ -267,13 +267,15 @@ pub(crate) fn create(
     validate_owner_sid(&repository.owner_sid)?;
     let local_root = path_text(&repository.local_root)?;
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO repositories(
                 repository_id, display_name, local_root, active_generation,
                 active_commit_hash, state, created_at_ns, updated_at_ns, owner_sid,
                 content_encrypted
              ) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?5, ?6, ?7)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 repository.repository_id.as_bytes().as_slice(),
                 repository.display_name,
                 local_root,
@@ -281,8 +283,8 @@ pub(crate) fn create(
                 repository.created_at_ns,
                 repository.owner_sid,
                 i64::from(repository.content_encrypted),
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to create repository"))?;
     Ok(())
 }
@@ -296,15 +298,17 @@ pub(crate) fn set_owner_sid(
     validate_owner_sid(&expected_owner_sid)?;
     validate_owner_sid(&new_owner_sid)?;
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE repositories SET owner_sid = ?1
              WHERE repository_id = ?2 AND owner_sid = ?3",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 new_owner_sid,
                 repository_id.as_bytes().as_slice(),
                 expected_owner_sid,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to update repository owner SID"))?;
     if changed != 1 {
         return Err(conflict("repository owner changed concurrently"));
@@ -333,10 +337,10 @@ pub(crate) fn set_volume_mode(
     mode: VolumeMode,
 ) -> Result<(), MirageError> {
     let changed = connection
-        .execute(
-            "UPDATE repositories SET volume_mode = ?1 WHERE repository_id = ?2",
-            params![mode.as_str(), repository_id.as_bytes().as_slice()],
-        )
+        .prepare_cached("UPDATE repositories SET volume_mode = ?1 WHERE repository_id = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![mode.as_str(), repository_id.as_bytes().as_slice()])
+        })
         .map_err(|error| sqlite(error, "failed to persist repository volume mode"))?;
     if changed != 1 {
         return Err(MirageError::invalid_argument("repository does not exist"));
@@ -349,11 +353,12 @@ pub(crate) fn set_state(
     change: RepositoryStateChange,
 ) -> Result<RepositoryState, MirageError> {
     let actual: String = connection
-        .query_row(
-            "SELECT state FROM repositories WHERE repository_id = ?1",
-            [change.repository_id.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT state FROM repositories WHERE repository_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_row([change.repository_id.as_bytes().as_slice()], |row| {
+                row.get(0)
+            })
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to load repository for state transition"))?
         .ok_or_else(|| MirageError::invalid_argument("repository does not exist"))?;
@@ -363,16 +368,18 @@ pub(crate) fn set_state(
     }
     let next = transition_repository(actual, change.event).map_err(transition)?;
     let changed = connection
-        .execute(
+        .prepare_cached(
             "UPDATE repositories SET state = ?1, updated_at_ns = ?2
              WHERE repository_id = ?3 AND state = ?4",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 next.as_str(),
                 change.updated_at_ns,
                 change.repository_id.as_bytes().as_slice(),
                 actual.as_str(),
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to persist repository state transition"))?;
     if changed != 1 {
         return Err(conflict("repository state changed concurrently"));
@@ -388,11 +395,8 @@ pub fn unregister_repository(
     repository_id: RepositoryId,
 ) -> Result<bool, MirageError> {
     let exists: bool = connection
-        .query_row(
-            "SELECT 1 FROM repositories WHERE repository_id = ?1",
-            [repository_id.as_bytes().as_slice()],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM repositories WHERE repository_id = ?1")
+        .and_then(|mut stmt| stmt.query_row([repository_id.as_bytes().as_slice()], |_| Ok(())))
         .optional()
         .map_err(|error| sqlite(error, "failed to load repository for unregister"))?
         .is_some();
@@ -423,7 +427,8 @@ pub fn unregister_repository(
         "DELETE FROM repositories WHERE repository_id = ?1",
     ] {
         transaction
-            .execute(statement, [repository_id.as_bytes().as_slice()])
+            .prepare_cached(statement)
+            .and_then(|mut stmt| stmt.execute([repository_id.as_bytes().as_slice()]))
             .map_err(|error| sqlite(error, "failed to delete repository rows"))?;
     }
     transaction

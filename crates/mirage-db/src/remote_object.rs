@@ -75,23 +75,27 @@ impl Database {
     ) -> Result<Option<RemoteObjectRecord>, MirageError> {
         self.reads.with_connection(|connection| {
             let row = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT provider_file_id, provider_revision, object_kind, byte_length,
                             content_hash, state, created_at_ns
                      FROM remote_objects WHERE backend_id = ?1 AND object_key = ?2",
-                    params![backend_id.as_str(), object_key.as_bytes().as_slice()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, Vec<u8>>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, i64>(6)?,
-                        ))
-                    },
                 )
+                .and_then(|mut stmt| {
+                    stmt.query_row(
+                        params![backend_id.as_str(), object_key.as_bytes().as_slice()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Vec<u8>>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, i64>(6)?,
+                            ))
+                        },
+                    )
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load immutable remote object"))?;
             row.map(
@@ -153,11 +157,14 @@ pub(crate) fn register_account(
     bounded_text(&account.provider, 1, 64, "backend provider")?;
     bounded_text(&account.state, 1, 64, "backend account state")?;
     let existing = connection
-        .query_row(
+        .prepare_cached(
             "SELECT provider, account_subject_hash FROM backend_accounts WHERE backend_id = ?1",
-            [account.backend_id.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row([account.backend_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to query backend account"))?;
     if let Some((provider, subject_hash)) = existing {
@@ -165,30 +172,34 @@ pub(crate) fn register_account(
             return Err(conflict("backend account immutable identity changed"));
         }
         connection
-            .execute(
+            .prepare_cached(
                 "UPDATE backend_accounts SET state = ?1, updated_at_ns = ?2 WHERE backend_id = ?3",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     account.state,
                     account.updated_at_ns,
                     account.backend_id.as_str()
-                ],
-            )
+                ])
+            })
             .map_err(|error| sqlite(error, "failed to update backend account state"))?;
         return Ok(());
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO backend_accounts(
                 backend_id, provider, account_subject_hash, state, updated_at_ns
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 account.backend_id.as_str(),
                 account.provider,
                 account.account_subject_hash.as_bytes().as_slice(),
                 account.state,
                 account.updated_at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to register backend account"))?;
     Ok(())
 }
@@ -205,23 +216,27 @@ pub(crate) fn upsert_object(
         ));
     }
     let existing = connection
-        .query_row(
+        .prepare_cached(
             "SELECT provider_file_id, provider_revision, object_kind, byte_length, content_hash
              FROM remote_objects WHERE backend_id = ?1 AND object_key = ?2",
-            params![
-                object.backend_id.as_str(),
-                object.object_key.as_bytes().as_slice()
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                ))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    object.backend_id.as_str(),
+                    object.object_key.as_bytes().as_slice()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to query immutable remote object"))?;
     if let Some((provider, revision, kind, length, hash)) = existing {
@@ -242,12 +257,14 @@ pub(crate) fn upsert_object(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO remote_objects(
                 backend_id, object_key, provider_file_id, provider_revision,
                 object_kind, byte_length, content_hash, state, created_at_ns
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 object.backend_id.as_str(),
                 object.object_key.as_bytes().as_slice(),
                 object.provider_object_id.as_str(),
@@ -260,8 +277,8 @@ pub(crate) fn upsert_object(
                 object.content_hash.as_bytes().as_slice(),
                 object.state,
                 object.created_at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to persist immutable remote object"))?;
     Ok(UpsertRemoteObjectOutcome::Inserted)
 }
@@ -281,22 +298,23 @@ pub(crate) fn begin_upload(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO upload_sessions(
                 backend_id, upload_id, object_key, provider_session_id,
                 committed_offset, total_length, state, updated_at_ns
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session.backend_id.as_str(),
-                session.upload_id.as_bytes().as_slice(),
-                session.object_key.as_bytes().as_slice(),
-                session.provider_session_id,
-                sqlite_integer(session.committed_offset.as_u64(), "upload offset")?,
-                sqlite_integer(session.total_length.as_u64(), "upload length")?,
-                session.state,
-                session.updated_at_ns,
-            ],
         )
+        .map_err(|error| sqlite(error, "failed to persist upload session"))?
+        .execute(params![
+            session.backend_id.as_str(),
+            session.upload_id.as_bytes().as_slice(),
+            session.object_key.as_bytes().as_slice(),
+            session.provider_session_id,
+            sqlite_integer(session.committed_offset.as_u64(), "upload offset")?,
+            sqlite_integer(session.total_length.as_u64(), "upload length")?,
+            session.state,
+            session.updated_at_ns,
+        ])
         .map_err(|error| sqlite(error, "failed to persist upload session"))?;
     Ok(())
 }
@@ -322,19 +340,20 @@ pub(crate) fn advance_upload(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "UPDATE upload_sessions
              SET committed_offset = ?1, state = ?2, updated_at_ns = ?3
              WHERE backend_id = ?4 AND upload_id = ?5 AND committed_offset = ?6",
-            params![
-                sqlite_integer(advance.new_offset.as_u64(), "upload offset")?,
-                advance.state,
-                advance.updated_at_ns,
-                advance.backend_id.as_str(),
-                advance.upload_id.as_bytes().as_slice(),
-                sqlite_integer(advance.expected_offset.as_u64(), "upload offset")?,
-            ],
         )
+        .map_err(|error| sqlite(error, "failed to advance upload session"))?
+        .execute(params![
+            sqlite_integer(advance.new_offset.as_u64(), "upload offset")?,
+            advance.state,
+            advance.updated_at_ns,
+            advance.backend_id.as_str(),
+            advance.upload_id.as_bytes().as_slice(),
+            sqlite_integer(advance.expected_offset.as_u64(), "upload offset")?,
+        ])
         .map_err(|error| sqlite(error, "failed to advance upload session"))?;
     load_upload(connection, &advance.backend_id, advance.upload_id)?
         .ok_or_else(|| MirageError::internal_invariant("updated upload session disappeared"))
@@ -346,22 +365,26 @@ fn load_upload(
     upload_id: UpdateId,
 ) -> Result<Option<UploadSession>, MirageError> {
     let row = connection
-        .query_row(
+        .prepare_cached(
             "SELECT object_key, provider_session_id, committed_offset,
                     total_length, state, updated_at_ns
              FROM upload_sessions WHERE backend_id = ?1 AND upload_id = ?2",
-            params![backend_id.as_str(), upload_id.as_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![backend_id.as_str(), upload_id.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to load upload session"))?;
     row.map(|(key, provider, offset, total, state, updated)| {

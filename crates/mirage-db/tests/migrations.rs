@@ -42,7 +42,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations");
-    assert_eq!(migration_count, 28);
+    assert_eq!(migration_count, 30);
     drop(raw);
     drop(db);
 
@@ -54,7 +54,7 @@ fn fresh_database_initialization_and_idempotent_restart() {
             row.get(0)
         })
         .expect("count schema_migrations after restart");
-    assert_eq!(migration_count2, 28);
+    assert_eq!(migration_count2, 30);
     drop(raw2);
     drop(db2);
 }
@@ -128,7 +128,7 @@ fn future_unsupported_migration_version_is_rejected() {
     let raw = open_raw_connection(&db_path);
     raw.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at_ns)
-         VALUES (29, '0029_future.sql', ?1, 1000)",
+         VALUES (31, '0031_future.sql', ?1, 1000)",
         [[0xAA_u8; 32].as_slice()],
     )
     .expect("insert future migration");
@@ -175,4 +175,41 @@ fn migration_0027_adds_the_payload_lookup_index() {
         )
         .ok();
     assert_eq!(index.as_deref(), Some("byte_extents_payload"));
+}
+
+#[test]
+fn migration_0030_defaults_member_offset_for_old_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("control.db");
+    let db = Database::open(&db_path).expect("open");
+    drop(db);
+    // A row written by a pre-0030 schema: no member_offset column value.
+    let raw = open_raw_connection(&db_path);
+    raw.execute(
+        "INSERT INTO payload_remote_objects
+         (volume_id, payload_id, provider_object_id, immutable_revision,
+          object_length, object_hash, plaintext_length, plaintext_hash,
+          frame_hashes, published_ns)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            [7u8; 16].as_slice(),
+            [8u8; 16].as_slice(),
+            "old-object",
+            100i64,
+            [9u8; 32].as_slice(),
+            64i64,
+            [10u8; 32].as_slice(),
+            Vec::<u8>::new(),
+            1000i64,
+        ],
+    )
+    .expect("insert pre-0030 shaped row");
+    drop(raw);
+
+    let db = Database::open(&db_path).expect("reopen");
+    let record = db
+        .payload_publication(mirage_types::RepositoryId::from_bytes([7; 16]), &[8u8; 16])
+        .expect("read back")
+        .expect("row exists");
+    assert_eq!(record.member_offset, 0);
 }

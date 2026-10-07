@@ -45,10 +45,9 @@ impl Database {
     ) -> Result<Option<VerifiedGeneration>, MirageError> {
         let generation = sqlite_integer(generation_id.as_u64(), "generation")?;
         self.reads.with_connection(|connection| {
-            let row = connection
-                .query_row(
+            let row = connection.prepare_cached(
                     "SELECT commit_hash, manifest_hash, manifest_local_path, mount_index_path, created_at_ns
-                     FROM generations WHERE repository_id = ?1 AND generation = ?2 AND verified = 1",
+                     FROM generations WHERE repository_id = ?1 AND generation = ?2 AND verified = 1").and_then(|mut stmt| stmt.query_row(
                     params![repository_id.as_bytes().as_slice(), generation],
                     |row| {
                         Ok((
@@ -59,7 +58,7 @@ impl Database {
                             row.get::<_, i64>(4)?,
                         ))
                     },
-                )
+                ))
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load verified generation"))?;
             row.map(|(commit, manifest, manifest_path, index_path, created_at_ns)| {
@@ -107,7 +106,7 @@ impl Database {
     ) -> Result<Option<ActiveGeneration>, MirageError> {
         self.reads.with_connection(|connection| {
             let row = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT r.active_generation, r.active_commit_hash, g.manifest_hash,
                             g.manifest_local_path, g.mount_index_path
                      FROM repositories r
@@ -115,8 +114,9 @@ impl Database {
                        ON g.repository_id = r.repository_id
                       AND g.generation = r.active_generation
                      WHERE r.repository_id = ?1",
-                    [repository_id.as_bytes().as_slice()],
-                    |row| {
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_row([repository_id.as_bytes().as_slice()], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
@@ -124,8 +124,8 @@ impl Database {
                             row.get::<_, String>(3)?,
                             row.get::<_, Option<String>>(4)?,
                         ))
-                    },
-                )
+                    })
+                })
                 .optional()
                 .map_err(|error| sqlite(error, "failed to load active generation"))?;
             row.map(
@@ -160,23 +160,27 @@ pub(crate) fn insert_verified(
         .map(path_text)
         .transpose()?;
     let existing = connection
-        .query_row(
+        .prepare_cached(
             "SELECT commit_hash, manifest_hash, manifest_local_path, mount_index_path, verified
              FROM generations WHERE repository_id = ?1 AND generation = ?2",
-            params![
-                generation.repository_id.as_bytes().as_slice(),
-                generation_id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    generation.repository_id.as_bytes().as_slice(),
+                    generation_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to query generation identity"))?;
     if let Some((commit, manifest, stored_manifest_path, stored_index_path, verified)) = existing {
@@ -193,12 +197,14 @@ pub(crate) fn insert_verified(
         ));
     }
     connection
-        .execute(
+        .prepare_cached(
             "INSERT INTO generations(
                 repository_id, generation, commit_hash, manifest_hash,
                 manifest_local_path, mount_index_path, verified, created_at_ns
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 generation.repository_id.as_bytes().as_slice(),
                 generation_id,
                 generation.commit_hash.as_bytes().as_slice(),
@@ -206,8 +212,8 @@ pub(crate) fn insert_verified(
                 manifest_path,
                 index_path,
                 generation.created_at_ns,
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to insert verified generation"))?;
     Ok(())
 }
@@ -221,17 +227,18 @@ pub(crate) fn activate(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| sqlite(error, "failed to begin generation activation"))?;
     let current = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT active_generation, active_commit_hash
              FROM repositories WHERE repository_id = ?1",
-            [activation.repository_id.as_bytes().as_slice()],
-            |row| {
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([activation.repository_id.as_bytes().as_slice()], |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,
                     row.get::<_, Option<Vec<u8>>>(1)?,
                 ))
-            },
-        )
+            })
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to load repository activation state"))?
         .ok_or_else(|| MirageError::invalid_argument("repository does not exist"))?;
@@ -251,12 +258,16 @@ pub(crate) fn activate(
         return Err(conflict("active generation changed concurrently"));
     }
     let target_row = transaction
-        .query_row(
+        .prepare_cached(
             "SELECT commit_hash, verified FROM generations
              WHERE repository_id = ?1 AND generation = ?2",
-            params![activation.repository_id.as_bytes().as_slice(), target],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![activation.repository_id.as_bytes().as_slice(), target],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+        })
         .optional()
         .map_err(|error| sqlite(error, "failed to load activation target"))?
         .ok_or_else(|| MirageError::invalid_argument("target generation does not exist"))?;
@@ -266,17 +277,19 @@ pub(crate) fn activate(
         ));
     }
     transaction
-        .execute(
+        .prepare_cached(
             "UPDATE repositories
              SET active_generation = ?1, active_commit_hash = ?2, updated_at_ns = ?3
              WHERE repository_id = ?4",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 target,
                 activation.target_commit_hash.as_bytes().as_slice(),
                 activation.updated_at_ns,
                 activation.repository_id.as_bytes().as_slice(),
-            ],
-        )
+            ])
+        })
         .map_err(|error| sqlite(error, "failed to activate generation"))?;
     transaction
         .commit()
