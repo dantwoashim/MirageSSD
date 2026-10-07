@@ -1,15 +1,18 @@
 //! `--tray`: a notification-area companion for the UI host — hidden message
 //! window, per-user tray icon, live menu, and balloon notifications.
 //!
-//! The browser tab is still the UI; the tray simply owns "always running".
-//! Closing the tab leaves MirageSSD running in the tray; Quit exits the host.
+//! The app window is still the UI; the tray simply owns "always running".
+//! Closing the window leaves MirageSSD running in the tray; Quit exits the host.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    HWND, LPARAM, LRESULT, POINT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -17,10 +20,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetCursorPos, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, LoadImageW,
-    MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, WM_APP, WM_COMMAND, WM_DESTROY,
-    WNDCLASSW,
+    GetCursorPos, GetSystemMetrics, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE,
+    LR_LOADFROMFILE, LR_SHARED, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
+    MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostQuitMessage, QS_ALLINPUT,
+    RegisterClassW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TrackPopupMenu, WM_APP, WM_COMMAND, WM_DESTROY, WM_QUIT, WNDCLASSW,
 };
 
 const WM_TRAYICON: u32 = WM_APP + 1;
@@ -38,8 +42,27 @@ fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain([0]).collect()
 }
 
+/// The installed icon sits next to the exes; the stock application icon is
+/// the fallback for unpackaged runs.
 fn small_icon() -> windows_sys::Win32::Foundation::HANDLE {
     unsafe {
+        if let Some(path) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("mirage-drive.ico")))
+        {
+            let path = wide(&path.to_string_lossy());
+            let icon = LoadImageW(
+                ptr::null_mut(),
+                path.as_ptr(),
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_LOADFROMFILE,
+            );
+            if !icon.is_null() {
+                return icon;
+            }
+        }
         LoadImageW(
             GetModuleHandleW(ptr::null()),
             IDI_APPLICATION,
@@ -51,11 +74,19 @@ fn small_icon() -> windows_sys::Win32::Foundation::HANDLE {
     }
 }
 
+/// The settings view, addressed through the same page URL (`{origin}/#{token}`)
+/// by inserting the view parameter ahead of the fragment.
+fn settings_url(page_url: &str) -> String {
+    match page_url.split_once('#') {
+        Some((base, fragment)) => format!("{base}?view=settings#{fragment}"),
+        None => format!("{page_url}?view=settings"),
+    }
+}
+
 struct Tray {
     hwnd: HWND,
     nid: NOTIFYICONDATAW,
     url: String,
-    signed_in: bool,
     mounted: Vec<String>,
     account: Option<String>,
     service_down_announced: bool,
@@ -144,7 +175,6 @@ impl Tray {
                 self.set_tip("MirageSSD — service unavailable");
             }
         }
-        self.signed_in = self.account.is_some();
     }
 
     fn menu(&mut self) {
@@ -167,11 +197,7 @@ impl Tray {
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             let reclaim = wide("Free up space now");
             AppendMenuW(menu, MF_STRING, CMD_RECLAIM as usize, reclaim.as_ptr());
-            let sign = wide(if self.signed_in {
-                "Sign out…"
-            } else {
-                "Sign in…"
-            });
+            let sign = wide("Account…");
             AppendMenuW(menu, MF_STRING, CMD_SIGNIN as usize, sign.as_ptr());
             let diag = wide("Collect diagnostics");
             AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS as usize, diag.as_ptr());
@@ -198,25 +224,41 @@ impl Tray {
     fn command(&mut self, command: u16) {
         match command {
             CMD_OPEN => {
-                let _ = super::windows_host::open_browser_url(&self.url);
+                let _ = super::windows_host::open_app_window(&self.url);
             }
             CMD_RECLAIM => {
-                if let Ok(result) =
-                    mirage_cli::commands::service::request_json(mirage_ipc::Command::DiskReclaimNow)
-                {
-                    let freed = result["reclaimed_bytes"].as_u64().unwrap_or(0);
-                    self.balloon(
-                        "Space freed",
-                        &format!("Moved {freed} bytes of already-uploaded content to Drive."),
-                    );
+                match mirage_cli::commands::service::request_json(
+                    mirage_ipc::Command::DiskReclaimNow,
+                ) {
+                    Ok(result) => {
+                        let freed = result["reclaimed_bytes"].as_u64().unwrap_or(0);
+                        if freed == 0 {
+                            self.balloon(
+                                "Nothing to free",
+                                "Nothing to free right now — everything local is still in use or waiting to upload.",
+                            );
+                        } else {
+                            self.balloon(
+                                "Space freed",
+                                &format!(
+                                    "Freed {} of files that are already in Google Drive.",
+                                    mirage_cli::output::format_bytes(freed)
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.balloon("Couldn't free up space", &error.to_string());
+                    }
                 }
             }
-            CMD_DIAGNOSTICS => {
-                let _ = mirage_cli::commands::diagnostics::collect_zip(None);
-            }
+            CMD_DIAGNOSTICS => match mirage_cli::commands::diagnostics::collect_zip(None) {
+                Ok(path) => self.balloon("Diagnostics saved", &path.to_string_lossy()),
+                Err(error) => self.balloon("Couldn't collect diagnostics", &error.to_string()),
+            },
             CMD_SIGNIN => {
-                // Signing in/out lives on the account chip — open the window.
-                let _ = super::windows_host::open_browser_url(&self.url);
+                // Account actions live on the Settings page — open it directly.
+                let _ = super::windows_host::open_app_window(&settings_url(&self.url));
             }
             CMD_QUIT => unsafe {
                 Shell_NotifyIconW(NIM_DELETE, &self.notify_data());
@@ -320,7 +362,6 @@ pub fn run(url: String) -> ! {
             hwnd,
             nid,
             url,
-            signed_in: account.is_some(),
             mounted: Vec::new(),
             account,
             service_down_announced: false,
@@ -336,36 +377,52 @@ pub fn run(url: String) -> ! {
 
         let tray = TRAY.load(Ordering::SeqCst) as *mut Tray;
         (*tray).refresh_state();
-        // Periodic refresh of tooltip + state; messages also pump the icon.
-        let mut ticks = 0_u32;
+        // Clicks, the second-launch show event, and the 30 s state refresh all
+        // wake this wait — no sleep means the menu feels instant.
+        let mut next_refresh = Instant::now() + Duration::from_secs(30);
+        let handles = [show_event];
         let mut message = MSG::default();
         loop {
-            while windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
-                &mut message,
-                ptr::null_mut(),
+            let count = u32::from(!show_event.is_null());
+            let wait_ms = next_refresh
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
+            let signaled = MsgWaitForMultipleObjects(
+                count,
+                if count == 0 {
+                    ptr::null()
+                } else {
+                    handles.as_ptr()
+                },
                 0,
-                0,
-                1, // PM_REMOVE
-            ) != 0
-            {
-                if message.message == 0x0012 {
-                    // WM_QUIT
-                    Shell_NotifyIconW(NIM_DELETE, &(*tray).nid);
-                    std::process::exit(0);
-                }
-                DispatchMessageW(&message);
-            }
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            if !show_event.is_null()
-                && windows_sys::Win32::System::Threading::WaitForSingleObject(show_event, 0) == 0
-            {
+                wait_ms,
+                QS_ALLINPUT,
+            );
+            if count == 1 && signaled == WAIT_OBJECT_0 {
+                // A second launch asked for the window.
                 let url = (*tray).url.clone();
-                let _ = super::windows_host::open_browser_url(&url);
+                let _ = super::windows_host::open_app_window(&url);
+                continue;
             }
-            ticks += 5;
-            if ticks >= 30 {
-                ticks = 0;
+            if signaled == WAIT_OBJECT_0 + count {
+                while PeekMessageW(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if message.message == WM_QUIT {
+                        Shell_NotifyIconW(NIM_DELETE, &(*tray).nid);
+                        std::process::exit(0);
+                    }
+                    DispatchMessageW(&message);
+                }
+                continue;
+            }
+            if signaled == WAIT_FAILED {
+                // A dead handle would spin until the refresh deadline; don't.
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            // Timeout (or a failed wait): refresh on schedule.
+            if Instant::now() >= next_refresh {
                 (*tray).refresh_state();
+                next_refresh = Instant::now() + Duration::from_secs(30);
             }
         }
     }

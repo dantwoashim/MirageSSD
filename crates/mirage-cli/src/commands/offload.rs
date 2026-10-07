@@ -16,6 +16,7 @@ use mirage_types::{MirageError, RepositoryId};
 
 use super::service;
 use crate::client::ServiceTransport;
+use crate::output::format_bytes;
 
 #[derive(Debug, Clone)]
 pub struct OffloadSpec {
@@ -317,17 +318,6 @@ fn request(
         Some(transport) => service::request_with(transport, command),
         None => service::request_json(command),
     }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[cfg(test)]
