@@ -1,10 +1,10 @@
 import { StrictMode } from 'react';
-import { MotionConfig } from 'framer-motion';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { FetchBridge, ServiceClient } from './api/client';
 import { bridgeSession } from './api/session';
 import { initTheme } from './theme';
+import { ToastProvider } from './ui';
 import './styles.css';
 
 const root = document.getElementById('root');
@@ -18,6 +18,6 @@ const bridge = new FetchBridge(session.token);
 if (session.removeHash) window.history.replaceState(null, '', window.location.pathname + window.location.search);
 createRoot(root).render(
   <StrictMode>
-    <MotionConfig reducedMotion="user"><App client={new ServiceClient(bridge)} /></MotionConfig>
+    <ToastProvider><App client={new ServiceClient(bridge)} /></ToastProvider>
   </StrictMode>,
 );

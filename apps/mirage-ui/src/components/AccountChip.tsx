@@ -2,6 +2,7 @@ import { ArrowClockwise, GoogleLogo, Info, SignOut, SpinnerGap, UserCircle, X } 
 import { useState } from 'react';
 import type { DriveAccount } from '../api/account';
 import { useDriveAccount } from '../api/account';
+import { Button } from '../ui';
 
 function refreshedLabel(issued?: number): string {
   if (!issued) return '';
@@ -9,14 +10,16 @@ function refreshedLabel(issued?: number): string {
   return minutes <= 1 ? 'Token refreshed just now' : `Token refreshed ${minutes} min ago`;
 }
 
-/** Always-visible Google account control for the sidebar. */
+/** Full Google account control: status, sign-in/out, and account switching. */
 export function AccountChip({ account, onChanged, unavailable }: { account: DriveAccount; onChanged?: () => void; unavailable?: boolean }) {
   if (unavailable) {
     return (
-      <div className="account-chip" aria-live="polite">
-        <div className="account-chip-row">
-          <span className="account-chip-icon" aria-hidden="true"><GoogleLogo size={17} weight="bold" /></span>
-          <span className="account-chip-status text-zinc-500">Unavailable</span>
+      <div aria-live="polite">
+        <div className="flex items-center gap-2.5">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-fg-subtle" aria-hidden="true">
+            <GoogleLogo size={15} weight="bold" />
+          </span>
+          <span className="text-xs text-fg-subtle">Unavailable</span>
         </div>
       </div>
     );
@@ -42,81 +45,79 @@ function AccountChipInner({ account, onChanged }: { account: DriveAccount; onCha
 
   const status = (() => {
     switch (state.phase) {
-      case 'signed_in': return refreshedLabel(state.issuedUnixSeconds) || 'Connected to Google Drive';
+      case 'signed_in': return 'Connected to Google Drive';
       case 'signing_in': return 'Waiting for Google…';
       case 'error': return state.error ?? 'Sign-in needs attention.';
       default: return 'Not signed in to Google Drive';
     }
   })();
+  const refreshed = state.phase === 'signed_in' ? refreshedLabel(state.issuedUnixSeconds) : '';
 
   return (
-    <div className="account-chip" aria-live="polite">
-      <div className="account-chip-row">
-        <span className={`account-chip-icon${state.phase === 'signed_in' ? ' is-signed-in' : ''}`} aria-hidden="true">
-          {state.phase === 'signed_in' ? <UserCircle size={18} weight="duotone" /> : <GoogleLogo size={17} weight="bold" />}
+    <div aria-live="polite">
+      <div className="flex items-center gap-2.5">
+        <span className={`grid size-8 shrink-0 place-items-center rounded-lg border border-line ${state.phase === 'signed_in' ? 'bg-accent-soft text-accent' : 'text-fg-subtle'}`} aria-hidden="true">
+          {state.phase === 'signed_in' ? <UserCircle size={16} weight="duotone" /> : <GoogleLogo size={15} weight="bold" />}
         </span>
-        <div className="account-chip-text">
+        <div className="min-w-0 flex-1">
           {state.phase === 'signed_in' && state.email
-            ? <span className="account-chip-email" title={state.email}>{state.email}</span>
-            : <span className="account-chip-email">Google Drive</span>}
-          <small>{status}</small>
+            ? <span className="block truncate text-[13px] font-medium text-fg" title={state.email}>{state.email}</span>
+            : <span className="block truncate text-[13px] font-medium text-fg">Google Drive</span>}
+          <span className="block truncate text-xs text-fg-subtle" title={refreshed || undefined}>{status}</span>
         </div>
         {state.phase === 'signing_in'
-          ? <SpinnerGap size={16} className="refreshing" aria-hidden="true" />
+          ? <SpinnerGap size={15} className="animate-spin text-fg-muted" aria-hidden="true" />
           : null}
       </div>
 
       {state.phase === 'error' && state.error && (
-        <p className="account-chip-error" role="alert"><Info size={14} /> {state.error}</p>
+        <p className="mt-2.5 flex items-start gap-1.5 text-xs leading-relaxed text-danger" role="alert">
+          <Info size={13} className="mt-0.5 shrink-0" aria-hidden="true" /> {state.error}
+        </p>
       )}
 
-      <div className="account-chip-actions">
+      <div className="mt-3 flex flex-wrap gap-2">
         {state.phase === 'signed_out' && (
-          <button className="primary-button account-chip-button" disabled={busy}
-            onClick={() => void run(() => account.signIn())}>
+          <Button size="sm" disabled={busy} onClick={() => void run(() => account.signIn())}>
             Sign in
-          </button>
+          </Button>
         )}
         {state.phase === 'signing_in' && (
-          <button className="quiet-button account-chip-button" disabled={busy}
-            onClick={() => void run(() => account.cancelSignIn())}>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => void run(() => account.cancelSignIn())}>
             Cancel
-          </button>
+          </Button>
         )}
         {state.phase === 'error' && (
-          <button className="primary-button account-chip-button" disabled={busy}
-            onClick={() => void run(() => account.signIn())}>
+          <Button size="sm" disabled={busy} onClick={() => void run(() => account.signIn())}>
             Try again
-          </button>
+          </Button>
         )}
         {state.phase === 'signed_in' && !confirming && (
           <>
-            <button className="quiet-button account-chip-button" disabled={busy}
-              onClick={() => void run(() => account.switchAccount())}>
-              <ArrowClockwise size={14} />Switch account
-            </button>
-            <button className="quiet-button account-chip-button" disabled={busy} onClick={() => setConfirming(true)}>
-              <SignOut size={14} />Sign out
-            </button>
+            <Button variant="ghost" size="sm" icon={<ArrowClockwise size={13} />} disabled={busy} onClick={() => void run(() => account.switchAccount())}>
+              Switch account
+            </Button>
+            <Button variant="ghost" size="sm" icon={<SignOut size={13} />} disabled={busy} onClick={() => setConfirming(true)}>
+              Sign out
+            </Button>
           </>
         )}
       </div>
 
       {confirming && (
-        <div className="account-chip-confirm" role="alertdialog" aria-label="Confirm sign out">
-          <p>
+        <div className="mt-3 rounded-xl border border-line bg-surface-2 p-3.5" role="alertdialog" aria-label="Confirm sign out">
+          <p className="text-xs leading-relaxed text-fg-muted">
             Sign out of {state.email ?? 'Google Drive'}? Your drives stay mounted until the service
             restarts, but new uploads and cold reads will fail until you sign in again.
             Files on Drive are not deleted.
           </p>
-          <div className="account-chip-actions">
-            <button className="primary-button account-chip-button" disabled={busy}
-              onClick={() => void run(() => account.signOut())}>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="danger" size="sm" disabled={busy} onClick={() => void run(() => account.signOut())}>
               Sign out
-            </button>
-            <button className="quiet-button account-chip-button" disabled={busy} onClick={() => setConfirming(false)}>
-              <X size={14} />Keep signed in
-            </button>
+            </Button>
+            <Button variant="ghost" size="sm" icon={<X size={13} />} disabled={busy} onClick={() => setConfirming(false)}>
+              Keep signed in
+            </Button>
           </div>
         </div>
       )}

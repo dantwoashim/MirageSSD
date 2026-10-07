@@ -1,4 +1,48 @@
+import { formatBytes } from './format';
 import { EMPTY_READINESS, type Mode, type Readiness, type RepositoryState } from './models';
+
+export function label(value: string) {
+  return value.replaceAll('_', ' ').replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+export function isManagedDrive(repository?: RepositoryState): boolean {
+  return repository?.origin === 'drive' && repository?.volumeMode === 'managed';
+}
+
+export function driveLetter(repository?: RepositoryState): string | undefined {
+  const match = /^([A-Za-z]):\\?$/.exec(repository?.mountPath?.trim() ?? '');
+  return match ? match[1].toUpperCase() : undefined;
+}
+
+export type StatusTone = 'ok' | 'warn' | 'danger' | 'busy' | 'neutral';
+
+export function connectionStatus(repository: RepositoryState): { tone: StatusTone; label: string } {
+  switch (repository.state) {
+    case 'ready_mounted': return { tone: 'ok', label: 'Connected' };
+    case 'playing_sealed':
+    case 'playing_balanced': return { tone: 'ok', label: 'In use' };
+    case 'ready_unmounted': return { tone: 'neutral', label: 'Disconnected' };
+    case 'mounting': return { tone: 'busy', label: 'Connecting' };
+    case 'importing': return { tone: 'busy', label: 'Importing' };
+    case 'uploading_base': return { tone: 'busy', label: 'Uploading' };
+    case 'verifying_base': return { tone: 'busy', label: 'Verifying' };
+    case 'admitting_session': return { tone: 'busy', label: 'Preparing' };
+    case 'updating': return { tone: 'busy', label: 'Updating' };
+    case 'recovering': return { tone: 'busy', label: 'Recovering' };
+    case 'degraded': return { tone: 'warn', label: 'Limited' };
+    case 'conflicted':
+    case 'error': return { tone: 'danger', label: 'Needs attention' };
+    case 'uninitialized': return { tone: 'neutral', label: 'Not set up' };
+    default: return { tone: 'neutral', label: label(repository.state) };
+  }
+}
+
+export function uploadStatus(repository: RepositoryState): { tone: StatusTone; label: string } {
+  const pending = repository.pendingBytes;
+  if (pending === null || pending === undefined) return { tone: 'neutral', label: 'Upload status unavailable' };
+  if (pending === 0) return { tone: 'ok', label: 'Everything is uploaded to Google Drive' };
+  return { tone: 'busy', label: `Uploading ${formatBytes(pending)} to Google Drive` };
+}
 
 export function canLaunch(mode: Mode, readiness: Readiness) {
   return mode === 'verified_local' && readiness.state === 'sealed_ready' && readiness.missingBytes === 0 && Boolean(readiness.capsuleId);

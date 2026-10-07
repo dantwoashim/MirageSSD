@@ -15,6 +15,9 @@ const repository: RepositoryState = {
   logicalBytes: 2048,
   backendHealth: 'online',
   lastSealViolations: 0,
+  origin: 'drive',
+  volumeMode: 'managed',
+  mountPath: 'M:\\',
 };
 
 describe('dashboard drive creation entry points', () => {
@@ -22,11 +25,10 @@ describe('dashboard drive creation entry points', () => {
     const html = renderToStaticMarkup(createElement(Dashboard, {
       repositories: [],
       onSelect: () => {},
-      onRefresh: () => {},
       onSetup: () => {},
     }));
     expect(html).toContain('Create your drive');
-    expect(html).toContain('Sign in with Google and create an encrypted drive');
+    expect(html).toContain('Sign in with Google');
   });
 
   it('offers Add a drive alongside existing workspaces', () => {
@@ -34,10 +36,20 @@ describe('dashboard drive creation entry points', () => {
       repositories: [repository],
       selectedId: repository.id,
       onSelect: () => {},
-      onRefresh: () => {},
       onSetup: () => {},
     }));
     expect(html).toContain('Add a drive');
     expect(html).toContain('Existing');
+  });
+
+  it('shows an uploading indicator for a managed drive with pending bytes', () => {
+    const uploading = { ...repository, pendingBytes: Math.round(1.37 * 1024 ** 3) };
+    const html = renderToStaticMarkup(createElement(Dashboard, {
+      repositories: [uploading],
+      selectedId: repository.id,
+      onSelect: () => {},
+      onSetup: () => {},
+    }));
+    expect(html).toContain('Uploading');
   });
 });

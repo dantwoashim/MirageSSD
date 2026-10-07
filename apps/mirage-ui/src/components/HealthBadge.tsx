@@ -1,4 +1,6 @@
 import { CheckCircle, WarningCircle, XCircle } from '@phosphor-icons/react';
+import { label } from '../presentation';
+export { label } from '../presentation';
 
 const healthy = new Set(['healthy', 'ready', 'running', 'ready_mounted', 'ready_unmounted']);
 const warning = new Set(['not_configured', 'degraded', 'recovering', 'updating', 'materializing']);
@@ -9,10 +11,10 @@ export function HealthBadge({ value }: { value: string }) {
   const caution = warning.has(normalized);
   const Icon = good ? CheckCircle : caution ? WarningCircle : XCircle;
   const colors = good
-    ? 'border-emerald-400/20 bg-emerald-400/8 text-emerald-200'
+    ? 'border-ok/25 bg-ok-soft text-ok'
     : caution
-      ? 'border-amber-300/20 bg-amber-300/8 text-amber-100'
-      : 'border-rose-300/20 bg-rose-300/8 text-rose-100';
+      ? 'border-warn/25 bg-warn-soft text-warn'
+      : 'border-danger/25 bg-danger-soft text-danger';
   return (
     <span
       role="status"
@@ -23,8 +25,4 @@ export function HealthBadge({ value }: { value: string }) {
       {label(value)}
     </span>
   );
-}
-
-export function label(value: string) {
-  return value.replaceAll('_', ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }

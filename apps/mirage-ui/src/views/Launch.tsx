@@ -1,9 +1,9 @@
-import { Play, ShieldCheck } from '@phosphor-icons/react';
-import { motion } from 'framer-motion';
+import { ShieldCheck } from '@phosphor-icons/react';
 import { CapsuleBreakdown } from '../components/CapsuleBreakdown';
 import { RiskPanel } from '../components/RiskPanel';
 import type { Mode, Readiness } from '../models';
 import { canLaunch } from '../presentation';
+import { Button, Card, cx } from '../ui';
 export { canLaunch } from '../presentation';
 
 export const modeMeaning: Record<Mode, string> = {
@@ -14,7 +14,6 @@ export function Launch({
   mode,
   readiness,
   busy,
-  onMode,
   onPlan,
   onMaterialize,
   onAdmit,
@@ -23,59 +22,55 @@ export function Launch({
   mode: Mode;
   readiness: Readiness;
   busy?: boolean;
-  onMode: (mode: Mode) => void;
   onPlan: () => void;
   onMaterialize: () => void;
   onAdmit: () => void;
   onLaunch: () => void;
 }) {
-  const modes: Mode[] = ['verified_local'];
   return (
-    <section className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(19rem,.65fr)]" aria-labelledby="launch-title">
-      <div className="surface rounded-[2rem] p-6 md:p-8">
+    <section className="grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(19rem,.65fr)]" aria-labelledby="launch-title">
+      <Card padding="lg">
         <div className="flex items-start justify-between gap-5">
           <div>
-            <p className="eyebrow">Offline preparation</p>
-            <h2 id="launch-title" className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-zinc-50">Ready before you disconnect.</h2>
+            <h2 id="launch-title" className="section-title">Offline preparation</h2>
+            <p className="mt-1.5 text-[13px] leading-relaxed text-fg-muted">
+              One verified mode keeps the contract simple: everything needed locally is measured, downloaded, and checked.
+            </p>
           </div>
-          <span className={`status-breathe mt-1 size-2.5 rounded-full ${readiness.state === 'sealed_ready' ? 'bg-emerald-400' : 'bg-amber-300'}`} aria-hidden="true" />
+          <span className={cx('mt-1.5 size-2.5 shrink-0 rounded-full', readiness.state === 'sealed_ready' ? 'bg-ok' : 'bg-warn')} aria-hidden="true" />
         </div>
-        <div className="relative mt-7 grid gap-2 sm:grid-cols-2">
-          {modes.map((item) => (
-            <button key={item} onClick={() => onMode(item)} className={`relative overflow-hidden rounded-2xl border px-4 py-4 text-left transition duration-300 ease-out active:translate-y-px ${mode === item ? 'border-emerald-300/30 bg-emerald-300/[0.07]' : 'border-white/8 bg-white/[0.02] hover:border-white/15'}`}>
-              {mode === item && <motion.span layoutId="active-mode" className="absolute inset-y-3 left-0 w-0.5 rounded-full bg-emerald-300" transition={{ type: 'spring', stiffness: 100, damping: 20 }} />}
-              <span className="block text-sm font-semibold text-zinc-100">Verified offline access</span>
-              <span className="mt-1.5 block text-xs leading-relaxed text-zinc-500">{modeMeaning[item]}</span>
-            </button>
-          ))}
+        <div className="mt-5 rounded-xl border border-line bg-surface-2 p-4">
+          <p className="text-[13px] font-semibold text-fg">Verified offline access</p>
+          <p className="mt-1 text-xs leading-relaxed text-fg-muted">{modeMeaning[mode]}</p>
         </div>
-        <div className="mt-8">
+        <div className="mt-6">
           <CapsuleBreakdown value={readiness} />
         </div>
-        <div className="mt-7 flex flex-col gap-3 sm:flex-row">
-          <button onClick={onPlan} disabled={busy} className="rounded-xl border border-white/12 bg-white/5 px-4 py-2.5 text-sm font-medium text-zinc-200 transition duration-300 ease-out hover:bg-white/8 active:translate-y-px disabled:opacity-45">
+        <div className="mt-6 flex flex-col gap-2.5 sm:flex-row">
+          <Button variant="secondary" onClick={onPlan} disabled={busy}>
             1. Check files
-          </button>
-          <button onClick={onMaterialize} disabled={busy || !readiness.capsuleId || readiness.state === 'sealed_ready'} className="rounded-xl border border-white/12 bg-white/5 px-4 py-2.5 text-sm font-medium text-zinc-200 transition duration-300 ease-out hover:bg-white/8 active:translate-y-px disabled:opacity-45">
+          </Button>
+          <Button variant="secondary" onClick={onMaterialize} disabled={busy || !readiness.capsuleId || readiness.state === 'sealed_ready'}>
             2. Download files
-          </button>
-          <button onClick={onAdmit} disabled={busy || !readiness.capsuleId || readiness.state !== 'materializing' || readiness.missingBytes !== 0} className="rounded-xl border border-white/12 bg-white/5 px-4 py-2.5 text-sm font-medium text-zinc-200 transition duration-300 ease-out hover:bg-white/8 active:translate-y-px disabled:opacity-45">
+          </Button>
+          <Button variant="secondary" onClick={onAdmit} disabled={busy || !readiness.capsuleId || readiness.state !== 'materializing' || readiness.missingBytes !== 0}>
             3. Verify offline access
-          </button>
-          <button disabled={busy || !canLaunch(mode, readiness)} onClick={onLaunch} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#101713] transition duration-300 ease-out hover:bg-emerald-400 active:translate-y-px disabled:bg-zinc-700 disabled:text-zinc-400">
-            {mode === 'verified_local' ? <ShieldCheck size={17} weight="bold" aria-hidden="true" /> : <Play size={17} weight="fill" aria-hidden="true" />}
+          </Button>
+          <Button icon={<ShieldCheck size={16} weight="bold" aria-hidden="true" />} disabled={busy || !canLaunch(mode, readiness)} onClick={onLaunch}>
             {busy ? 'Working' : 'Launch'}
-          </button>
+          </Button>
         </div>
-      </div>
-      <aside className="space-y-6 rounded-[2rem] border border-white/8 bg-white/[0.018] p-6 md:p-7">
+      </Card>
+      <Card padding="lg" className="content-start">
         <div>
-          <p className="eyebrow">Offline status</p>
-          <p className="mt-2 text-lg text-zinc-100">{readiness.state === 'sealed_ready' ? 'Ready to use offline' : readiness.state === 'materializing' ? 'Ready for verification' : 'Preparation needed'}</p>
+          <p className="field-label">Offline status</p>
+          <p className="mt-2 text-[15px] font-medium text-fg">{readiness.state === 'sealed_ready' ? 'Ready to use offline' : readiness.state === 'materializing' ? 'Ready for verification' : 'Preparation needed'}</p>
         </div>
-        <RiskPanel value={readiness} />
-        <p className="text-xs leading-6 text-zinc-600">Readiness applies to the verified version of this workspace. New versions need a fresh check.</p>
-      </aside>
+        <div className="mt-5">
+          <RiskPanel value={readiness} />
+        </div>
+        <p className="mt-5 border-t border-line pt-4 text-xs leading-relaxed text-fg-subtle">Readiness applies to the verified version of this workspace. New versions need a fresh check.</p>
+      </Card>
     </section>
   );
 }
