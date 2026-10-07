@@ -1,9 +1,10 @@
 #![allow(unsafe_code)]
 
-//! Mounted write-path benchmark: mounts a temporary managed volume through
-//! the real WinFsp adapter, runs `D:\tmp\mirage-bench.ps1` against it, and
-//! prints the measured output. Ignored by default — run explicitly with
-//! `cargo test --release -p mirage-ffi --test bench_mounted -- --ignored`.
+//! Mounted benchmark: mounts a temporary managed volume through the real
+//! WinFsp adapter, runs `tools/perf/run-managed-bench.ps1` (or the script in
+//! `MIRAGE_BENCH_SCRIPT`) against it, and prints the measured output. Ignored
+//! by default — run explicitly with `MIRAGE_FS_EXE` pointing at a release host:
+//! `cargo test --release -p mirage-ffi --test bench_mounted -- --ignored --nocapture`.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -124,14 +125,15 @@ fn mounted_write_benchmark() {
     }
     assert!(ready_file.exists(), "mount did not become ready");
 
+    let script = std::env::var_os("MIRAGE_BENCH_SCRIPT").unwrap_or_else(|| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/perf/run-managed-bench.ps1")
+            .into_os_string()
+    });
     let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-File",
-            "D:\\tmp\\mirage-bench.ps1",
-            "-Target",
-            &mount_root,
-        ])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .args(["-Target", &mount_root])
         .output()
         .expect("run benchmark");
     println!(
