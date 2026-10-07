@@ -34,23 +34,86 @@ pub const PUBLISH_PARALLELISM: usize = 16;
 /// backed the whole publisher off. 64 MiB keeps every request well inside it.
 pub const PUBLISH_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Splits the pending list into batches of at most PUBLISH_PARALLELISM``n/// payloads and PUBLISH_BATCH_BYTES plaintext (a single larger payload
+/// Largest plaintext payload that may join a pack — bigger payloads publish
+/// as their own remote object exactly as before.
+const PACK_MEMBER_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Plaintext bytes per packed remote object (encoded members are simply
+/// concatenated; each member's row records its `member_offset`).
+const PACK_TARGET_BYTES: u64 = 16 * 1024 * 1024;
+/// Most payloads in one pack.
+const PACK_MAX_MEMBERS: usize = 1024;
+
+/// One remote object to upload: a single payload (member_offset 0) or a pack
+/// of small payloads — Drive charges ~5 round trips per object, so packing
+/// turns the per-object latency floor into a per-pack one.
+struct PublishUnit<'a> {
+    members: Vec<&'a UnpublishedPayload>,
+}
+
+fn unit_bytes(unit: &PublishUnit<'_>) -> u64 {
+    unit.members
+        .iter()
+        .map(|member| u64::try_from(member.bytes).unwrap_or(0))
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Splits the pending list (device-seq order) into publish units: payloads
+/// over PACK_MEMBER_MAX_BYTES become singles; the rest accumulate into packs
+/// bounded by PACK_TARGET_BYTES and PACK_MAX_MEMBERS.
+fn publish_units(pending: &[UnpublishedPayload]) -> Vec<PublishUnit<'_>> {
+    let mut units = Vec::new();
+    let mut pack: Vec<&UnpublishedPayload> = Vec::new();
+    let mut pack_bytes = 0u64;
+    for payload in pending {
+        let bytes = u64::try_from(payload.bytes).unwrap_or(0);
+        if bytes > PACK_MEMBER_MAX_BYTES {
+            if !pack.is_empty() {
+                units.push(PublishUnit {
+                    members: std::mem::take(&mut pack),
+                });
+                pack_bytes = 0;
+            }
+            units.push(PublishUnit {
+                members: vec![payload],
+            });
+            continue;
+        }
+        if !pack.is_empty()
+            && (pack_bytes.saturating_add(bytes) > PACK_TARGET_BYTES
+                || pack.len() >= PACK_MAX_MEMBERS)
+        {
+            units.push(PublishUnit {
+                members: std::mem::take(&mut pack),
+            });
+            pack_bytes = 0;
+        }
+        pack.push(payload);
+        pack_bytes = pack_bytes.saturating_add(bytes);
+    }
+    if !pack.is_empty() {
+        units.push(PublishUnit { members: pack });
+    }
+    units
+}
+
+/// Splits the unit list into batches of at most PUBLISH_PARALLELISM units
+/// and PUBLISH_BATCH_BYTES total member plaintext (a single larger unit
 /// still forms its own batch).
-fn publish_batches(pending: &[UnpublishedPayload]) -> Vec<&[UnpublishedPayload]> {
+fn publish_batches<'a>(units: &'a [PublishUnit<'a>]) -> Vec<&'a [PublishUnit<'a>]> {
     let mut batches = Vec::new();
     let mut start = 0;
-    while start < pending.len() {
+    while start < units.len() {
         let mut end = start;
         let mut bytes = 0_u64;
-        while end < pending.len() && end - start < PUBLISH_PARALLELISM {
-            let next = u64::try_from(pending[end].bytes).unwrap_or(0);
+        while end < units.len() && end - start < PUBLISH_PARALLELISM {
+            let next = unit_bytes(&units[end]);
             if end > start && bytes.saturating_add(next) > PUBLISH_BATCH_BYTES {
                 break;
             }
             bytes = bytes.saturating_add(next);
             end += 1;
         }
-        batches.push(&pending[start..end]);
+        batches.push(&units[start..end]);
         start = end;
     }
     batches
@@ -321,20 +384,23 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
         }
         // Uploads run a few at a time: Drive's per-object latency (upload +
         // independent readback) dominates for small payloads, so sequential
-        // publishing crawled at one object every several seconds. The durable
-        // record still goes through the single writer channel; a backend
-        // failure anywhere in a batch ends the pass and backs off.
+        // publishing crawled at one object every several seconds. Packing
+        // keeps that parallelism but multiplies each object's payload count,
+        // turning the drain bandwidth-bound instead of round-trip-bound.
+        // The durable record still goes through the single writer channel;
+        // a backend failure anywhere in a batch ends the pass and backs off.
+        let units = publish_units(&pending);
         let mut any_error = false;
-        for batch in publish_batches(&pending) {
+        for batch in publish_batches(&units) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
             let results: Vec<Result<(), PublishFailure>> = std::thread::scope(|scope| {
                 let workers: Vec<_> = batch
                     .iter()
-                    .map(|payload| {
+                    .map(|unit| {
                         scope.spawn(move || {
-                            publish_one(db, *volume, journal_dir, provider, key, payload, stats)
+                            publish_unit(db, *volume, journal_dir, provider, key, unit, stats)
                         })
                     })
                     .collect();
@@ -366,15 +432,26 @@ enum PublishFailure {
     Integrity,
 }
 
-fn publish_one(
-    db: &Database,
+/// One encoded pack member and its byte offset inside the pack object.
+struct EncodedMember<'a> {
+    payload: &'a UnpublishedPayload,
+    member_offset: u64,
+    plaintext_length: u64,
+    plaintext_hash: [u8; 32],
+    frame_hashes: Vec<[u8; 32]>,
+}
+
+/// Reads, checksum-verifies, and encrypts one payload exactly as the single
+/// publish path did. A member that fails returns `None` (counted in stats)
+/// so one bad file cannot block the rest of its pack.
+fn encode_member<'a>(
     volume: RepositoryId,
     journal_dir: &Path,
-    provider: &crate::handles::ManagedProvider,
     key: &RepositoryKey,
-    payload: &UnpublishedPayload,
+    payload: &'a UnpublishedPayload,
+    member_offset: u64,
     stats: &PublisherStats,
-) -> Result<(), PublishFailure> {
+) -> Option<(EncodedMember<'a>, Vec<u8>)> {
     let path = journal_dir.join(&payload.path);
     let plaintext = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -386,7 +463,7 @@ fn publish_one(
                 "payload publish skipped: {} unreadable: {error}",
                 payload.path
             );
-            return Err(PublishFailure::Integrity);
+            return None;
         }
     };
     if let Some(expected) = payload.checksum
@@ -398,16 +475,61 @@ fn publish_one(
             "payload publish refused: {} checksum mismatch",
             payload.path
         );
-        return Err(PublishFailure::Integrity);
+        return None;
     }
-    let (object, frame_hashes) =
+    let plaintext_hash = *blake3::hash(&plaintext).as_bytes();
+    let (encoded, frame_hashes) =
         match encode_payload_object(key, volume, payload.payload_id, &plaintext) {
             Ok(encoded) => encoded,
             Err(_) => {
                 stats.record_error("payload frame encode failed");
-                return Err(PublishFailure::Integrity);
+                return None;
             }
         };
+    Some((
+        EncodedMember {
+            payload,
+            member_offset,
+            plaintext_length: plaintext.len() as u64,
+            plaintext_hash,
+            frame_hashes,
+        },
+        encoded,
+    ))
+}
+
+/// Publishes one unit — a single payload (packed to member_offset 0) or a
+/// pack of concatenated encoded payloads — as one provider object: upload,
+/// identity check, independent readback, then one durable record covering
+/// every member.
+fn publish_unit(
+    db: &Database,
+    volume: RepositoryId,
+    journal_dir: &Path,
+    provider: &crate::handles::ManagedProvider,
+    key: &RepositoryKey,
+    unit: &PublishUnit<'_>,
+    stats: &PublisherStats,
+) -> Result<(), PublishFailure> {
+    let mut object = Vec::new();
+    let mut members = Vec::new();
+    for payload in &unit.members {
+        let Some((member, encoded)) = encode_member(
+            volume,
+            journal_dir,
+            key,
+            payload,
+            object.len() as u64,
+            stats,
+        ) else {
+            continue;
+        };
+        object.extend_from_slice(&encoded);
+        members.push(member);
+    }
+    if members.is_empty() {
+        return Err(PublishFailure::Integrity);
+    }
     let object_hash = *blake3::hash(&object).as_bytes();
     let object_length = object.len() as u64;
     let source = UploadSource::from_bytes(bytes::Bytes::from(object));
@@ -448,22 +570,28 @@ fn publish_one(
         }
         return Err(PublishFailure::Backend);
     }
-    let record = mirage_db::payload_remote::PayloadRemoteObject {
-        volume_id: volume,
-        payload_id: payload.payload_id,
-        provider_object_id: reference.provider_object_id.as_str().to_owned(),
-        immutable_revision: reference
-            .immutable_revision
-            .map(|revision| revision.as_str().to_owned()),
-        object_length: i64::try_from(object_length).unwrap_or(i64::MAX),
-        object_hash,
-        plaintext_length: i64::try_from(plaintext.len()).unwrap_or(i64::MAX),
-        plaintext_hash: *blake3::hash(&plaintext).as_bytes(),
-        frame_hashes,
-        published_ns: now_ns_i64_pub(),
-        member_offset: 0,
-    };
-    match db.writer().payload_published(record) {
+    let published_ns = now_ns_i64_pub();
+    let provider_object_id = reference.provider_object_id.as_str().to_owned();
+    let immutable_revision = reference
+        .immutable_revision
+        .map(|revision| revision.as_str().to_owned());
+    let records: Vec<mirage_db::payload_remote::PayloadRemoteObject> = members
+        .iter()
+        .map(|member| mirage_db::payload_remote::PayloadRemoteObject {
+            volume_id: volume,
+            payload_id: member.payload.payload_id,
+            provider_object_id: provider_object_id.clone(),
+            immutable_revision: immutable_revision.clone(),
+            object_length: i64::try_from(object_length).unwrap_or(i64::MAX),
+            object_hash,
+            plaintext_length: i64::try_from(member.plaintext_length).unwrap_or(i64::MAX),
+            plaintext_hash: member.plaintext_hash,
+            frame_hashes: member.frame_hashes.clone(),
+            published_ns,
+            member_offset: i64::try_from(member.member_offset).unwrap_or(i64::MAX),
+        })
+        .collect();
+    match db.writer().payloads_published(records) {
         Ok(()) => Ok(()),
         Err(error) => {
             // Unreferenced payload: the upload is orphaned. Deletion needs a
@@ -521,16 +649,25 @@ pub fn pin_held(
 /// extent is marked dead inside the writer transaction and the file is
 /// deleted only after the ledger commit — a crash leaves either a live file
 /// or a dead extent with a fetchable remote object.
+#[allow(clippy::too_many_arguments)]
 pub fn evict_published(
     db: &Database,
     dirty: &crate::handles::DirtyLedger,
     journal_dir: &std::path::Path,
     volume: RepositoryId,
     handles: &mirage_engine::handles::HandleTable,
+    payload_files: &std::sync::Mutex<crate::handles::PayloadFileCache>,
     pins: &std::collections::HashSet<mirage_types::InodeId>,
     target: u64,
 ) -> Result<(u64, u64), MirageError> {
     let evictable = db.published_payloads_evictable(volume)?;
+    if !evictable.is_empty() {
+        // Deleting a payload is irreversible — the committed state that
+        // justifies it (the remote publication record) must be power-loss
+        // durable first. One FULL barrier commit covers every earlier
+        // NORMAL commit.
+        db.durability_barrier()?;
+    }
     let mut freed = 0_u64;
     let mut pinned_blocked = 0_u64;
     for (payload_id, plaintext_length, _published_ns) in evictable {
@@ -556,6 +693,7 @@ pub fn evict_published(
         // Never release the physical charge before deletion succeeds. If a
         // later ledger update fails, the missing, remotely recoverable file
         // stays conservatively charged until another eviction pass finishes.
+        crate::handles::invalidate_payload_file(payload_files, &payload_id);
         match std::fs::remove_file(journal_dir.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -717,8 +855,12 @@ impl RemotePayloadStore {
         let Some((offset, length)) = payload_frame_range(plaintext_len, frame_index) else {
             return Err(FetchFailure::Integrity);
         };
-        let range =
-            mirage_types::CheckedRange::new(offset, length).map_err(|_| FetchFailure::Integrity)?;
+        // Packed payloads sit at member_offset inside the provider object;
+        // unpacked rows carry 0.
+        let member_offset =
+            u64::try_from(record.member_offset).map_err(|_| FetchFailure::Integrity)?;
+        let range = mirage_types::CheckedRange::new(member_offset + offset, length)
+            .map_err(|_| FetchFailure::Integrity)?;
         let reference = mirage_backend::RemoteObjectRef {
             backend_id: mirage_backend::BackendId::new("drive")
                 .map_err(|_| FetchFailure::Backend)?,
@@ -945,19 +1087,54 @@ mod batch_tests {
         }
     }
 
+    fn unit(payload: &UnpublishedPayload) -> PublishUnit<'_> {
+        PublishUnit {
+            members: vec![payload],
+        }
+    }
+
+    #[test]
+    fn units_pack_small_members_and_isolate_large() {
+        // 40 x 1 MiB → 16 MiB packs → 16-member units then a partial tail.
+        let small: Vec<_> = (0..40).map(|_| payload(1 << 20)).collect();
+        let sizes: Vec<usize> = publish_units(&small)
+            .iter()
+            .map(|u| u.members.len())
+            .collect();
+        assert_eq!(sizes, vec![16, 16, 8]);
+        // A >4 MiB payload stays a single in pending order.
+        let mut mixed: Vec<_> = (0..4).map(|_| payload(1 << 20)).collect();
+        mixed.push(payload(8 << 20));
+        mixed.extend((0..4).map(|_| payload(1 << 20)));
+        let sizes: Vec<usize> = publish_units(&mixed)
+            .iter()
+            .map(|u| u.members.len())
+            .collect();
+        assert_eq!(sizes, vec![4, 1, 4]);
+    }
+
     #[test]
     fn batches_bound_count_and_bytes() {
         let small: Vec<_> = (0..40).map(|_| payload(1 << 20)).collect();
-        let sizes: Vec<usize> = publish_batches(&small).iter().map(|b| b.len()).collect();
+        let units: Vec<_> = small.iter().map(unit).collect();
+        let sizes: Vec<usize> = publish_batches(&units).iter().map(|b| b.len()).collect();
         assert_eq!(sizes, vec![16, 16, 8]);
         let large: Vec<_> = (0..20).map(|_| payload(32 << 20)).collect();
-        let sizes: Vec<usize> = publish_batches(&large).iter().map(|b| b.len()).collect();
+        let units: Vec<_> = large.iter().map(unit).collect();
+        let sizes: Vec<usize> = publish_batches(&units).iter().map(|b| b.len()).collect();
         assert_eq!(sizes, vec![2; 10]);
-        let huge = vec![payload(1 << 30)];
+        let huge = [payload(1 << 30)];
+        let units: Vec<_> = huge.iter().map(unit).collect();
         assert_eq!(
-            publish_batches(&huge).len(),
+            publish_batches(&units).len(),
             1,
             "an oversized payload still publishes"
         );
+        // A pack counts its members' bytes against the batch budget.
+        let members: Vec<_> = (0..4).map(|_| payload(16 << 20)).collect();
+        let packed = PublishUnit {
+            members: members.iter().collect(),
+        };
+        assert_eq!(unit_bytes(&packed), 64 << 20);
     }
 }

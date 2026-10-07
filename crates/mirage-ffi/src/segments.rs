@@ -16,7 +16,6 @@
 //! waits on `extents` while holding `open`. `state` may be taken alone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -27,7 +26,59 @@ use mirage_engine::volume::VolumeCoordinator;
 use mirage_types::InodeId;
 
 use crate::MirageStatus;
-use crate::handles::DirtyLedger;
+use crate::handles::{DirtyLedger, PayloadEntry, PayloadFileCache, invalidate_payload_file};
+use crate::trace;
+
+/// Positional append on the shared payload handle. `seek_write` on a
+/// synchronous handle moves the file cursor (seek/save-restore around the
+/// write) — the `io` lock keeps the pair atomic against concurrent readers
+/// sharing this entry.
+#[cfg(windows)]
+fn append_at(entry: &PayloadEntry, data: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let _io = entry
+        .io
+        .lock()
+        .map_err(|_| std::io::Error::other("payload io lock poisoned"))?;
+    let mut written = 0usize;
+    while written < data.len() {
+        match entry
+            .file
+            .seek_write(&data[written..], offset + written as u64)
+        {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "short payload write",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn append_at(entry: &PayloadEntry, data: &[u8], offset: u64) -> std::io::Result<()> {
+    let _io = entry
+        .io
+        .lock()
+        .map_err(|_| std::io::Error::other("payload io lock poisoned"))?;
+    std::os::unix::fs::FileExt::write_all_at(&entry.file, data, offset)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn append_at(entry: &PayloadEntry, data: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let _io = entry
+        .io
+        .lock()
+        .map_err(|_| std::io::Error::other("payload io lock poisoned"))?;
+    let mut file = entry.file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)
+}
 
 /// One payload file per up-to-32 MiB of contiguous data.
 pub const SEGMENT_MAX_BYTES: u64 = 32 << 20;
@@ -48,7 +99,10 @@ pub fn segment_max_bytes() -> u64 {
 struct OpenSegment {
     payload_id: [u8; 16],
     path: PathBuf,
-    file: std::fs::File,
+    /// The payload file, shared with the engine's read cache — reads of the
+    /// open segment never re-open it (each CreateFile can pay an AV scan).
+    /// Writes are positional because readers share the file's cursor.
+    entry: Arc<PayloadEntry>,
     hasher: blake3::Hasher,
     /// Logical offset in the inode where the segment starts.
     start: u64,
@@ -63,6 +117,8 @@ struct SealJob {
     /// Extent map cloned at close time — references only sealed or
     /// being-sealed payloads.
     snapshot: ExtentMap,
+    /// Enqueue time — dev trace measures queue latency into seal().
+    enqueued: Instant,
 }
 
 #[derive(Default)]
@@ -70,11 +126,28 @@ struct Shared {
     queue: VecDeque<SealJob>,
     pending: HashMap<InodeId, usize>,
     failed: HashSet<InodeId>,
+    /// Inodes deleted while a seal job is in flight — a seal that fails on a
+    /// discarded inode is cleaned up, not recorded as a failure.
+    discarded: HashSet<InodeId>,
     /// Inodes whose mtime the caller set explicitly — the sealer must not
     /// overwrite it with the last write time.
     explicit_mtime: HashSet<InodeId>,
     /// Live mtimes for the read path (file stat / enumerate).
     mtimes: HashMap<InodeId, (i64, i64)>,
+}
+
+/// Close-time seal enqueues block only above this queue depth — bounds both
+/// memory and the group-commit power-loss window.
+const SEAL_QUEUE_BACKPRESSURE: usize = 256;
+
+/// Test hook: delay before each seal so a test can deterministically land a
+/// delete between enqueue and seal start.
+fn seal_delay() -> Option<Duration> {
+    std::env::var("MIRAGE_TEST_SEAL_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|delay| *delay > 0)
+        .map(Duration::from_millis)
 }
 
 pub struct SegmentWriter {
@@ -83,6 +156,7 @@ pub struct SegmentWriter {
     journal_dir: PathBuf,
     dirty: Arc<DirtyLedger>,
     extents: Arc<Mutex<HashMap<InodeId, ExtentMap>>>,
+    payload_files: Arc<Mutex<PayloadFileCache>>,
     coordinator: Option<Arc<VolumeCoordinator>>,
     publisher: Mutex<Option<Arc<crate::publisher::Publisher>>>,
     open: Mutex<HashMap<InodeId, OpenSegment>>,
@@ -95,12 +169,14 @@ pub struct SegmentWriter {
 impl SegmentWriter {
     /// Creates the writer and spawns its sealer thread. `extents` must be the
     /// engine's shared extent-map table — the same map the read path serves.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: mirage_db::Database,
         volume: mirage_types::RepositoryId,
         journal_dir: PathBuf,
         dirty: Arc<DirtyLedger>,
         extents: Arc<Mutex<HashMap<InodeId, ExtentMap>>>,
+        payload_files: Arc<Mutex<PayloadFileCache>>,
         coordinator: Option<Arc<VolumeCoordinator>>,
         publisher: Option<Arc<crate::publisher::Publisher>>,
     ) -> Arc<Self> {
@@ -110,6 +186,7 @@ impl SegmentWriter {
             journal_dir,
             dirty,
             extents,
+            payload_files,
             coordinator,
             publisher: Mutex::new(publisher),
             open: Mutex::new(HashMap::new()),
@@ -165,9 +242,7 @@ impl SegmentWriter {
             .is_some_and(|seg| offset == seg.start + seg.len && seg.len + data.len() as u64 <= max);
         if contiguous {
             let seg = open.get_mut(&inode).expect("checked above");
-            seg.file
-                .write_all(data)
-                .map_err(|_| MirageStatus::IoError)?;
+            append_at(&seg.entry, data, seg.len).map_err(|_| MirageStatus::IoError)?;
             seg.hasher.update(data);
             let payload_id = seg.payload_id;
             let at = seg.len;
@@ -191,12 +266,36 @@ impl SegmentWriter {
             let path = self
                 .journal_dir
                 .join(format!("{}.payload", hex16(payload_id)));
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .map_err(|_| MirageStatus::IoError)?;
-            file.write_all(data).map_err(|_| MirageStatus::IoError)?;
+            let entry = {
+                let _create = trace::Scope::new(trace::Slot::WriteNewPayloadFile);
+                // The dir is created once per engine; a vanished dir is
+                // recreated here so a NotFound does not fail the write.
+                let open = || {
+                    std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                };
+                let file = match open() {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = std::fs::create_dir_all(&self.journal_dir);
+                        open().map_err(|_| MirageStatus::IoError)?
+                    }
+                    Err(_) => return Err(MirageStatus::IoError),
+                };
+                Arc::new(PayloadEntry {
+                    file,
+                    io: Mutex::new(()),
+                })
+            };
+            // Reads of the open segment go through the shared cache — never
+            // a fresh CreateFile for a payload this process just created.
+            if let Ok(mut cache) = self.payload_files.lock() {
+                cache.insert(payload_id, Arc::clone(&entry));
+            }
+            append_at(&entry, data, 0).map_err(|_| MirageStatus::IoError)?;
             let mut hasher = blake3::Hasher::new();
             hasher.update(data);
             open.insert(
@@ -204,7 +303,7 @@ impl SegmentWriter {
                 OpenSegment {
                     payload_id,
                     path,
-                    file,
+                    entry,
                     hasher,
                     start: offset,
                     len: data.len() as u64,
@@ -230,7 +329,10 @@ impl SegmentWriter {
                 })
                 .or_insert((0, now_ns));
         }
-        self.wake.notify_one();
+        // notify_all: the condvar also wakes drain_inode/drain_all waiters —
+        // notify_one can pick a waiter and leave the sealer sleeping a whole
+        // SEAL_TICK.
+        self.wake.notify_all();
         Ok(())
     }
 
@@ -255,10 +357,38 @@ impl SegmentWriter {
             inode,
             segment,
             snapshot,
+            enqueued: Instant::now(),
         });
         *state.pending.entry(inode).or_insert(0) += 1;
         drop(state);
-        self.wake.notify_one();
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    /// Enqueue the inode's open segment without waiting (group-commit
+    /// close): the seal lands on the sealer thread. Waits only when the
+    /// queue exceeds the backpressure bound — keeps the power-loss window
+    /// and queued-segment memory bounded.
+    /// Callers must NOT hold `dirty.mutex`, `extents`, `open`, or `state`.
+    pub fn seal_async(&self, inode: InodeId) -> Result<(), MirageStatus> {
+        {
+            let mut maps = self.extents.lock().unwrap_or_else(|p| p.into_inner());
+            let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            if open.contains_key(&inode) {
+                self.enqueue_open(inode, &mut open, &mut maps)?;
+            }
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.queue.len() > SEAL_QUEUE_BACKPRESSURE {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(MirageStatus::IoError);
+            }
+            state = self
+                .wake
+                .wait_timeout(state, Duration::from_secs(30))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
         Ok(())
     }
 
@@ -295,19 +425,49 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Drops the inode's open segment without committing (delete path): the
-    /// payload file is removed and its bytes come off the dirty ledger.
+    /// Drops the inode's open segment AND any queued (not yet started) seal
+    /// jobs without committing (delete path): payload files are removed and
+    /// their bytes come off the dirty ledger. A seal already in flight sees
+    /// the inode in `discarded` and runs the same cleanup on failure.
     pub fn discard_inode(&self, inode: InodeId) {
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(segment) = open.remove(&inode) {
-            let _ = std::fs::remove_file(&segment.path);
-            self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+        {
+            let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(segment) = open.remove(&inode) {
+                invalidate_payload_file(&self.payload_files, &segment.payload_id);
+                let _ = std::fs::remove_file(&segment.path);
+                self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+            }
         }
-        drop(open);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut dropped = 0usize;
+        state.queue.retain(|job| {
+            if job.inode != inode {
+                return true;
+            }
+            invalidate_payload_file(&self.payload_files, &job.segment.payload_id);
+            let _ = std::fs::remove_file(&job.segment.path);
+            self.dirty.used.fetch_sub(job.segment.len, Ordering::AcqRel);
+            dropped += 1;
+            false
+        });
+        if dropped > 0
+            && let Some(count) = state.pending.get_mut(&inode)
+        {
+            *count = count.saturating_sub(dropped);
+            if *count == 0 {
+                state.pending.remove(&inode);
+            }
+        }
+        // A still-running seal must see the discard: its failure then runs
+        // the same cleanup instead of recording a failure.
+        if state.pending.contains_key(&inode) {
+            state.discarded.insert(inode);
+        }
         state.failed.remove(&inode);
         state.explicit_mtime.remove(&inode);
         state.mtimes.remove(&inode);
+        drop(state);
+        self.wake.notify_all();
     }
 
     /// Seals every open segment and waits for the queue to empty (quiesce /
@@ -399,6 +559,11 @@ impl SegmentWriter {
                     state.queue.pop_front()
                 };
                 let Some(job) = job else { break };
+                // Test hook: hold the job in-flight (not queued) so a test
+                // can land a delete between pop and seal deterministically.
+                if let Some(delay) = seal_delay() {
+                    std::thread::sleep(delay);
+                }
                 self.seal(job);
             }
             if self.stop.load(Ordering::Acquire) {
@@ -432,13 +597,36 @@ impl SegmentWriter {
     /// the physical ledger row, commit the snapshot's extent mutation, and
     /// bump the durable mtime unless the user set it explicitly.
     fn seal(&self, job: SealJob) {
+        trace::record_elapsed(trace::Slot::SealQueueLatency, job.enqueued);
         let SealJob {
             inode,
             segment,
             snapshot,
+            enqueued: _,
         } = job;
         let result = (|| -> Result<(), MirageStatus> {
-            segment.file.sync_all().map_err(|_| MirageStatus::IoError)?;
+            {
+                let _fsync = trace::Scope::new(trace::Slot::SealFsync);
+                segment
+                    .entry
+                    .file
+                    .sync_all()
+                    .map_err(|_| MirageStatus::IoError)?;
+            }
+            // A delete can land while this seal was in flight: committing
+            // extents for a gone inode would reference a payload nobody can
+            // reach — discard it instead. `delete_node_in` removes the inode
+            // row, so namespace_entry is the definitive existence check.
+            match self.db.namespace_entry(self.volume, inode) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    invalidate_payload_file(&self.payload_files, &segment.payload_id);
+                    let _ = std::fs::remove_file(&segment.path);
+                    self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+                    return Ok(());
+                }
+                Err(_) => return Err(MirageStatus::IoError),
+            }
             let checksum: [u8; 32] = *segment.hasher.finalize().as_bytes();
             let now = crate::now_ns_i64();
             let slot_index = self.dirty.next_slot.fetch_add(1, Ordering::AcqRel);
@@ -451,30 +639,22 @@ impl SegmentWriter {
                     .unwrap_or(0)
                     .to_le_bytes(),
             );
-            self.db
-                .writer()
-                .physical_reserve_extent(
-                    mirage_db::PhysicalExtentRecord {
-                        extent_id: segment.payload_id,
-                        file_id: self.dirty.file_id,
-                        slot_index,
-                        length_bytes: i64::try_from(segment.len).unwrap_or(i64::MAX),
-                        state: mirage_db::PhysicalExtentState::Reserved,
-                        page_hash: None,
-                        checksum: None,
-                        pin_count: 0,
-                        generation: 0,
-                        updated_ns: now,
-                    },
-                    mirage_db::PhysicalReservationRecord {
-                        extent_id: segment.payload_id,
-                        owner_epoch,
-                        expires_ns: now.saturating_add(60_000_000_000),
-                    },
+            let (explicit, explicit_mtime) = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.explicit_mtime.contains(&inode),
+                    state.mtimes.get(&inode).map(|times| times.1),
                 )
-                .map_err(|_| MirageStatus::IoError)?;
-            if crate::commit_extent_mutation_parts(
-                &self.db,
+            };
+            // The mutation commit touches inodes.modified_ns itself, so the
+            // truthful stamp lands after the commit body — inside the same
+            // transaction.
+            let modified = if explicit {
+                explicit_mtime
+            } else {
+                Some(segment.last_write_ns)
+            };
+            let mut mutation = crate::build_extent_mutation_commit(
                 self.volume,
                 inode,
                 &snapshot,
@@ -494,46 +674,51 @@ impl SegmentWriter {
                     checksum,
                 }),
                 now,
-            )
-            .is_err()
-            {
-                let _ = self
-                    .db
-                    .writer()
-                    .physical_release_extent(segment.payload_id, now);
-                return Err(MirageStatus::IoError);
-            }
-            let (explicit, explicit_mtime) = {
-                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    state.explicit_mtime.contains(&inode),
-                    state.mtimes.get(&inode).map(|times| times.1),
-                )
-            };
-            // The mutation commit touches inodes.modified_ns itself, so the
-            // truthful stamp must be written after it lands.
-            let modified = if explicit {
-                explicit_mtime
-            } else {
-                Some(segment.last_write_ns)
-            };
-            if let Some(modified) = modified {
-                let _ =
-                    self.db
-                        .writer()
-                        .namespace_set_times(self.volume, inode, None, Some(modified));
-            }
-            Ok(())
+            )?;
+            mutation.reservation = Some((
+                mirage_db::PhysicalExtentRecord {
+                    extent_id: segment.payload_id,
+                    file_id: self.dirty.file_id,
+                    slot_index,
+                    length_bytes: i64::try_from(segment.len).unwrap_or(i64::MAX),
+                    state: mirage_db::PhysicalExtentState::Reserved,
+                    page_hash: None,
+                    checksum: None,
+                    pin_count: 0,
+                    generation: 0,
+                    updated_ns: now,
+                },
+                mirage_db::PhysicalReservationRecord {
+                    extent_id: segment.payload_id,
+                    owner_epoch,
+                    expires_ns: now.saturating_add(60_000_000_000),
+                },
+            ));
+            mutation.modified_ns = modified.map(|stamp| (inode, stamp));
+            let _commit = trace::Scope::new(trace::Slot::SealCommit);
+            self.db
+                .writer()
+                .sequenced_mutation_commit(mutation)
+                .map_err(|_| MirageStatus::IoError)
         })();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(error) = result {
-            eprintln!("segment seal failed for inode {inode:?}: {error:?}");
-            state.failed.insert(inode);
+            if state.discarded.contains(&inode) {
+                // A delete landed while this seal was in flight — the same
+                // cleanup discard_inode runs for queued jobs, not a failure.
+                invalidate_payload_file(&self.payload_files, &segment.payload_id);
+                let _ = std::fs::remove_file(&segment.path);
+                self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+            } else {
+                eprintln!("segment seal failed for inode {inode:?}: {error:?}");
+                state.failed.insert(inode);
+            }
         }
         if let Some(count) = state.pending.get_mut(&inode) {
             *count -= 1;
             if *count == 0 {
                 state.pending.remove(&inode);
+                state.discarded.remove(&inode);
             }
         }
         drop(state);

@@ -12,7 +12,7 @@ set(MIRAGE_RUST_PROFILE "debug" CACHE STRING "Rust profile used for the FFI libr
 if(NOT EXISTS "${WINFSP_SDK_ROOT}/inc/winfsp/winfsp.h")
   message(FATAL_ERROR "Set WINFSP_SDK_ROOT to the pinned WinFsp SDK root")
 endif()
-add_executable(mirage-fs src/main.cpp src/service.cpp src/volume.cpp src/ffi_bridge.cpp src/file_context.cpp src/directory_buffer.cpp src/status_map.cpp src/callbacks/get_volume_info.cpp src/callbacks/get_security.cpp src/callbacks/get_file_info.cpp src/callbacks/open.cpp src/callbacks/read_directory.cpp src/callbacks/mutation.cpp src/callbacks/read.cpp src/pending_read.cpp src/cancel.cpp src/security.cpp src/host_control.cpp)
+add_executable(mirage-fs src/main.cpp src/service.cpp src/trace.cpp src/volume.cpp src/ffi_bridge.cpp src/file_context.cpp src/directory_buffer.cpp src/status_map.cpp src/callbacks/get_volume_info.cpp src/callbacks/get_security.cpp src/callbacks/get_file_info.cpp src/callbacks/open.cpp src/callbacks/read_directory.cpp src/callbacks/mutation.cpp src/callbacks/read.cpp src/pending_read.cpp src/cancel.cpp src/security.cpp src/host_control.cpp)
 # Rust's MSVC target links the dynamic release CRT in both Rust profiles.
 # Use the same CRT for the adapter, retaining Debug symbols and /Od without
 # mixing MSVCRTD/MSVCRT allocators or suppressing LNK4098.

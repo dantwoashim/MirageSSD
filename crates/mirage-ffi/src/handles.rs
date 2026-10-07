@@ -217,6 +217,91 @@ impl DirtyLedger {
             .saturating_sub(self.used.load(Ordering::Acquire))
     }
 }
+/// A journal payload file shared between the segment writer and the read
+/// cache. `FileExt::seek_read`/`seek_write` move the file object's cursor on
+/// synchronous handles (a seek/save-restore around the I/O), so every cursor
+/// op on the shared handle runs under `io` — a reader racing a writer could
+/// otherwise read or append at the wrong offset.
+pub struct PayloadEntry {
+    pub file: std::fs::File,
+    pub io: Mutex<()>,
+}
+
+/// Shared open handles for journal payload files, keyed by payload id:
+/// dirty-slice reads reuse the handle (positional reads) instead of a
+/// CreateFile per slice — every open on Windows can pay a synchronous AV
+/// scan. The segment writer inserts the same `Arc` it appends through, so
+/// open-segment and freshly sealed payloads hit the cache without a re-open.
+/// Payloads are immutable once sealed, so a stale handle still serves the
+/// correct bytes. Bounded LRU.
+#[derive(Default)]
+pub struct PayloadFileCache {
+    map: HashMap<[u8; 16], CacheEntry>,
+    /// Monotonic use counter for LRU ordering.
+    tick: u64,
+}
+
+struct CacheEntry {
+    entry: Arc<PayloadEntry>,
+    last_use: u64,
+}
+
+pub const PAYLOAD_FILE_CACHE_LIMIT: usize = 1024;
+
+impl PayloadFileCache {
+    /// Effective cap — `MIRAGE_PAYLOAD_CACHE_LIMIT` overrides it so tests can
+    /// exercise eviction without a thousand-payload fixture.
+    fn limit() -> usize {
+        std::env::var("MIRAGE_PAYLOAD_CACHE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PAYLOAD_FILE_CACHE_LIMIT)
+    }
+
+    pub fn get(&mut self, payload_id: &[u8; 16]) -> Option<Arc<PayloadEntry>> {
+        self.tick += 1;
+        let entry = self.map.get_mut(payload_id)?;
+        entry.last_use = self.tick;
+        Some(Arc::clone(&entry.entry))
+    }
+
+    pub fn insert(&mut self, payload_id: [u8; 16], entry: Arc<PayloadEntry>) {
+        self.tick += 1;
+        if self.map.len() >= Self::limit()
+            && !self.map.contains_key(&payload_id)
+            && let Some(evict) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.last_use)
+                .map(|(id, _)| *id)
+        {
+            self.map.remove(&evict);
+        }
+        self.map.insert(
+            payload_id,
+            CacheEntry {
+                entry,
+                last_use: self.tick,
+            },
+        );
+    }
+
+    /// Drops the cached handle for `payload_id` before the file is deleted or
+    /// recreated: Rust opens with FILE_SHARE_DELETE, but a delete-pending
+    /// name cannot be recreated while any handle is open.
+    fn invalidate(&mut self, payload_id: &[u8; 16]) {
+        self.map.remove(payload_id);
+    }
+}
+
+/// Drops the cached handle for `payload_id` before the file is deleted or
+/// recreated: Rust opens with FILE_SHARE_DELETE, but a delete-pending name
+/// cannot be recreated while any handle is open.
+pub fn invalidate_payload_file(cache: &Mutex<PayloadFileCache>, payload_id: &[u8; 16]) {
+    if let Ok(mut cache) = cache.lock() {
+        cache.invalidate(payload_id);
+    }
+}
 pub struct MirageEngineHandle {
     pub entries: BTreeMap<Vec<u16>, Entry>,
     pub index: Option<Arc<MountIndex>>,
@@ -250,6 +335,13 @@ pub struct MirageEngineHandle {
     pub handles: Arc<mirage_engine::handles::HandleTable>,
     /// Per-inode extent maps shared with every file handle.
     pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
+    /// Open read handles for journal payload files, shared with every file
+    /// handle — dirty-slice reads go through the shared handle instead of a
+    /// CreateFile per slice.
+    pub payload_files: Arc<Mutex<PayloadFileCache>>,
+    /// Set once the journal directory has been created — the write path
+    /// re-runs `create_dir_all` only when a payload open fails NotFound.
+    pub journal_dir_ready: Arc<AtomicBool>,
     /// State root holding journal payload files for dirty extents.
     pub state_root: Option<PathBuf>,
     /// Directory holding this volume's journal payloads (the user's chosen
@@ -281,6 +373,10 @@ pub struct MirageEngineHandle {
     pub pins: Arc<std::sync::RwLock<std::collections::HashSet<mirage_types::InodeId>>>,
     /// Write-behind segment writer (managed engines only).
     pub segments: Option<Arc<crate::segments::SegmentWriter>>,
+    /// Group-commit mode (`MIRAGE_DURABILITY` not `strict`): commits under
+    /// synchronous=NORMAL + writer barriers; close enqueues seals without
+    /// waiting, mirage_flush barriers explicitly.
+    pub group_durability: bool,
 }
 
 /// A page provider waiting for its first credential: the coordinator's
@@ -422,6 +518,10 @@ pub struct MirageFileHandle {
     pub handles: Arc<mirage_engine::handles::HandleTable>,
     /// Per-inode extent maps shared with the engine.
     pub extents: Arc<Mutex<HashMap<mirage_types::InodeId, mirage_engine::extent_map::ExtentMap>>>,
+    /// Shared open read handles for journal payload files (engine field).
+    pub payload_files: Arc<Mutex<PayloadFileCache>>,
+    /// Shared with the engine: the journal directory has been created.
+    pub journal_dir_ready: Arc<AtomicBool>,
     /// State root holding journal payload files for dirty extents.
     pub state_root: Option<PathBuf>,
     /// This volume's journal payload directory (see the engine field).
@@ -458,6 +558,12 @@ pub struct MirageFileHandle {
     pub modified_ns: AtomicI64,
     /// Set when `mirage_set_times` pinned an explicit mtime on this handle.
     pub explicit_mtime: AtomicBool,
+    /// Set by mirage_write / mirage_truncate once this handle has staged
+    /// bytes — close seals only handles that actually wrote.
+    pub wrote: AtomicBool,
+    /// Group-commit mode shared from the engine: close enqueues the seal
+    /// without waiting (backpressure-limited) instead of draining.
+    pub group_durability: bool,
 }
 
 /// Per-open sequential-read tracking for managed readahead.
@@ -506,6 +612,8 @@ impl MirageEngineHandle {
             db: None,
             handles: Arc::new(mirage_engine::handles::HandleTable::default()),
             extents: Arc::new(Mutex::new(HashMap::new())),
+            payload_files: Arc::new(Mutex::new(PayloadFileCache::default())),
+            journal_dir_ready: Arc::new(AtomicBool::new(false)),
             state_root: None,
             journal_dir: None,
             managed: false,
@@ -519,6 +627,7 @@ impl MirageEngineHandle {
             ))),
             pins: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             segments: None,
+            group_durability: false,
         }
     }
     /// Owner-side origin decodes performed by this engine.
