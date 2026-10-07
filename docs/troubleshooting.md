@@ -10,26 +10,32 @@ Never paste login tokens into an issue.
 
 ## The drive is missing
 
-Confirm WinFsp installed and check Task Scheduler for your user-specific `MirageSSD Drive` task. Sign out of Windows and back in to exercise startup. Check whether setup selected another drive letter.
-
-A restarted task cannot fix revoked authorization, insufficient local space, or unavailable internet. Logs live under `%LOCALAPPDATA%\MirageSSD\logs`; inspect locally and redact account information and personal paths before sharing excerpts.
+Open MirageSSD → **Drives** → **Connect** for the drive that should be mounted. If the service is not running, use **Help → Start service**. Make sure WinFsp is installed — the setup bundle installs it only when missing. Signing out of Windows and back in restarts the per-user logon agent that keeps your drives mounted.
 
 Do not format anything, delete the cache, or remove credentials as a first troubleshooting step.
 
 ## Copies start fast, then slow down
 
-Early progress can be local cache acceptance; uploads still consume upstream bandwidth. Small files add per-file metadata overhead.
+Early progress can be local journal and cache acceptance; uploads still consume upstream bandwidth. Small files add per-file metadata overhead. A finished copy is not a finished upload — sealed segments are uploaded and hash-verified in the background.
 
-Leave local free space available. Do not start a single open download larger than available staging space. The cache ceiling cannot safely force pending data to disappear.
+Leave local free space available. Uploads in progress stay local; the cache ceiling cannot safely force pending data to disappear.
 
-## Capacity differs from my physical disk
+## My disk is filling up
 
-Cloud quota, local cache size, and physical free space are separate quantities. Other Google storage usage affects available quota, and decimal/binary units can differ between displays. The virtual drive does not create additional physical SSD space.
+Use **Free up space** on the drive (app or the Explorer right-click menu) to evict data already uploaded and not pinned. You can also move the cache to another disk or adjust **Always keep free** so more space stays free. Uploads in progress stay local until they complete and verify.
 
-## Attributes differ on another PC
+## Capacity differs from my disk
 
-Attributes persist in the patched provider's local journal. They survive local remounts but do not automatically synchronize between machines.
+Explorer's capacity display comes from your Google storage quota — not your physical disk. Other Google storage usage affects available quota, and decimal/binary units can differ between displays.
+
+## Collecting diagnostics
+
+In the app use **Settings** or **Help → Collect diagnostics** (also available from the tray menu). Logs live under `%ProgramData%\MirageSSD\logs` (service) and `%LOCALAPPDATA%\MirageSSD\logs` (per-user components); the service database is under `%ProgramData%\MirageSSD`. Logs can contain paths, filenames, and error details — review and redact before sharing.
 
 ## Uninstall
 
-Use **Settings → Apps → Installed apps → MirageSSD**. Removal refuses known pending writes and retains cache, credentials, attribute metadata, remote files, and shared WinFsp. Do not purge retained data before verifying pending uploads and recovery.
+Use **Settings → Apps → Installed apps → MirageSSD**. Uninstall keeps `%ProgramData%\MirageSSD`, `%LOCALAPPDATA%\MirageSSD`, and everything in your Google Drive — remove the app folder from drive.google.com if you want it gone.
+
+---
+
+macOS issues → see [docs/macos.md](macos.md).

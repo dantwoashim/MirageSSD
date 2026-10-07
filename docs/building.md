@@ -1,31 +1,40 @@
 # Build and install
 
-The end-user path is the Windows writable-drive preview. The native immutable-repository adapter and management UI are optional, separate components.
+The shipping Windows product is the managed MirageSSD installer — a WiX bundle that installs WinFsp 2.1.25156 if it is missing and the MirageSSD MSI per-machine. An earlier rclone-based Windows package is kept for reference only (see [Legacy Windows rclone package](#legacy-windows-rclone-package)).
 
 ## Prerequisites
 
-Use Windows 11 x64 with PowerShell, Git, and:
+Windows 11 x64 with PowerShell and Git, plus:
 
 - Rust through rustup; `rust-toolchain.toml` selects 1.94.0.
 - Visual Studio 2022 Build Tools, **Desktop development with C++**, and the Windows SDK.
-- Go 1.25 or newer, as specified by the [pinned provider](https://github.com/rclone/rclone/blob/9ee9d0a0cafd5e5fe3b271d2280b090ab6e64048/go.mod).
-- [WinFsp 2.1.25156](https://github.com/winfsp/winfsp/releases/tag/v2.1). Packaging requires its installed license file.
-- Windows .NET Framework 4.x, including its C# compiler, for the setup wrapper.
+- CMake 3.25 or newer.
+- Node.js 22.19 or newer.
+- WiX 4.0.6 in `.tools\wix` (`dotnet tool install wix --tool-path .tools/wix --version 4.0.6`).
+- [WinFsp 2.1.25156](https://github.com/winfsp/winfsp/releases/tag/v2.1) installed for mounted-volume tests. `installer\build-setup.ps1` downloads and checksum-verifies the WinFsp MSI it bundles.
 
-Allow space for compiler outputs and provider dependencies. The installer's 12 GiB minimum is an end-user cache requirement, not a build-space estimate.
-
-## 1. Build the binaries
+## 1. Build
 
 ```powershell
 git clone https://github.com/dantwoashim/MirageSSD.git
 cd MirageSSD
-cargo build --release --locked -p mirage-cli
-.\scripts\build-rclone-miragessd.ps1
+cargo build --release --workspace --locked
+.\scripts\acquire-winfsp-sdk.ps1 -WixExecutable .\.tools\wix\wix.exe
+cmake --preset windows-msvc-release
+cmake --build --preset windows-msvc-release
 ```
 
-Outputs: `target/release/mirage.exe` and `target/rclone-miragessd/rclone.exe`.
+UI assets:
 
-The provider script checks out a fixed rclone `v1.75.1` commit, applies the published patch, tests `cmd/cmount`, and builds `v1.75.1-miragessd3`. An ordinary rclone binary is not a substitute. The preserved shipping baseline remains selectable with `-Variant miragessd2` (rclone `v1.75.0` → `v1.75.0-miragessd2`); see `third_party/rclone-miragessd/README.md`.
+```powershell
+cd apps\mirage-ui
+npm ci
+npm run build
+```
+
+Outputs: `target\release\{mirage,mirage-service,mirage-ui}.exe`, `build\windows-msvc-release\native\winfsp-adapter\Release\mirage-fs.exe`, and `apps\mirage-ui\dist\` (exactly `index.html`, `assets\mirage-ui.js`, `assets\mirage-ui.css`).
+
+The acquire script fetches the pinned WinFsp SDK payload used by the C++ adapter build; it needs the WiX executable path to extract it.
 
 ## 2. Configure Google sign-in
 
@@ -44,50 +53,22 @@ Authorization uses the system browser, PKCE, and a loopback callback. See Google
 
 Testing-mode authorization can expire and require sign-in again. A private tester configuration is not a publicly approved OAuth app.
 
-## 3. Package an installer
+## 3. Package
+
+Stage `target\release\mirage.exe`, `target\release\mirage-service.exe`, `target\release\mirage-ui.exe`, and `build\windows-msvc-release\native\winfsp-adapter\Release\mirage-fs.exe` into one folder, then:
 
 ```powershell
-.\scripts\build-one-click-setup.ps1 `
-  -DriveClientCredentials "$env:USERPROFILE\Downloads\desktop-oauth.json" `
-  -MirageExecutable .\target\release\mirage.exe `
-  -RcloneExecutable .\target\rclone-miragessd\rclone.exe `
-  -OutputRoot "$env:USERPROFILE\Downloads\MirageSSD-Packages"
+.\installer\build.ps1 -BinDir <stage> -DriveClientCredentials <oauth.json>
+.\installer\build-setup.ps1 -MsiPath <out>\MirageSSD.msi
 ```
 
-Replace the configuration filename with your actual download. Output must be outside the source repository.
+`build.ps1` produces `MirageSSD.msi` (per-machine; ships the MSVC runtime DLLs app-local so no separate VC++ redistributable is needed); `build-setup.ps1` wraps it with the pinned WinFsp MSI into `MirageSSD-Setup-<tag>.exe`. Version defaults to the `[workspace.package]` version in `Cargo.toml` and the tag to `v<version>-preview`; pass `-Version`/`-Tag` to override.
 
-The builder produces an EXE, ZIP, and extracted package. Send the EXE to testers. It includes the desktop application registration, **not a user's access token, refresh token, or files**. Use an app registration you intend to distribute.
+Tagged release builds use `scripts\build-release.ps1` with a clean checkout of the exact version tag.
 
-The package includes file checksums, the pinned WinFsp MSI, upstream licenses, provider source, and the patch. The preview is unsigned: checksums establish integrity, not publisher identity.
+The preview is unsigned. The bundle's license page points at the repository LICENSE; Windows may warn before running the EXE.
 
-Verify without installing, substituting the actual EXE path:
-
-```powershell
-$installer = "$env:USERPROFILE\Downloads\MirageSSD-Packages\MirageSSD-Setup-TIMESTAMP.exe"
-$report = "$env:TEMP\miragessd-package-check.txt"
-$process = Start-Process -FilePath $installer `
-  -ArgumentList ('--verify-only "' + $report + '"') -Wait -PassThru
-Get-Content -LiteralPath $report
-if ($process.ExitCode -ne 0) { throw 'Package verification failed.' }
-```
-
-This checks payload integrity and prerequisites. It does not authenticate, install, or test a mounted filesystem.
-
-## 4. Install and test
-
-Run the installer as the intended ordinary Windows user. Only driver installation requests administrator approval.
-
-Setup chooses an available drive letter and NTFS cache location, completes sign-in, and registers mount supervision. Cache targets range from 8 to 128 GiB according to free space, with a separate free-space reserve.
-
-Use disposable files. Check copy, edit, reopen, rename, attributes, and reconnect after Windows sign-out/sign-in. Verify a completed upload and restored copy before considering source deletion.
-
-## Optional developer components
-
-For Rust checks:
-
-On Windows, the full workspace suite includes a real mounted-volume test.
-Install WinFsp and build the native adapter using the commands below before
-running `cargo test`. Formatting and Clippy do not need a mounted filesystem.
+## Developer checks
 
 ```powershell
 cargo fmt --all -- --check
@@ -95,42 +76,41 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-For the UI, use Node.js 22.19 or newer:
+On Windows the workspace suite includes a real mounted-volume test that needs WinFsp installed and the **debug** adapter built (`cmake --preset windows-msvc-debug` + `cmake --build --preset windows-msvc-debug`).
+
+UI checks (in `apps\mirage-ui`):
 
 ```powershell
-cd apps/mirage-ui
 npm ci
 npm test
 npm run build
 ```
 
-The interface requires its local host and service backend. Vite alone is not a functioning storage service.
+The UI build must emit exactly `index.html`, `assets\mirage-ui.js`, `assets\mirage-ui.css` — the host serves only those under a strict CSP.
 
-For the native adapter, return to the repository root. Use CMake 3.25 or newer, Visual Studio 2022, and WiX 4.0.6:
+To exercise the UI without a running service:
 
 ```powershell
-dotnet tool install wix --tool-path .tools/wix --version 4.0.6
-.\scripts\acquire-winfsp-sdk.ps1 -WixExecutable .\.tools\wix\wix.exe
-cmake --preset windows-msvc-debug
-cmake --build --preset windows-msvc-debug
+npx vite --host 127.0.0.1 --port 5173
 ```
 
-Tagged MSI builds use `scripts/build-release.ps1` with a clean checkout and exact version tag. That is separate from the one-click writable-drive package.
+then open `/demo.html?scenario=fresh|drive|uploading|multi|offline` (`&theme=light|dark`, `&view=settings|help|setup`); mock data lives in `src/dev/mockBridge.ts`.
 
-The management-app MSI built by `installer/build.ps1` includes the x64 MSVC
-runtime DLLs beside the application. The builder locates them in Visual Studio's
-`VC/Redist/MSVC` directory; `-VCRuntimeDir` can select the matching
-`x64/Microsoft.VC143.CRT` directory explicitly. Do not use DLLs copied from
-Windows/System32. This avoids requiring development tools or a separate C++
-runtime installation on the receiving PC. The setup EXE also carries the pinned
-WinFsp prerequisite.
+Mounted-drive benchmarks live in `tools\perf`. With the release adapter built:
 
-Fresh-install regression coverage includes an empty service database, a real
-Drive-capable WinFsp host, first-file write/read, unmount/remount, and refusal to
-mount after removal of the repository key. It uses disposable local metadata
-without a Google bearer token; it does not prove remote upload or a new user's
-Google OAuth consent configuration.
+```powershell
+$env:MIRAGE_FS_EXE = 'D:\...\build\windows-msvc-release\native\winfsp-adapter\Release\mirage-fs.exe'
+cargo test --release --locked -p mirage-ffi --test bench_mounted -- --ignored --nocapture
+```
+
+or `.\tools\perf\run-managed-bench.ps1 -Target <mounted-root>` against any mounted drive. Results land in `target\perf\<timestamp>\summary.json` — see `tools\perf\README.md`.
+
+Fresh-install regression coverage includes an empty service database, a real Drive-capable WinFsp host, first-file write/read, unmount/remount, and refusal to mount after removal of the repository key. It uses disposable local metadata without a Google bearer token; it does not prove remote upload or a new user's Google OAuth consent configuration.
 
 ## macOS
 
 The macOS preview app is built with `scripts/build-rclone-miragessd.sh` and `scripts/build-macos-app.sh` on a Mac with Xcode Command Line Tools, Go, and macFUSE. It reuses the Google configuration from step 2. See the [macOS guide](macos.md).
+
+## Legacy Windows rclone package
+
+**Reference only — not the supported Windows install.** The earlier package mounts the drive through a pinned rclone provider and WinFsp. Its scripts remain in the repository: `scripts/build-one-click-setup.ps1`, `scripts/friend-setup.cs`, `scripts/setup-miragessd.ps1`, and `scripts/install-device-drive.ps1`. The provider build (`scripts/build-rclone-miragessd.ps1`) checks out a fixed rclone commit, applies the published patch, tests `cmd/cmount`, and builds `v1.75.1-miragessd3`; see `third_party/rclone-miragessd/README.md`. Go 1.25 or newer is required for that provider build only.

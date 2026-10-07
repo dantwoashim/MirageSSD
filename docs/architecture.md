@@ -4,36 +4,71 @@ MirageSSD contains two storage paths with separate guarantees.
 
 ## Writable drive
 
-This is the user-facing Windows preview.
+This is the user-facing Windows product — the managed-drive architecture.
 
 ```text
 Explorer / ordinary application
              |
            WinFsp
              |
-     patched rclone VFS
-        /           \
-local NTFS cache   Google Drive
-                   (user account)
+       mirage-fs.exe            <- native WinFsp filesystem host (per mounted drive)
+             |                    calls the Rust engine through the mirage-ffi C ABI
+   Rust engine (mirage-ffi)
+     local journal + cache  <->  background publisher  ---->  Google Drive
+             |                                                (app folder,
+   mirage-service (Windows service, LocalSystem)               immutable
+     repositories, mounts, free-space floors,                  encrypted
+     Explorer icon + right-click verbs, named-pipe IPC)        objects)
+             |
+   mirage-ui.exe (loopback desktop app)   mirage.exe (CLI + per-user logon agent)
 ```
 
-WinFsp exposes the filesystem to Windows. The rclone VFS implements ordinary file operations, cached content, ranged reads, and background uploads. MirageSSD supplies authentication, supervision, installation, and device configuration.
+`mirage-service.exe` owns repositories, mounts, free-space floors, the Explorer drive icon and right-click verbs, and local named-pipe IPC. `mirage-fs.exe` is the native C++ WinFsp filesystem host for each mounted drive and calls the Rust engine through the mirage-ffi C ABI. `mirage-ui.exe` serves the management UI over loopback HTTP with a per-launch token (opened as an Edge app window, falling back to the default browser) and has a `--tray` notification-area companion registered under HKCU Run. `mirage.exe` is the CLI; a per-user logon agent under HKCU Run keeps this user's drives mounted and supplies fresh Drive access tokens to their hosts.
 
 ### Reads and writes
 
-Cached reads stay local; uncached reads use the network and can fail when the remote data is unavailable. Background directory prewarming loads metadata, not file contents. This path does not promise network-free metadata operations.
+Reads of data already on this PC are served locally; other data is fetched from Drive, hash-verified, and cached. Writes land in a local journal on this PC — contiguous writes go into segment files that a background thread seals durably. **Local completion and remote completion are different events.**
 
-Writes enter the cache first. Closed files become eligible for upload after a short write-back delay. **Local completion and remote completion are different events.** Open files and pending uploads cannot be evicted simply to meet a size target, so available local space limits staging.
+### Durability
+
+Every operation is atomic and ordered. Closing a file does not wait for the disk — committed changes reach the disk within about a quarter second, or when an application calls `FlushFileBuffers` (which returns only once that file is durable). A crash or power loss can lose writes from roughly the last quarter second, including files whose close was still being sealed, but never leaves corrupted or half-applied state. Local payload files are deleted only after the state that allows the deletion is durable. Setting `MIRAGE_DURABILITY=strict` in the `mirage-fs.exe` environment restores per-operation durability: every commit is fsynced and close waits for the seal.
+
+### Publication and eviction
+
+A background publisher uploads sealed data to the drive's app folder in Google Drive as immutable objects, encrypted on this PC with a per-drive key. Payloads up to 4 MiB are uploaded together in packs of up to 16 MiB / 1,024 payloads, so many small files cost one Drive object instead of one each (Drive limits sustained write requests to about 3 per second per account); each payload stays individually encrypted and verified, and reads fetch only the byte range they need. Uploads are read back and hash-verified before the local copy may be evicted. A local budget plus a free-space floor ("Always keep free") bound local use; eviction only removes data already uploaded and not pinned, and pinned folders ("Keep on this device") are never evicted.
 
 ### Identity and lifecycle
 
-Setup runs as the ordinary user. A per-user scheduled task supervises the hidden launcher, starts at sign-in, and retries periodically. Credentials use Windows DPAPI and owner-limited filesystem permissions. Driver installation is the privileged step.
-
-Volume capacity comes from the connected account's quota, not physical SSD capacity. The rclone attribute patch maintains a local journal across rename and deletion; that journal is not automatically synchronized to another PC.
+Sign-in happens in the system browser with PKCE and a loopback callback; the scope is `drive.file` (app-created files only). Tokens are stored per user and protected with Windows DPAPI, as is the per-drive encryption key — so there is currently no supported way to open a drive from another PC or after reinstalling Windows. Volume capacity comes from the Google storage quota, not physical disk capacity.
 
 | Component | Main implementation |
 | --- | --- |
-| Desktop authorization and protected tokens | `crates/mirage-backend-drive/src/oauth.rs`, `token_store.rs` |
+| WinFsp filesystem host (`mirage-fs.exe`) | `native/winfsp-adapter/` |
+| Write-behind segments and their durable seal | `crates/mirage-ffi/src/segments.rs` |
+| Writes, extent journal, and namespace mutations | `crates/mirage-ffi/src/write.rs`, `crates/mirage-ffi/src/mutation.rs` |
+| Origin fetch and reads | `crates/mirage-ffi/src/read.rs` |
+| Background publisher (encrypt, upload, read-back verify) | `crates/mirage-ffi/src/publisher.rs` |
+| Service control plane | `crates/mirage-service/src/control_plane.rs`, `crates/mirage-service/src/control_plane/` |
+| Desktop app host | `crates/mirage-ui-host/` |
+| Logon agent | `crates/mirage-cli/src/commands/agent.rs` |
+| OAuth and protected token storage | `crates/mirage-backend-drive/src/oauth.rs`, `crates/mirage-backend-drive/src/token_store.rs` |
+| MSI and setup bundle | `installer/` |
+
+## macOS preview (rclone + macFUSE)
+
+The macOS preview is a separate AppKit app over the patched rclone provider and macFUSE, mounting an app folder at `~/MirageSSD` in Finder. Files upload as ordinary files (not encrypted by MirageSSD). See the [macOS guide](macos.md).
+
+| Component | Main implementation |
+| --- | --- |
+| macOS app | `apps/mirage-macos/`, `scripts/build-macos-app.sh` |
+| Patched provider and its build | `third_party/rclone-miragessd/`, `scripts/build-rclone-miragessd.sh` |
+
+### Legacy Windows rclone package
+
+Earlier Windows previews mounted the same patched provider through WinFsp. These files remain for reference; they are not the supported Windows install.
+
+| Component | Main implementation |
+| --- | --- |
 | Mount command and provider options | `crates/mirage-cli/src/commands/device_drive.rs` |
 | Setup and cache selection | `scripts/setup-miragessd.ps1` |
 | Installation and supervision | `scripts/install-device-drive.ps1` |
@@ -45,7 +80,7 @@ Volume capacity comes from the connected account's quota, not physical SSD capac
 
 The Rust engine stores versioned manifests, indexes, and packs; verifies page contents; manages residency; and coordinates sessions through a service and authenticated IPC. Its C++ WinFsp adapter exposes a separate immutable-repository filesystem.
 
-This path contains encryption, owner binding, profiling, simulation, and session-admission work. Those features do not make the writable drive an encrypted pack filesystem or establish production-ready game streaming.
+This path contains encryption, owner binding, profiling, simulation, and session-admission work. The writable drive shares the engine's journal, cache, and encrypted publication, but the profiling and session-admission work does not establish production-ready game streaming.
 
 The [format specifications](specs/) and [design decisions](adr/) describe its persistent contracts. Its management interface talks through a local host to the service; it does not provide the ordinary writable mount.
 
@@ -55,7 +90,7 @@ The engine can now compile a readiness verdict for a declared scope: `compile_re
 
 ## Backup helpers
 
-Optional CLI and PowerShell helpers integrate with Restic for encrypted packed backups and restores. They require separate configuration and recovery material, and are not automatically installed by the one-click package. An ordinary Explorer copy is not a verified packed backup.
+Optional CLI and PowerShell helpers integrate with Restic for encrypted packed backups and restores. They require separate configuration and recovery material, and are not installed by the Windows setup bundle. An ordinary Explorer copy is not a verified packed backup.
 
 ## Failure boundaries
 

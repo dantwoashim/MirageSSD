@@ -1,5 +1,10 @@
 # Capability status and evidence baseline
 
+> Historical baseline (2026-09-19). Since then the Windows product ships the
+> managed engine path — an MSI with `mirage-service` plus the `mirage-fs`
+> WinFsp host — and the patched rclone provider remains the macOS preview's
+> mount. See [architecture.md](architecture.md).
+
 Frozen 2026-09-19 against repository state `5958d6a2ceb8fd04daa949e89249cf3d851eb963`
 plus the engineering-handoff audit bundle (source SHA-256
 `ef7c52c28574250e8cff7ef11d863558a651356d2ca99684304e4a65774f0ac0`).

@@ -1,11 +1,18 @@
 param(
-  [string]$Version = '0.1.17',
+  [string]$Version,
   [string]$MsiPath,
   [string]$Output = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist-dev\installer'),
-  [string]$Tag = 'v0.1.17-preview'
+  [string]$Tag
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $Version) {
+  $manifest = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Cargo.toml') -Raw
+  $match = [regex]::Match($manifest, '(?ms)\[workspace\.package\].*?version\s*=\s*"(\d+\.\d+\.\d+)"')
+  if (-not $match.Success) { throw 'Cannot determine version from Cargo.toml; supply -Version.' }
+  $Version = $match.Groups[1].Value
+}
+if (-not $Tag) { $Tag = "v$Version-preview" }
 $winfspUrl = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
 $winfspSha = '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A'
 

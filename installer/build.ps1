@@ -3,7 +3,7 @@ param(
   [string]$Configuration = 'release',
   [string]$BinDir,
   [string]$UiDir,
-  [string]$Version = '0.1.17',
+  [string]$Version,
   [Parameter(Mandatory = $true)]
   [string]$DriveClientCredentials,
   [string]$VCRuntimeDir,
@@ -11,6 +11,12 @@ param(
   [string]$Output = "$PSScriptRoot\out"
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Version) {
+  $manifest = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Cargo.toml') -Raw
+  $match = [regex]::Match($manifest, '(?ms)\[workspace\.package\].*?version\s*=\s*"(\d+\.\d+\.\d+)"')
+  if (-not $match.Success) { throw 'Cannot determine installer version from Cargo.toml; supply -Version.' }
+  $Version = $match.Groups[1].Value
+}
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Installer version must be major.minor.patch.' }
 $versionParts = @($Version.Split('.') | ForEach-Object { [uint32]$_ })
 if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -gt 65535) {
