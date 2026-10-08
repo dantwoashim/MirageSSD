@@ -103,7 +103,12 @@ if (-not $VCRuntimeDir) {
   $redist = Get-ChildItem -LiteralPath (Join-Path $vs 'VC\Redist\MSVC') -Directory |
     Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
     Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-  if ($redist) { $VCRuntimeDir = Join-Path $redist.FullName 'x64\Microsoft.VC143.CRT' }
+  if ($redist) {
+    $VCRuntimeDir = Get-ChildItem -LiteralPath (Join-Path $redist.FullName 'x64') -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '^Microsoft\.VC\d+\.CRT$' } |
+      Sort-Object { [int]($_.Name -replace '^Microsoft\.VC(\d+)\.CRT$', '$1') } -Descending |
+      Select-Object -First 1 -ExpandProperty FullName
+  }
 }
 foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
   if (-not $VCRuntimeDir -or -not (Test-Path -LiteralPath (Join-Path $VCRuntimeDir $name))) {
