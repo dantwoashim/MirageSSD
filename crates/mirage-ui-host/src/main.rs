@@ -7,6 +7,7 @@
 mod pin_quick_access;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
 mod update_check;
 
 #[cfg(windows)]

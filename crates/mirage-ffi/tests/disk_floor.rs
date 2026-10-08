@@ -6,12 +6,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use mirage_ffi::mirage_engine_set_disk_floor;
 use mirage_ffi::{
     MirageEngineHandle, MirageFileHandle, MiragePublicationStats, MirageStatus,
     mirage_engine_create_managed_local_provider, mirage_engine_destroy,
     mirage_engine_evict_published, mirage_engine_mark_mounted, mirage_engine_publication_stats,
-    mirage_engine_set_disk_floor, mirage_engine_set_drive_token, mirage_flush, mirage_lookup,
-    mirage_namespace_create, mirage_read, mirage_write,
+    mirage_engine_set_drive_token, mirage_flush, mirage_lookup, mirage_namespace_create,
+    mirage_read, mirage_write,
 };
 use mirage_manifest::FileClass;
 use mirage_pack::{ImportPlan, PlannedFile, import_local};
@@ -197,32 +199,25 @@ fn evict(engine: *mut MirageEngineHandle, target: u64) -> (MirageStatus, u64) {
     (status, freed)
 }
 
+#[cfg(windows)]
 fn real_free_bytes(dir: &Path) -> u64 {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let wide: Vec<u16> = dir
-            .canonicalize()
-            .unwrap()
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut free = 0u64;
-        let mut total = 0u64;
-        let mut total_free = 0u64;
-        assert_ne!(
-            unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) },
-            0
-        );
-        free
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = dir;
-        u64::MAX
-    }
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir
+        .canonicalize()
+        .unwrap()
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut free = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    assert_ne!(
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) },
+        0
+    );
+    free
 }
 
 #[test]
@@ -307,6 +302,7 @@ fn unpublished_payloads_are_never_evicted() {
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
 
+#[cfg(windows)]
 #[test]
 fn impossible_floor_fails_diskfull_when_nothing_evictable() {
     let (_source, objects, index) = build_index();
@@ -330,6 +326,7 @@ fn impossible_floor_fails_diskfull_when_nothing_evictable() {
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
 
+#[cfg(windows)]
 #[test]
 fn breached_floor_evicts_published_then_admits() {
     let (_source, objects, index) = build_index();

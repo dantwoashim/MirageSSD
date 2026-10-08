@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use mirage_db::Database;
 use mirage_ipc::{Command, PROTOCOL_VERSION, Principal, PrincipalRole, Request, ResponseBody};
 use mirage_service::{ControlPlaneHandler, RequestHandler};

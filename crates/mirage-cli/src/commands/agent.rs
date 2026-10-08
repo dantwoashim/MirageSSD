@@ -5,7 +5,9 @@
 //! and never logs tokens.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use mirage_types::{GenerationId, MirageError, RepositoryId};
@@ -198,6 +200,7 @@ fn agent_command_line(current_exe: &Path) -> Result<String, MirageError> {
 /// Starts `mirage.exe agent` (the sibling binary) as a detached background
 /// process. Idempotent: a running agent holds the agent mutex, so the new
 /// instance exits immediately.
+#[cfg(windows)]
 pub fn spawn_detached() -> Result<(), MirageError> {
     let current_exe = std::env::current_exe().map_err(MirageError::from)?;
     let command_line = agent_command_line(&current_exe)?;
@@ -210,7 +213,6 @@ pub fn spawn_detached() -> Result<(), MirageError> {
         .ok_or_else(|| MirageError::internal_invariant("agent command line is malformed"))?;
     let mut command = std::process::Command::new(executable);
     command.arg("agent");
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -224,6 +226,13 @@ pub fn spawn_detached() -> Result<(), MirageError> {
         .spawn()
         .map(|_| ())
         .map_err(MirageError::from)
+}
+
+#[cfg(not(windows))]
+pub fn spawn_detached() -> Result<(), MirageError> {
+    Err(MirageError::provider_unavailable(
+        "the background agent requires Windows",
+    ))
 }
 
 pub fn install_logon_registration() -> Result<(), MirageError> {
@@ -425,7 +434,7 @@ struct AgentMutex;
 #[cfg(not(windows))]
 impl AgentMutex {
     fn acquire() -> Result<Option<Self>, MirageError> {
-        Ok(Self)
+        Ok(Some(Self))
     }
 }
 

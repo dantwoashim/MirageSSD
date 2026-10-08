@@ -720,6 +720,7 @@ fn namespace_pin_unpin_list_round_trip() {
     assert!(matches!(again, ResponseBody::Error { .. }), "{again:?}");
 }
 
+#[cfg(windows)]
 #[test]
 fn cache_root_move_copies_verifies_records_and_is_refused_while_mounted() {
     let directory = tempfile::tempdir().expect("directory");

@@ -1029,6 +1029,7 @@ mod tests {
         assert_eq!(volumes[0]["state"], "ready_mounted");
     }
 
+    #[cfg(windows)]
     #[test]
     fn create_end_to_end_against_the_local_backend_seam() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1107,6 +1108,7 @@ mod tests {
         assert!(matches!(requests[3], mirage_ipc::Command::Mount { .. }));
     }
 
+    #[cfg(windows)]
     #[test]
     fn failed_create_rolls_back_the_local_dirs_and_reports_the_step() {
         struct FailingTransport;
@@ -1167,6 +1169,7 @@ mod tests {
         assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn failed_mount_unregisters_or_preserves_recoverable_metadata() {
         struct Transport {
@@ -1247,6 +1250,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn floor_permission_denial_keeps_the_volume_and_warns() {
         struct FloorFails {

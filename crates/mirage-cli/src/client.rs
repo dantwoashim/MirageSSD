@@ -42,6 +42,7 @@ impl ServiceTransport for NamedPipeTransport {
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MirageSSD.v1";
 
 /// How a failed `CreateFileW` on the service pipe is handled.
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipeOpenDisposition {
     /// `ERROR_PIPE_BUSY`: an instance exists but is held — wait and retry.
@@ -52,6 +53,7 @@ pub(crate) enum PipeOpenDisposition {
     Fail,
 }
 
+#[cfg(windows)]
 pub(crate) fn pipe_open_disposition(raw_os_error: Option<i32>) -> PipeOpenDisposition {
     const ERROR_PIPE_BUSY: i32 = 231;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -155,7 +157,7 @@ fn io(error: std::io::Error) -> MirageError {
     .with_source(error)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
