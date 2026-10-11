@@ -39,5 +39,6 @@ fn git_build_hash() -> Option<String> {
 }
 
 fn valid_build_hash(value: &str) -> bool {
-    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    let hex = value.strip_suffix("-dirty").unwrap_or(value);
+    (7..=64).contains(&hex.len()) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
