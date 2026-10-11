@@ -448,21 +448,33 @@ fn evicted_payload_restages_on_read_within_budget() {
     assert!(freed >= 256 * 1024);
     assert!(payload_names(&journal).is_empty());
 
-    // First read re-stages the whole payload; bytes stay exact.
+    // First read serves the bytes remotely and schedules the background
+    // re-stage; the payload becomes resident shortly after.
     let (status, bytes) = read_path(engine, "restage.bin", 256 * 1024);
     assert_eq!(status, MirageStatus::Ok);
     assert!(bytes.iter().all(|b| *b == 0x99));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while payload_names(&journal).len() != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(
         payload_names(&journal).len(),
         1,
         "evicted payload was not re-staged to the journal"
     );
     // The re-staged bytes count against the dirty ledger again.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut dirty_free = u64::MAX;
-    assert_eq!(
-        unsafe { mirage_ffi::mirage_engine_dirty_free(engine, &mut dirty_free) },
-        MirageStatus::Ok
-    );
+    loop {
+        assert_eq!(
+            unsafe { mirage_ffi::mirage_engine_dirty_free(engine, &mut dirty_free) },
+            MirageStatus::Ok
+        );
+        if BUDGET - dirty_free == 256 * 1024 || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(BUDGET - dirty_free, 256 * 1024);
     // Second read still exact (served from the re-staged file).
     let (status, bytes) = read_path(engine, "restage.bin", 256 * 1024);
@@ -489,9 +501,12 @@ fn restage_stays_transient_when_budget_cannot_admit() {
     assert_eq!(payload_names(&journal).len(), 1);
 
     // Reading A must not re-stage: the ledger cannot admit another 40 KiB.
+    // The bytes still arrive (remote frames); the background re-stage is
+    // refused by admission — give it time to run, then check nothing landed.
     let (status, bytes) = read_path(engine, "a.bin", 4096);
     assert_eq!(status, MirageStatus::Ok);
     assert!(bytes.iter().all(|b| *b == 0xAB));
+    std::thread::sleep(Duration::from_secs(3));
     assert_eq!(
         payload_names(&journal).len(),
         1,

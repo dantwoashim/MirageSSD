@@ -71,6 +71,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            restage_pool: None,
             disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -166,6 +167,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            restage_pool: None,
             disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -376,6 +378,7 @@ unsafe fn create_cache_impl(
             managed_provider: None,
             publisher: None,
             remote_payloads: None,
+            restage_pool: None,
             disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             floor_free_cache: std::sync::Arc::new(std::sync::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -982,6 +985,11 @@ fn create_managed_impl(
                 volume,
             ))
         });
+        // Cold reads schedule whole-payload re-stages on this bounded pool
+        // instead of blocking the read callback on a full fetch.
+        let restage_pool = remote_payloads
+            .is_some()
+            .then(|| Arc::new(publisher::RestagePool::new()));
         let extents: Arc<std::sync::Mutex<HashMap<InodeId, mirage_engine::extent_map::ExtentMap>>> =
             Arc::new(std::sync::Mutex::new(Default::default()));
         let payload_files: Arc<std::sync::Mutex<handles::PayloadFileCache>> =
@@ -1039,6 +1047,7 @@ fn create_managed_impl(
             managed_provider,
             publisher,
             remote_payloads,
+            restage_pool,
             segments,
             group_durability,
             disk_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

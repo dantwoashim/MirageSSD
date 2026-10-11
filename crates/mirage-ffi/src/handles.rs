@@ -362,6 +362,10 @@ pub struct MirageEngineHandle {
     pub publisher: Option<Arc<crate::publisher::Publisher>>,
     /// Evicted-payload fetch state: backend + key + bounded frame cache.
     pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
+    /// Bounded background re-stage pool for evicted payloads — cold reads
+    /// queue whole-payload re-stages here instead of blocking the callback.
+    /// `None` on unmanaged volumes (they never evict to remote).
+    pub restage_pool: Option<Arc<crate::publisher::RestagePool>>,
     /// Write-admission free-space floor for the journal volume (`--floor`;
     /// 0 disables). Writes fail DiskFull rather than breach it when nothing
     /// published remains evictable.
@@ -546,6 +550,9 @@ pub struct MirageFileHandle {
     /// Remote fetch for evicted payloads (published dirty extents whose local
     /// file was reclaimed).
     pub remote_payloads: Option<Arc<crate::publisher::RemotePayloadStore>>,
+    /// Bounded background re-stage pool shared with the engine (managed
+    /// volumes only); cold reads queue re-stages instead of blocking.
+    pub restage_pool: Option<Arc<crate::publisher::RestagePool>>,
     /// Sequential-miss tracking for `prefetch` (file-relative page hashes and
     /// the last provider-fetched position).
     pub prefetch_state: Arc<PrefetchState>,
@@ -620,6 +627,7 @@ impl MirageEngineHandle {
             dirty: None,
             publisher: None,
             remote_payloads: None,
+            restage_pool: None,
             disk_floor: Arc::new(AtomicU64::new(0)),
             floor_free_cache: Arc::new(Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),

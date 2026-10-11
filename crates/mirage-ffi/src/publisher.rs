@@ -807,8 +807,21 @@ type PublicationCache = Mutex<
     >,
 >;
 
-const FRAME_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
+const FRAME_CACHE_BUDGET: u64 = 128 * 1024 * 1024;
 const PUBLICATION_CACHE_LIMIT: usize = 4096;
+/// Frames of one `read` fetched concurrently — hides a backend round trip
+/// per frame (Drive latency dominates a cold read), bounded so a burst of
+/// readers cannot stampede the backend.
+const FRAME_FETCH_PARALLELISM: usize = 8;
+/// Sub-range size when one frame fetch is split across connections. Some
+/// links have low *per-connection* throughput to the provider (measured:
+/// ~0.6 MiB/s per request against ~19 MiB/s aggregate); fetching a ~4.3 MiB
+/// encoded frame as one request leaves most of the link idle.
+const SUBRANGE_BYTES: u64 = 1024 * 1024;
+/// Sub-range fetches in flight per frame. Combined with the 8-frame window
+/// a foreground read tops out at 32 sockets — acceptable next to a running
+/// game and far inside what a consumer NAT table tolerates.
+const SUBRANGE_PARALLELISM: usize = 4;
 
 struct FrameFlight {
     done: Mutex<Option<Result<Vec<u8>, FetchFailure>>>,
@@ -943,15 +956,7 @@ impl RemotePayloadStore {
             content_hash: ContentHash::from_bytes(record.object_hash),
             kind: ObjectKind::Payload,
         };
-        let read = futures_executor::block_on(self.backend.read_range(
-            &reference,
-            range,
-            mirage_backend::FetchClass::BlockingRead,
-            CancellationToken::new(),
-        ))
-        .map_err(|_| FetchFailure::Backend)?;
-        let bytes = futures_executor::block_on(collect_stream(read.stream))
-            .map_err(|_| FetchFailure::Backend)?;
+        let bytes = fetch_remote_range(&self.backend, &reference, range)?;
         if bytes.len() as u64 != length {
             return Err(FetchFailure::Integrity);
         }
@@ -1006,6 +1011,32 @@ impl RemotePayloadStore {
         offset: u64,
         length: usize,
     ) -> Result<Option<Vec<u8>>, MirageError> {
+        self.read_inner(db, volume, payload_id, offset, length, None)
+    }
+
+    /// `read` for a background worker: `cancel` is polled between frame
+    /// batches so engine shutdown can cut a whole-payload fetch short.
+    pub fn read_cancelable(
+        &self,
+        db: &Database,
+        volume: RepositoryId,
+        payload_id: &[u8; 16],
+        offset: u64,
+        length: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<u8>>, MirageError> {
+        self.read_inner(db, volume, payload_id, offset, length, Some(cancel))
+    }
+
+    fn read_inner(
+        &self,
+        db: &Database,
+        volume: RepositoryId,
+        payload_id: &[u8; 16],
+        offset: u64,
+        length: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<Vec<u8>>, MirageError> {
         if !self.installed.load(Ordering::Acquire) {
             return Err(MirageError::backend_unavailable(
                 "payload fetch requires an installed backend credential",
@@ -1024,11 +1055,31 @@ impl RemotePayloadStore {
         }
         let first = offset / PAYLOAD_FRAME_BYTES;
         let last = (end.saturating_sub(1)) / PAYLOAD_FRAME_BYTES;
-        let mut out = Vec::with_capacity(length);
-        for frame_index in first..=last {
-            let plaintext = self
-                .frame(&record, frame_index)
-                .map_err(|failure| match failure {
+        let mut frames: Vec<(u64, Vec<u8>)> = Vec::with_capacity((last - first + 1) as usize);
+        let mut pending = first..=last;
+        loop {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(MirageError::backend_unavailable("payload fetch cancelled"));
+            }
+            // Fetch the next window's frames concurrently; cached frames
+            // resolve inline through the same single-flight/verify path.
+            let batch: Vec<u64> = pending.by_ref().take(FRAME_FETCH_PARALLELISM).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let results: Vec<Result<Vec<u8>, FetchFailure>> = std::thread::scope(|scope| {
+                let record = record.as_ref();
+                let spawned: Vec<_> = batch
+                    .iter()
+                    .map(|&frame_index| scope.spawn(move || self.frame(record, frame_index)))
+                    .collect();
+                spawned
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap_or(Err(FetchFailure::Backend)))
+                    .collect()
+            });
+            for (frame_index, plaintext) in batch.iter().copied().zip(results) {
+                let plaintext = plaintext.map_err(|failure| match failure {
                     FetchFailure::Backend => {
                         MirageError::backend_unavailable("evicted payload fetch failed")
                     }
@@ -1036,6 +1087,14 @@ impl RemotePayloadStore {
                         MirageError::integrity_mismatch("evicted payload failed verification")
                     }
                 })?;
+                frames.push((frame_index, plaintext));
+            }
+        }
+        // Assemble strictly from the fetched plaintexts in range order —
+        // never back through the shared cache, which may have evicted a
+        // frame of this very read when its budget cleared.
+        let mut out = Vec::with_capacity(length);
+        for (frame_index, plaintext) in frames {
             let frame_start = frame_index * PAYLOAD_FRAME_BYTES;
             let take_start = offset.saturating_sub(frame_start) as usize;
             let take_end = ((end - frame_start) as usize).min(plaintext.len());
@@ -1046,11 +1105,13 @@ impl RemotePayloadStore {
 
     /// Full verified plaintext of an evicted payload plus its record, for
     /// re-staging the local file. `None` when no publication row exists.
+    /// `cancel`, when set, cuts the fetch between frame batches.
     pub fn fetch_whole(
         &self,
         db: &Database,
         volume: RepositoryId,
         payload_id: &[u8; 16],
+        cancel: Option<&AtomicBool>,
     ) -> Result<Option<WholePayload>, MirageError> {
         let Some(record) = self.publication(db, volume, payload_id)? else {
             return Ok(None);
@@ -1058,7 +1119,7 @@ impl RemotePayloadStore {
         let length = usize::try_from(record.plaintext_length)
             .map_err(|_| MirageError::integrity_mismatch("published payload length overflows"))?;
         let bytes = self
-            .read(db, volume, payload_id, 0, length)?
+            .read_inner(db, volume, payload_id, 0, length, cancel)?
             .ok_or_else(|| MirageError::integrity_mismatch("publication vanished mid-read"))?;
         if bytes.len() != length {
             return Err(MirageError::integrity_mismatch(
@@ -1107,6 +1168,148 @@ impl Drop for RestageGuard<'_> {
     }
 }
 
+/// Bounded background re-stage pool: at most `RESTAGE_WORKERS`
+/// whole-payload fetches run per engine, so a cold-read burst keeps its
+/// latency win without competing head-on with the foreground reader or the
+/// publisher. Queued work past `RESTAGE_QUEUE_LIMIT` drops silently — the
+/// next cold read schedules it again. Best-effort by contract: failures
+/// live and die with the task itself.
+pub struct RestagePool {
+    inner: Mutex<RestagePoolState>,
+    wake: Condvar,
+    /// Engine shutdown: workers exit at the next job boundary and an
+    /// in-flight fetch polls the flag between frame batches.
+    stop: Arc<AtomicBool>,
+}
+
+struct RestagePoolState {
+    queue: std::collections::VecDeque<RestageJob>,
+    /// Queued-but-not-started payload ids; the restage slot dedupes running
+    /// work, this set keeps the queue itself bounded and unique.
+    queued: std::collections::BTreeSet<[u8; 16]>,
+    running: usize,
+}
+
+struct RestageJob {
+    payload_id: [u8; 16],
+    task: Box<dyn FnOnce(&AtomicBool) + Send>,
+}
+
+const RESTAGE_WORKERS: usize = 2;
+const RESTAGE_QUEUE_LIMIT: usize = 64;
+
+impl Default for RestagePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RestagePool {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(RestagePoolState {
+                queue: std::collections::VecDeque::new(),
+                queued: std::collections::BTreeSet::new(),
+                running: 0,
+            }),
+            wake: Condvar::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The shared cancellation flag for tasks that poll mid-fetch.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Queues `task` for `payload_id`; `false` when the payload is already
+    /// queued, the queue is full, or the pool is stopping — callers that do
+    /// not care may ignore it (a later read reschedules).
+    pub fn submit(
+        self: &Arc<Self>,
+        payload_id: [u8; 16],
+        task: impl FnOnce(&AtomicBool) + Send + 'static,
+    ) -> bool {
+        if self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = match self.inner.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if !state.queued.insert(payload_id) {
+            return false;
+        }
+        if state.queue.len() >= RESTAGE_QUEUE_LIMIT {
+            state.queued.remove(&payload_id);
+            return false;
+        }
+        state.queue.push_back(RestageJob {
+            payload_id,
+            task: Box::new(task),
+        });
+        if state.running < RESTAGE_WORKERS {
+            // Reserve the slot under the lock so a failed spawn can hand it
+            // back deterministically.
+            state.running += 1;
+            let pool = Arc::clone(self);
+            drop(state);
+            match std::thread::Builder::new()
+                .name("mirage-restage".to_owned())
+                .spawn(move || pool.worker())
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    if let Ok(mut state) = self.inner.lock() {
+                        state.running = state.running.saturating_sub(1);
+                    }
+                }
+            }
+        } else {
+            drop(state);
+            self.wake.notify_one();
+        }
+        true
+    }
+
+    /// Stop scheduling and wake workers. Workers are detached: everything a
+    /// job touches is independently owned (Arc/Database), so engine destroy
+    /// never blocks on a fetch already in flight — it only lets the pool
+    /// wind down.
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn worker(self: &Arc<Self>) {
+        loop {
+            let job = {
+                let mut state = match self.inner.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                loop {
+                    if let Some(job) = state.queue.pop_front() {
+                        state.queued.remove(&job.payload_id);
+                        break job;
+                    }
+                    if self.stop.load(Ordering::Acquire) {
+                        state.running = state.running.saturating_sub(1);
+                        return;
+                    }
+                    state = match self.wake.wait(state) {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                }
+            };
+            let cancel = Arc::clone(&self.stop);
+            (job.task)(&cancel);
+        }
+    }
+}
+
 fn flight_key_of(
     record: &mirage_db::payload_remote::PayloadRemoteObject,
     frame_index: u64,
@@ -1125,6 +1328,77 @@ fn flight_done(
 
 fn flight_result(flight: &FrameFlight) -> Option<Result<Vec<u8>, FetchFailure>> {
     flight.done.lock().ok().and_then(|done| done.clone())
+}
+
+/// Fetches one backend range. Ranges larger than `SUBRANGE_BYTES` are split
+/// into sub-ranges fetched `SUBRANGE_PARALLELISM` at a time so a
+/// per-connection-limited link overlaps them; parts are concatenated in
+/// order and the total length must match exactly.
+fn fetch_remote_range(
+    backend: &Arc<dyn mirage_backend::ObjectBackend>,
+    reference: &mirage_backend::RemoteObjectRef,
+    range: mirage_types::CheckedRange,
+) -> Result<Vec<u8>, FetchFailure> {
+    if range.len() <= SUBRANGE_BYTES {
+        return fetch_remote_part(backend, reference, range);
+    }
+    let mut parts: Vec<mirage_types::CheckedRange> = Vec::new();
+    let mut cursor = range.start();
+    let end = range.start() + range.len();
+    while cursor < end {
+        let length = SUBRANGE_BYTES.min(end - cursor);
+        let Some(part) = mirage_types::CheckedRange::try_new(cursor, length) else {
+            return Err(FetchFailure::Integrity);
+        };
+        parts.push(part);
+        cursor += length;
+    }
+    let mut pending = parts.iter();
+    let mut bytes = Vec::with_capacity(range.len() as usize);
+    loop {
+        let batch: Vec<mirage_types::CheckedRange> = pending
+            .by_ref()
+            .take(SUBRANGE_PARALLELISM)
+            .copied()
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        let results: Vec<Result<Vec<u8>, FetchFailure>> = std::thread::scope(|scope| {
+            let spawned: Vec<_> = batch
+                .iter()
+                .map(|part| scope.spawn(move || fetch_remote_part(backend, reference, *part)))
+                .collect();
+            spawned
+                .into_iter()
+                .map(|thread| thread.join().unwrap_or(Err(FetchFailure::Backend)))
+                .collect()
+        });
+        for result in results {
+            bytes.extend_from_slice(&result?);
+        }
+    }
+    if bytes.len() as u64 != range.len() {
+        return Err(FetchFailure::Integrity);
+    }
+    Ok(bytes)
+}
+
+/// One `read_range` + stream collect; typed backend failure only — callers
+/// compare the length.
+fn fetch_remote_part(
+    backend: &Arc<dyn mirage_backend::ObjectBackend>,
+    reference: &mirage_backend::RemoteObjectRef,
+    range: mirage_types::CheckedRange,
+) -> Result<Vec<u8>, FetchFailure> {
+    let read = futures_executor::block_on(backend.read_range(
+        reference,
+        range,
+        mirage_backend::FetchClass::BlockingRead,
+        CancellationToken::new(),
+    ))
+    .map_err(|_| FetchFailure::Backend)?;
+    futures_executor::block_on(collect_stream(read.stream)).map_err(|_| FetchFailure::Backend)
 }
 
 async fn collect_stream(

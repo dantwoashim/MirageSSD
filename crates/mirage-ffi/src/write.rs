@@ -549,72 +549,205 @@ pub unsafe extern "C" fn mirage_flush(handle: *mut MirageFileHandle) -> MirageSt
     })
 }
 
+/// Everything a payload re-stage needs that is not the payload id — built
+/// once per cold read and shared by the background pool's jobs, so a
+/// detached worker never reaches back through the file handle.
+pub(super) struct RestageContext {
+    remote: Arc<crate::publisher::RemotePayloadStore>,
+    db: mirage_db::Database,
+    dirty: Arc<handles::DirtyLedger>,
+    payload_files: Arc<std::sync::Mutex<handles::PayloadFileCache>>,
+    disk_floor: Arc<AtomicU64>,
+    floor_free_cache: Arc<std::sync::Mutex<(std::time::Instant, u64)>>,
+    journal_dir: PathBuf,
+    volume: RepositoryId,
+}
+
+/// The shared re-stage state for a managed handle, or `None` on engines
+/// without remote publication (unmanaged volumes never evict to remote).
+pub(super) fn restage_context_for(
+    handle: &MirageFileHandle,
+    journal_dir: &Path,
+    volume: RepositoryId,
+) -> Option<Arc<RestageContext>> {
+    Some(Arc::new(RestageContext {
+        remote: Arc::clone(handle.remote_payloads.as_ref()?),
+        db: handle.db.clone()?,
+        dirty: Arc::clone(handle.dirty.as_ref()?),
+        payload_files: Arc::clone(&handle.payload_files),
+        disk_floor: Arc::clone(&handle.disk_floor),
+        floor_free_cache: Arc::clone(&handle.floor_free_cache),
+        journal_dir: journal_dir.to_path_buf(),
+        volume,
+    }))
+}
+
 /// Re-stages an evicted published payload: fetch and verify the whole remote
 /// object, write it back to the journal atomically, revive the physical
 /// extent in one writer transaction, and re-add its bytes to the dirty
 /// ledger — only when the dirty budget and the disk floor admit it.
+/// `cancel`, when set, aborts the fetch between frame batches.
 /// Callers fall back to the transient frame fetch on any error.
 pub(super) fn restage_evicted_payload(
-    handle: &MirageFileHandle,
-    journal_dir: &Path,
+    ctx: &RestageContext,
     payload_id: &[u8; 16],
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), MirageError> {
-    let (Some(remote), Some(db), Some(dirty)) =
-        (&handle.remote_payloads, &handle.db, &handle.dirty)
-    else {
-        return Err(MirageError::backend_unavailable(
-            "restage needs publication state",
-        ));
-    };
-    let Some(volume) = handle
-        .index
-        .as_ref()
-        .map(|index| index.header().repository_id)
-    else {
-        return Err(MirageError::internal_invariant("restage without a volume"));
-    };
     // Dedupes concurrent cold reads of the same payload.
-    let _slot = remote
+    let _slot = ctx
+        .remote
         .begin_restage(payload_id)
         .ok_or_else(|| MirageError::repository_conflict("payload restage already in flight"))?;
-    let Some(whole) = remote.fetch_whole(db, volume, payload_id)? else {
+    // Cheap pre-check: a ledger already at its budget can never admit the
+    // payload, so skip the fetch rather than download and then refuse. The
+    // serialized check below still governs the admission itself.
+    if ctx.dirty.used.load(Ordering::Acquire) >= ctx.dirty.budget_bytes {
+        return Err(MirageError::repository_conflict("dirty budget full"));
+    }
+    let Some(whole) = ctx
+        .remote
+        .fetch_whole(&ctx.db, ctx.volume, payload_id, cancel)?
+    else {
         return Err(MirageError::backend_unavailable("no publication record"));
     };
     let bytes = whole.bytes;
     let length = bytes.len() as u64;
     // The ledger mutex serializes the budget check with the byte add.
-    let _serialize = dirty
+    let _serialize = ctx
+        .dirty
         .mutex
         .lock()
         .map_err(|_| MirageError::internal_invariant("dirty ledger lock poisoned"))?;
-    if dirty.used.load(Ordering::Acquire).saturating_add(length) > dirty.budget_bytes {
+    if ctx
+        .dirty
+        .used
+        .load(Ordering::Acquire)
+        .saturating_add(length)
+        > ctx.dirty.budget_bytes
+    {
         return Err(MirageError::repository_conflict("dirty budget full"));
     }
-    let floor = handle.disk_floor.load(Ordering::Acquire);
+    let floor = ctx.disk_floor.load(Ordering::Acquire);
     if floor > 0 {
-        let free = floor_free_space(&handle.floor_free_cache, journal_dir, false)
+        let free = floor_free_space(&ctx.floor_free_cache, &ctx.journal_dir, false)
             .ok_or_else(|| MirageError::backend_unavailable("free space probe failed"))?;
         if free.saturating_sub(length) < floor {
             return Err(MirageError::repository_conflict("disk floor would breach"));
         }
     }
-    let journal = mirage_engine::journal::LocalJournal::new(db.clone(), volume);
+    let journal = mirage_engine::journal::LocalJournal::new(ctx.db.clone(), ctx.volume);
     // A cached read handle to a delete-pending name would block recreation.
-    handles::invalidate_payload_file(&handle.payload_files, payload_id);
-    let staged = journal.stage_payload_as(journal_dir, &bytes, *payload_id)?;
-    db.writer().physical_revive_extent(
+    handles::invalidate_payload_file(&ctx.payload_files, payload_id);
+    let staged = journal.stage_payload_as(&ctx.journal_dir, &bytes, *payload_id)?;
+    ctx.db.writer().physical_revive_extent(
         *payload_id,
-        dirty.file_id,
-        dirty.next_slot.fetch_add(1, Ordering::AcqRel),
+        ctx.dirty.file_id,
+        ctx.dirty.next_slot.fetch_add(1, Ordering::AcqRel),
         i64::try_from(staged.bytes).unwrap_or(i64::MAX),
         mirage_types::PageHash::from_bytes(staged.checksum),
         staged.checksum,
         now_ns_i64(),
     )?;
-    dirty.used.fetch_add(length, Ordering::AcqRel);
+    ctx.dirty.used.fetch_add(length, Ordering::AcqRel);
     // Force the next floor probe to see the re-staged bytes.
-    if let Ok(mut cache) = handle.floor_free_cache.lock() {
+    if let Ok(mut cache) = ctx.floor_free_cache.lock() {
         cache.0 = std::time::Instant::now() - std::time::Duration::from_secs(2);
     }
     Ok(())
+}
+
+/// How many evicted payloads ahead of a cold read to pre-stage: sequential
+/// readers (video playback, file copies) walk payloads in extent order, so
+/// two stays a step ahead of the reader without outrunning the budget.
+const RESTAGE_LOOKAHEAD: usize = 2;
+
+/// Queues a best-effort background re-stage for `payload_id` plus the
+/// inode's next evicted payloads in extent order (sequential-read
+/// lookahead). Scheduling failures are silent — a later read reschedules;
+/// task failures are logged by the task itself.
+pub(super) fn schedule_restage_with_lookahead(
+    handle: &MirageFileHandle,
+    ctx: &Arc<RestageContext>,
+    pool: &Arc<crate::publisher::RestagePool>,
+    payload_id: &[u8; 16],
+) {
+    submit_restage(ctx, pool, *payload_id);
+    // Readahead only while the ledger has headroom: below 75% used the
+    // staged bytes cannot crowd out new writes under normal pressure.
+    if ctx.dirty.used.load(Ordering::Acquire) * 4 >= ctx.dirty.budget_bytes * 3 {
+        return;
+    }
+    for next in evicted_payloads_after(handle, ctx, payload_id)
+        .into_iter()
+        .take(RESTAGE_LOOKAHEAD)
+    {
+        submit_restage(ctx, pool, next);
+    }
+}
+
+/// The inode's distinct `Dirty` payload ids after `after` in extent order,
+/// filtered to those whose `.payload` file is absent (i.e. evicted). The
+/// extent map is locked only to read the ids — never across file or
+/// network I/O.
+fn evicted_payloads_after(
+    handle: &MirageFileHandle,
+    ctx: &RestageContext,
+    after: &[u8; 16],
+) -> Vec<[u8; 16]> {
+    let Some(inode) = handle.inode else {
+        return Vec::new();
+    };
+    let candidates: Vec<[u8; 16]> = {
+        let Ok(maps) = handle.extents.lock() else {
+            return Vec::new();
+        };
+        let Some(map) = maps.get(&inode) else {
+            return Vec::new();
+        };
+        let Ok(slices) = map.read(0, map.file_size()) else {
+            return Vec::new();
+        };
+        let mut past = false;
+        let mut ids = Vec::new();
+        for slice in slices {
+            let mirage_engine::extent_map::ExtentSlice::Dirty { payload_id, .. } = slice else {
+                continue;
+            };
+            if !past {
+                past = payload_id == *after;
+                continue;
+            }
+            if !ids.contains(&payload_id) {
+                ids.push(payload_id);
+            }
+        }
+        ids
+    };
+    candidates
+        .into_iter()
+        .filter(|payload_id| !ctx.journal_dir.join(payload_file_name(payload_id)).exists())
+        .collect()
+}
+
+/// `<hex>.payload` — the journal file name a payload id stages to.
+fn payload_file_name(payload_id: &[u8; 16]) -> String {
+    let mut name = String::with_capacity(40);
+    for byte in payload_id {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name.push_str(".payload");
+    name
+}
+
+fn submit_restage(
+    ctx: &Arc<RestageContext>,
+    pool: &Arc<crate::publisher::RestagePool>,
+    payload_id: [u8; 16],
+) {
+    let ctx = Arc::clone(ctx);
+    pool.submit(payload_id, move |cancel| {
+        if let Err(error) = restage_evicted_payload(&ctx, &payload_id, Some(cancel)) {
+            eprintln!("background restage of payload {payload_id:02x?} failed: {error}");
+        }
+    });
 }

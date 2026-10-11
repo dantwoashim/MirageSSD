@@ -3,7 +3,7 @@
 use super::mutation::managed_path_components;
 use super::write::extent_map_for;
 use super::write::handle_journal_dir;
-use super::write::restage_evicted_payload;
+use super::write::{restage_context_for, schedule_restage_with_lookahead};
 use super::*;
 
 /// # Safety
@@ -191,6 +191,7 @@ pub unsafe extern "C" fn mirage_lookup(
                             .map(|provider| provider.prefetch()),
                         publisher: engine.publisher.clone(),
                         remote_payloads: engine.remote_payloads.clone(),
+                        restage_pool: engine.restage_pool.clone(),
                         disk_floor: engine.disk_floor.clone(),
                         floor_free_cache: engine.floor_free_cache.clone(),
                         pins: Arc::clone(&engine.pins),
@@ -257,6 +258,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         .map(|provider| provider.prefetch()),
                     publisher: engine.publisher.clone(),
                     remote_payloads: engine.remote_payloads.clone(),
+                    restage_pool: engine.restage_pool.clone(),
                     disk_floor: engine.disk_floor.clone(),
                     floor_free_cache: engine.floor_free_cache.clone(),
                     pins: Arc::clone(&engine.pins),
@@ -1149,28 +1151,13 @@ unsafe fn read_via_extents(
                 let destination = unsafe { std::slice::from_raw_parts_mut(output.add(dst), len) };
                 match read_payload_slice(handle, &path, &payload_id, payload_offset, destination) {
                     Ok(()) => {}
-                    // An evicted payload is remote-only: first try to re-stage
-                    // the whole file (budget/floor permitting) so subsequent
-                    // reads are local; otherwise fetch just the needed frames.
-                    // No publication row means genuinely unavailable — never
-                    // zeros.
+                    // An evicted payload is remote-only: serve the requested
+                    // bytes straight from the remote frames (parallel fetch —
+                    // first byte waits on this slice only), then re-stage the
+                    // whole payload in the background so later reads are
+                    // local. No publication row means genuinely unavailable —
+                    // never zeros.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        let restaged = {
-                            let _restage = trace::Scope::new(trace::Slot::ReadRestage);
-                            restage_evicted_payload(handle, journal_dir, &payload_id)
-                        };
-                        if restaged.is_ok()
-                            && read_payload_slice(
-                                handle,
-                                &path,
-                                &payload_id,
-                                payload_offset,
-                                destination,
-                            )
-                            .is_ok()
-                        {
-                            continue;
-                        }
                         let (Some(remote), Some(db)) = (&handle.remote_payloads, &handle.db) else {
                             return MirageStatus::IoError;
                         };
@@ -1188,6 +1175,20 @@ unsafe fn read_via_extents(
                         match remote_read {
                             Ok(Some(bytes)) => {
                                 destination.copy_from_slice(&bytes);
+                                // Best-effort: bounded pool, deduped, budget-
+                                // and floor-admitted inside the task itself.
+                                let _restage = trace::Scope::new(trace::Slot::ReadRestage);
+                                if let Some(pool) = &handle.restage_pool
+                                    && let Some(ctx) =
+                                        restage_context_for(handle, journal_dir, volume)
+                                {
+                                    schedule_restage_with_lookahead(
+                                        handle,
+                                        &ctx,
+                                        pool,
+                                        &payload_id,
+                                    );
+                                }
                             }
                             Ok(None) => return MirageStatus::IoError,
                             Err(fetch) => {

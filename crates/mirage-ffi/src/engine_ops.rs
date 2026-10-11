@@ -114,6 +114,9 @@ pub unsafe extern "C" fn mirage_engine_destroy(handle: *mut MirageEngineHandle) 
                 // durable before the handle is freed.
                 let _ = db.durability_barrier();
             }
+            if let Some(pool) = &engine.restage_pool {
+                pool.shutdown();
+            }
             if let Some(publisher) = &engine.publisher {
                 publisher.stop();
                 let stats = engine_publication_stats(engine.as_ref());
