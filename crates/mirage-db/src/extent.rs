@@ -493,6 +493,98 @@ pub fn compact_volume(
     Ok(dead)
 }
 
+/// Delete/replace finalization for an inode the namespace already removed:
+/// drops its byte-extent history and head — the rows are orphaned once no
+/// open handle can pin them — then marks each journal payload the inode
+/// referenced dead when no `byte_extents` row anywhere in the volume still
+/// references it. The safety rule mirrors compaction: only alive, unpinned
+/// extents of `journal_file_id` may die; a payload another inode still
+/// references stays alive and stays charged. One transaction. Returns
+/// `(payload_id, length_bytes)` per extent that transitioned to dead — the
+/// caller deletes payload files and releases budget only after this commit.
+pub fn release_inode_extents(
+    connection: &mut Connection,
+    volume_id: RepositoryId,
+    inode: InodeId,
+    journal_file_id: [u8; 16],
+    now_ns: i64,
+) -> Result<Vec<([u8; 16], i64)>, MirageError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|e| sqlite(e, "failed to begin inode extent release"))?;
+    let candidates: std::collections::BTreeSet<Vec<u8>> = {
+        let mut statement = transaction
+            .prepare_cached(
+                "SELECT DISTINCT payload_id FROM byte_extents
+                 WHERE volume_id = ?1 AND inode = ?2 AND payload_id IS NOT NULL",
+            )
+            .map_err(|e| sqlite(e, "deleted-inode payload scan prepare failed"))?;
+        let rows = statement
+            .query_map(
+                params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|e| sqlite(e, "deleted-inode payload scan failed"))?;
+        rows.collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|e| sqlite(e, "deleted-inode payload row decode failed"))?
+    };
+    transaction
+        .prepare_cached("DELETE FROM byte_extents WHERE volume_id = ?1 AND inode = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                volume_id.as_bytes().as_slice(),
+                inode.as_bytes().as_slice()
+            ])
+        })
+        .map_err(|e| sqlite(e, "deleted-inode extent drop failed"))?;
+    transaction
+        .prepare_cached("DELETE FROM byte_extent_heads WHERE volume_id = ?1 AND inode = ?2")
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                volume_id.as_bytes().as_slice(),
+                inode.as_bytes().as_slice()
+            ])
+        })
+        .map_err(|e| sqlite(e, "deleted-inode extent head drop failed"))?;
+    let mut dead = Vec::new();
+    for payload_id in candidates {
+        // Alive unpinned extents only, and never while another inode's rows
+        // still reference the payload — identical to compaction's rule.
+        let changed = transaction
+            .prepare_cached(
+                "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
+                 WHERE file_id = ?2 AND extent_id = ?3 AND state = 'alive' AND pin_count = 0
+                   AND NOT EXISTS (SELECT 1 FROM byte_extents
+                                   WHERE volume_id = ?4 AND payload_id = ?3)",
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
+                    now_ns,
+                    journal_file_id.as_slice(),
+                    payload_id.as_slice(),
+                    volume_id.as_bytes().as_slice()
+                ])
+            })
+            .map_err(|e| sqlite(e, "deleted-inode extent dead mark failed"))?;
+        if changed == 1 {
+            let length: i64 = transaction
+                .prepare_cached("SELECT length_bytes FROM physical_extents WHERE extent_id = ?1")
+                .and_then(|mut stmt| stmt.query_row([payload_id.as_slice()], |row| row.get(0)))
+                .map_err(|e| sqlite(e, "dead extent length lookup failed"))?;
+            dead.push((
+                payload_id
+                    .try_into()
+                    .map_err(|_| MirageError::integrity_mismatch("payload id length"))?,
+                length,
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|e| sqlite(e, "inode extent release commit failed"))?;
+    Ok(dead)
+}
+
 /// Drops versions strictly older than `keep_from` once no snapshot pins them.
 pub fn drop_versions_before(
     connection: &mut Connection,

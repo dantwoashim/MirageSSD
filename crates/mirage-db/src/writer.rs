@@ -181,6 +181,16 @@ enum Command {
     /// unreferenced journal payload extents dead; returns `(payload_id,
     /// length_bytes)` for each extent that transitioned.
     ExtentCompactVolume(RepositoryId, [u8; 16], i64, Reply<Vec<([u8; 16], i64)>>),
+    /// Delete/replace finalization: drop the removed inode's extent history
+    /// and mark its now-unreferenced journal payloads dead; returns
+    /// `(payload_id, length_bytes)` for each extent that transitioned.
+    PhysicalReleaseUnreferenced(
+        RepositoryId,
+        InodeId,
+        [u8; 16],
+        i64,
+        Reply<Vec<([u8; 16], i64)>>,
+    ),
     /// Records one payload's remote publication; fails when the payload is
     /// no longer referenced by any byte extent.
     PayloadPublished(crate::payload_remote::PayloadRemoteObject, Reply<()>),
@@ -851,6 +861,24 @@ impl DbWriter {
                                 crate::extent::compact_volume(
                                     &mut connection,
                                     volume_id,
+                                    file_id,
+                                    now,
+                                ),
+                            );
+                        }
+                        Command::PhysicalReleaseUnreferenced(
+                            volume_id,
+                            inode,
+                            file_id,
+                            now,
+                            reply,
+                        ) => {
+                            respond(
+                                reply,
+                                crate::extent::release_inode_extents(
+                                    &mut connection,
+                                    volume_id,
+                                    inode,
                                     file_id,
                                     now,
                                 ),
@@ -1629,6 +1657,23 @@ impl DbWriter {
     ) -> Result<Vec<([u8; 16], i64)>, MirageError> {
         self.request(|reply| {
             Command::ExtentCompactVolume(volume_id, journal_file_id, now_ns, reply)
+        })
+    }
+
+    /// Delete/replace finalization: drops the removed inode's byte-extent
+    /// history and marks its now-unreferenced journal payloads dead in one
+    /// transaction. Returns `(payload_id, length_bytes)` per transitioned
+    /// extent; the caller deletes payload files and frees dirty budget only
+    /// after this commit is durable.
+    pub fn physical_release_unreferenced(
+        &self,
+        volume_id: RepositoryId,
+        inode: InodeId,
+        journal_file_id: [u8; 16],
+        now_ns: i64,
+    ) -> Result<Vec<([u8; 16], i64)>, MirageError> {
+        self.request(|reply| {
+            Command::PhysicalReleaseUnreferenced(volume_id, inode, journal_file_id, now_ns, reply)
         })
     }
 

@@ -11,9 +11,10 @@ use mirage_ffi::mirage_engine_set_disk_floor;
 use mirage_ffi::{
     MirageEngineHandle, MirageFileHandle, MiragePublicationStats, MirageStatus,
     mirage_engine_create_managed_local_provider, mirage_engine_destroy,
-    mirage_engine_evict_published, mirage_engine_mark_mounted, mirage_engine_publication_stats,
-    mirage_engine_set_drive_token, mirage_flush, mirage_lookup, mirage_namespace_create,
-    mirage_read, mirage_write,
+    mirage_engine_dirty_used_for_tests, mirage_engine_evict_published, mirage_engine_mark_mounted,
+    mirage_engine_publication_stats, mirage_engine_set_drive_token, mirage_file_close,
+    mirage_flush, mirage_lookup, mirage_namespace_create, mirage_namespace_delete,
+    mirage_namespace_rename, mirage_read, mirage_write,
 };
 use mirage_manifest::FileClass;
 use mirage_pack::{ImportPlan, PlannedFile, import_local};
@@ -544,6 +545,186 @@ fn dead_extents_leave_the_unpublished_scan() {
             .all(|pending| pending.payload_id != payload_id),
         "dead-extent payload must leave the unpublished scan"
     );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+fn managed_unpublished(
+    index: &Path,
+    state_root: &Path,
+    provider_root: &Path,
+) -> *mut MirageEngineHandle {
+    // No drive token: the publisher waits for installation, so sealed
+    // payloads stay unpublished forever.
+    let index16: Vec<u16> = index.to_string_lossy().encode_utf16().collect();
+    let root16: Vec<u16> = state_root.to_string_lossy().encode_utf16().collect();
+    let provider16: Vec<u16> = provider_root.to_string_lossy().encode_utf16().collect();
+    let mut engine: *mut MirageEngineHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            mirage_engine_create_managed_local_provider(
+                index16.as_ptr(),
+                index16.len(),
+                root16.as_ptr(),
+                root16.len(),
+                std::ptr::null(),
+                0,
+                BUDGET,
+                provider16.as_ptr(),
+                provider16.len(),
+                &mut engine,
+            )
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(
+        unsafe { mirage_engine_mark_mounted(engine) },
+        MirageStatus::Ok
+    );
+    engine
+}
+
+fn dirty_used(engine: *mut MirageEngineHandle) -> u64 {
+    unsafe { mirage_engine_dirty_used_for_tests(engine) }
+}
+
+fn delete(engine: *mut MirageEngineHandle, path: &str) -> MirageStatus {
+    let path16 = utf16(path);
+    unsafe { mirage_namespace_delete(engine, path16.as_ptr(), path16.len()) }
+}
+
+fn rename(engine: *mut MirageEngineHandle, from: &str, to: &str) -> MirageStatus {
+    let from16 = utf16(from);
+    let to16 = utf16(to);
+    unsafe {
+        mirage_namespace_rename(
+            engine,
+            from16.as_ptr(),
+            from16.len(),
+            to16.as_ptr(),
+            to16.len(),
+        )
+    }
+}
+
+fn open_existing(engine: *mut MirageEngineHandle, path: &str) -> *mut MirageFileHandle {
+    let path16 = utf16(path);
+    let mut file: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path16.as_ptr(), path16.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    assert!(!file.is_null());
+    file
+}
+
+#[test]
+fn delete_releases_unpublished_payload_bytes_and_files_immediately() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_unpublished(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    create_write(engine, "doomed.bin", &vec![0x5E; 512 * 1024]);
+    let before = dirty_used(engine);
+    assert!(before > 0, "sealed payload charged the dirty budget");
+    assert_eq!(payload_names(&journal).len(), 1, "one staged payload");
+
+    assert_eq!(delete(engine, "doomed.bin"), MirageStatus::Ok);
+    assert!(
+        dirty_used(engine) < before,
+        "delete must free dirty budget: {before} -> {}",
+        dirty_used(engine)
+    );
+    assert!(
+        payload_names(&journal).is_empty(),
+        "unreferenced payload file must be deleted"
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn delete_releases_published_payload_bytes_and_files_immediately() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    create_write(engine, "doomed.bin", &vec![0x42; 512 * 1024]);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    let before = dirty_used(engine);
+    assert!(before > 0);
+    assert_eq!(payload_names(&journal).len(), 1);
+
+    assert_eq!(delete(engine, "doomed.bin"), MirageStatus::Ok);
+    assert!(
+        dirty_used(engine) < before,
+        "published payloads release too: {before} -> {}",
+        dirty_used(engine)
+    );
+    assert!(payload_names(&journal).is_empty());
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn delete_pending_file_releases_only_at_last_close() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_unpublished(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    create_write(engine, "held.bin", &vec![0x33; 512 * 1024]);
+    let held = open_existing(engine, "held.bin");
+    let before = dirty_used(engine);
+    assert!(before > 0);
+
+    // An open handle makes the delete pending: bytes stay charged and the
+    // payload file stays on disk while the tombstone is readable.
+    assert_eq!(delete(engine, "held.bin"), MirageStatus::Ok);
+    assert_eq!(
+        dirty_used(engine),
+        before,
+        "delete-pending must not release early"
+    );
+    assert_eq!(payload_names(&journal).len(), 1);
+
+    assert_eq!(unsafe { mirage_file_close(held) }, MirageStatus::Ok);
+    assert!(
+        dirty_used(engine) < before,
+        "last close must finalize the release: {before} -> {}",
+        dirty_used(engine)
+    );
+    assert!(payload_names(&journal).is_empty());
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn rename_replace_releases_the_victims_payloads() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_unpublished(&index, state.path(), objects.path());
+    let journal = state.path().join("journal");
+
+    create_write(engine, "victim.bin", &vec![0x66; 256 * 1024]);
+    create_write(engine, "new.bin", &vec![0x77; 256 * 1024]);
+    let before = dirty_used(engine);
+    assert!(before > 0);
+    assert_eq!(payload_names(&journal).len(), 2);
+
+    assert_eq!(rename(engine, "new.bin", "victim.bin"), MirageStatus::Ok);
+    assert!(
+        dirty_used(engine) < before,
+        "victim payloads must release: {before} -> {}",
+        dirty_used(engine)
+    );
+    assert_eq!(
+        payload_names(&journal).len(),
+        1,
+        "only the renamed source's payload remains"
+    );
+    // The rename itself is intact: reading the target returns new bytes.
+    let (status, bytes) = read_path(engine, "victim.bin", 8);
+    assert_eq!(status, MirageStatus::Ok);
+    assert_eq!(bytes, vec![0x77; 8]);
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
 

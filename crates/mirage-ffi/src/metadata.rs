@@ -323,18 +323,40 @@ pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> Mir
                 let volume = index.header().repository_id;
                 // Finalize by inode identity: the open-time path may be stale
                 // after a rename, and a delete-without-read never populated it.
-                if let Ok(Some((parent, name))) = db.namespace_entry(volume, inode) {
-                    let now = now_ns_i64();
-                    let _finalize = trace::Scope::new(trace::Slot::CloseDeleteFinalize);
-                    if db.namespace_delete(volume, parent, &name, now).is_ok() {
-                        let _ = journal_namespace_operation(
-                            db,
-                            volume,
-                            mirage_db::OperationKind::Delete,
-                            name.as_bytes().to_vec(),
-                            now,
-                        );
+                let finalized = match db.namespace_entry(volume, inode) {
+                    Ok(None) => true, // already unlinked by the delete-pending request
+                    Ok(Some((parent, name))) => {
+                        let now = now_ns_i64();
+                        let _finalize = trace::Scope::new(trace::Slot::CloseDeleteFinalize);
+                        if db.namespace_delete(volume, parent, &name, now).is_ok() {
+                            let _ = journal_namespace_operation(
+                                db,
+                                volume,
+                                mirage_db::OperationKind::Delete,
+                                name.as_bytes().to_vec(),
+                                now,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     }
+                    Err(_) => false,
+                };
+                // Last close of a finalized tombstone: no handle can read the
+                // inode again, so its sealed payloads release under
+                // compaction's rule instead of pinning the dirty budget until
+                // quiesce. A failed finalize keeps the extents — the file is
+                // still visible.
+                if finalized && let Some(dirty) = &file.dirty {
+                    super::mutation::release_deleted_inode_payloads(
+                        db,
+                        dirty,
+                        &file.payload_files,
+                        &crate::write::handle_journal_dir(&file),
+                        volume,
+                        inode,
+                    );
                 }
             }
         }

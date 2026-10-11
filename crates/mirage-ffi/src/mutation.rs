@@ -264,12 +264,15 @@ pub unsafe extern "C" fn mirage_namespace_rename(
             Ok(source) => source,
             Err(_) => return MirageStatus::IoError,
         };
+        let mut victim_inode = None;
         match db.namespace_lookup(volume, to_parent, &to_name) {
-            Ok(Some(victim))
-                if Some(victim.inode) != source.map(|entry| entry.inode)
-                    && engine.handles.is_open(victim.inode) =>
-            {
-                return MirageStatus::Conflict;
+            Ok(Some(victim)) => {
+                if Some(victim.inode) != source.map(|entry| entry.inode) {
+                    if engine.handles.is_open(victim.inode) {
+                        return MirageStatus::Conflict;
+                    }
+                    victim_inode = Some(victim.inode);
+                }
             }
             Ok(_) => {}
             Err(_) => return MirageStatus::IoError,
@@ -295,7 +298,24 @@ pub unsafe extern "C" fn mirage_namespace_rename(
                 created_ns: now,
             },
         ) {
-            Ok(()) => MirageStatus::Ok,
+            Ok(()) => {
+                // Rename-over-existing leaves the victim's payloads
+                // unreferenced: release them now under compaction's rule so
+                // the dirty budget is not pinned until quiesce.
+                if let Some(victim) = victim_inode
+                    && let Some(dirty) = &engine.dirty
+                {
+                    release_deleted_inode_payloads(
+                        db,
+                        dirty,
+                        &engine.payload_files,
+                        &crate::write::engine_journal_dir(engine),
+                        volume,
+                        victim,
+                    );
+                }
+                MirageStatus::Ok
+            }
             Err(error) => mutation_status(&error),
         }
     })
@@ -346,11 +366,11 @@ pub unsafe extern "C" fn mirage_namespace_delete(
         // Delete-pending semantics: the name unlinks now (the open-handle
         // tombstone keeps identity for existing readers), and the last close
         // finalizes — re-issuing the delete is then a harmless no-op.
-        match engine.handles.request_delete(inode) {
-            Ok(mirage_engine::handles::DeleteDisposition::Pending)
-            | Ok(mirage_engine::handles::DeleteDisposition::Removed) => {}
+        let pending = match engine.handles.request_delete(inode) {
+            Ok(mirage_engine::handles::DeleteDisposition::Pending) => true,
+            Ok(mirage_engine::handles::DeleteDisposition::Removed) => false,
             Err(_) => return MirageStatus::AccessDenied,
-        }
+        };
         let parent = match resolve_parent(db, volume, &parent_path) {
             Ok(inode) => inode,
             Err(status) => return status,
@@ -373,10 +393,75 @@ pub unsafe extern "C" fn mirage_namespace_delete(
                 created_ns: now,
             },
         ) {
-            Ok(()) => MirageStatus::Ok,
+            Ok(()) => {
+                // Delete-pending releases at last close; an unopened file's
+                // sealed payloads free immediately under compaction's rule.
+                if !pending && let Some(dirty) = &engine.dirty {
+                    release_deleted_inode_payloads(
+                        db,
+                        dirty,
+                        &engine.payload_files,
+                        &crate::write::engine_journal_dir(engine),
+                        volume,
+                        inode,
+                    );
+                }
+                MirageStatus::Ok
+            }
             Err(error) => mutation_status(&error),
         }
     })
+}
+
+/// Releases journal payloads orphaned by an inode's removal (delete
+/// finalize, an unopened delete, or a closed rename victim): the dead marks
+/// run under compaction's safety rule in one transaction, then payload
+/// files are dropped and the dirty budget freed — only after the demotion
+/// commit is durable. Callers must run this only when no open handle can
+/// still read the inode.
+pub(crate) fn release_deleted_inode_payloads(
+    db: &mirage_db::Database,
+    dirty: &handles::DirtyLedger,
+    payload_files: &std::sync::Mutex<handles::PayloadFileCache>,
+    journal_dir: &Path,
+    volume: RepositoryId,
+    inode: InodeId,
+) {
+    let dead =
+        match db
+            .writer()
+            .physical_release_unreferenced(volume, inode, dirty.file_id, now_ns_i64())
+        {
+            Ok(dead) => dead,
+            Err(error) => {
+                eprintln!("payload release for deleted inode {inode:?} failed: {error}");
+                return;
+            }
+        };
+    if dead.is_empty() {
+        return;
+    }
+    // Irreversible file deletes need the demotion durable first: a crash
+    // between file delete and commit must not resurrect unreferenced bytes.
+    if db.durability_barrier().is_err() {
+        eprintln!("payload release for deleted inode {inode:?}: barrier failed");
+        return;
+    }
+    for (payload_id, length_bytes) in dead {
+        let mut name = String::with_capacity(40);
+        for byte in payload_id {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        name.push_str(".payload");
+        crate::handles::invalidate_payload_file(payload_files, &payload_id);
+        let _ = std::fs::remove_file(journal_dir.join(name));
+        let length = u64::try_from(length_bytes).unwrap_or(0);
+        let _ = dirty
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(length))
+            });
+    }
 }
 
 fn mutation_status(error: &MirageError) -> MirageStatus {
