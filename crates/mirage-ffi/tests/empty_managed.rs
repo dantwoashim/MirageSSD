@@ -178,6 +178,85 @@ fn empty_managed_volume_accepts_writes_and_lists_the_root() {
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
 
+/// Regression: WinFsp pages a directory with the *display* name of the last
+/// entry as the marker, but the managed namespace pages on folded names.
+/// A raw mixed-case marker sorts below every lowercase folded key, so the
+/// same first page came back forever and listings truncated after one page.
+#[test]
+fn enumerate_pages_past_first_page_with_display_name_markers() {
+    let (_source, objects, index) = empty_index();
+    let state = provisioned_state();
+    let engine = managed_local(&index, state.path(), objects.path());
+
+    let mut expected: Vec<String> = vec!["apple.txt".to_owned(), "Zed.txt".to_owned()];
+    for i in 0..64 {
+        expected.push(format!("Cs_Quest_{i:04}_Girl.usm"));
+    }
+    for name in &expected {
+        let path16 = utf16(name);
+        assert_eq!(
+            unsafe { mirage_namespace_create(engine, path16.as_ptr(), path16.len(), 0) },
+            MirageStatus::Ok
+        );
+    }
+
+    let mut root: *mut MirageFileHandle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, std::ptr::null(), 0, &mut root) },
+        MirageStatus::Ok
+    );
+
+    unsafe extern "C" fn collect(
+        context: *mut core::ffi::c_void,
+        name: *const u16,
+        name_len: usize,
+        _info: MirageFileInfo,
+    ) -> u8 {
+        let names = unsafe { &mut *(context as *mut Vec<String>) };
+        names.push(String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(name, name_len)
+        }));
+        1
+    }
+
+    // Page exactly like WinFsp: small limit, display-name marker.
+    let mut seen: Vec<String> = Vec::new();
+    let mut marker: Option<Vec<u16>> = None;
+    for _ in 0..expected.len() {
+        let mut page: Vec<String> = Vec::new();
+        let (ptr, len) = marker
+            .as_deref()
+            .map_or((std::ptr::null(), 0), |m| (m.as_ptr(), m.len()));
+        assert_eq!(
+            unsafe {
+                mirage_enumerate(
+                    root,
+                    ptr,
+                    len,
+                    8,
+                    &mut page as *mut Vec<String> as *mut core::ffi::c_void,
+                    Some(collect),
+                )
+            },
+            MirageStatus::Ok
+        );
+        if page.is_empty() {
+            break;
+        }
+        marker = Some(page.last().expect("nonempty page").encode_utf16().collect());
+        seen.extend(page);
+        if seen.len() > expected.len() {
+            break;
+        }
+    }
+
+    let mut want = expected;
+    want.sort_by_key(|name| name.to_lowercase());
+    assert_eq!(seen, want, "every entry exactly once, in folded order");
+    unsafe { mirage_ffi::mirage_file_close(root) };
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
 #[test]
 fn rename_over_an_open_file_fails_with_conflict() {
     let (_source, objects, index) = empty_index();

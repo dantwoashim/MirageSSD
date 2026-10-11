@@ -182,11 +182,18 @@ pub unsafe extern "C" fn mirage_enumerate(
             let Some(volume) = volume else {
                 return MirageStatus::IntegrityFailure;
             };
-            let children = match db.namespace_list_children(volume, inode, marker.as_deref(), limit)
-            {
-                Ok(children) => children,
-                Err(_) => return MirageStatus::IoError,
-            };
+            // WinFsp's marker is the display name of the last entry it saw,
+            // but the namespace pages on folded names — a raw mixed-case
+            // marker sorts below every folded key, so the same page would be
+            // re-returned forever. Fold the marker to compare like with like.
+            let folded_marker = marker
+                .as_deref()
+                .map(|name| mirage_types::fold_name(name).unwrap_or_else(|_| name.to_lowercase()));
+            let children =
+                match db.namespace_list_children(volume, inode, folded_marker.as_deref(), limit) {
+                    Ok(children) => children,
+                    Err(_) => return MirageStatus::IoError,
+                };
             let live_maps = handle.extents.lock().ok();
             for child in children {
                 let name = child.display_name.encode_utf16().collect::<Vec<_>>();
