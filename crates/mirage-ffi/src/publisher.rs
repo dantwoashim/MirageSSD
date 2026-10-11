@@ -28,11 +28,53 @@ pub const PAYLOAD_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 /// round trips (dedup lookup, session start, upload, metadata + readback
 /// verify), so small payloads are latency-bound and need many in flight.
 pub const PUBLISH_PARALLELISM: usize = 16;
-/// Plaintext bytes in flight per batch. Home uplinks are ~1-10 MB/s: with
-/// 256 MiB in flight each request's share of the link pushed uploads and
+/// Floor of the adaptive in-flight byte budget for a publish batch; also
+/// its starting value. Home uplinks are ~1-10 MB/s: with several hundred
+/// MiB in flight each request's share of the link pushed uploads and
 /// readbacks past the 5-minute transport timeout, and the resulting errors
-/// backed the whole publisher off. 64 MiB keeps every request well inside it.
+/// backed the whole publisher off. On a slow link the sizer stays at
+/// 64 MiB, keeping every request well inside that timeout.
 pub const PUBLISH_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling of the adaptive batch budget. Each in-flight upload buffers one
+/// chunk, so this also bounds upload memory next to a running game.
+const PUBLISH_BATCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Batch duration the sizer steers toward: at ~45 s per batch the 5-minute
+/// transport-timeout rationale above still holds.
+const BATCH_TARGET: Duration = Duration::from_secs(45);
+
+/// Adaptive in-flight byte budget for publish batches. Starts at
+/// PUBLISH_BATCH_BYTES — the previous fixed cap, which is right for slow
+/// uplinks — and grows toward PUBLISH_BATCH_MAX_BYTES when the measured
+/// batch rate would fill a larger batch inside BATCH_TARGET. Growth is at
+/// most 2x the current cap per batch; a backend failure resets the cap to
+/// the floor alongside the publisher's back-off.
+struct BatchSizer {
+    cap: u64,
+}
+
+impl BatchSizer {
+    fn new() -> Self {
+        Self {
+            cap: PUBLISH_BATCH_BYTES,
+        }
+    }
+
+    fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// Adapts the cap from one successful batch's observed plaintext rate.
+    fn record_success(&mut self, bytes: u64, elapsed: Duration) {
+        let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+        let target = (rate * BATCH_TARGET.as_secs_f64()) as u64;
+        let target = target.clamp(PUBLISH_BATCH_BYTES, PUBLISH_BATCH_MAX_BYTES);
+        self.cap = target.min(self.cap.saturating_mul(2));
+    }
+
+    fn record_failure(&mut self) {
+        self.cap = PUBLISH_BATCH_BYTES;
+    }
+}
 
 /// Largest plaintext payload that may join a pack — bigger payloads publish
 /// as their own remote object exactly as before.
@@ -96,23 +138,34 @@ fn publish_units(pending: &[UnpublishedPayload]) -> Vec<PublishUnit<'_>> {
     units
 }
 
+/// One batch starting at `start`: at most PUBLISH_PARALLELISM units and
+/// `cap` total member plaintext (a single larger unit still forms its own
+/// batch). Returns the end cursor.
+fn next_batch(units: &[PublishUnit<'_>], start: usize, cap: u64) -> usize {
+    let mut end = start;
+    let mut bytes = 0_u64;
+    while end < units.len() && end - start < PUBLISH_PARALLELISM {
+        let next = unit_bytes(&units[end]);
+        if end > start && bytes.saturating_add(next) > cap {
+            break;
+        }
+        bytes = bytes.saturating_add(next);
+        end += 1;
+    }
+    end
+}
+
 /// Splits the unit list into batches of at most PUBLISH_PARALLELISM units
-/// and PUBLISH_BATCH_BYTES total member plaintext (a single larger unit
-/// still forms its own batch).
-fn publish_batches<'a>(units: &'a [PublishUnit<'a>]) -> Vec<&'a [PublishUnit<'a>]> {
+/// and `cap` total member plaintext (a single larger unit still forms its
+/// own batch). The publisher loop batches incrementally through next_batch
+/// so each batch uses the sizer's current cap; this whole-list split backs
+/// the batching tests.
+#[cfg(test)]
+fn publish_batches<'a>(units: &'a [PublishUnit<'a>], cap: u64) -> Vec<&'a [PublishUnit<'a>]> {
     let mut batches = Vec::new();
     let mut start = 0;
     while start < units.len() {
-        let mut end = start;
-        let mut bytes = 0_u64;
-        while end < units.len() && end - start < PUBLISH_PARALLELISM {
-            let next = unit_bytes(&units[end]);
-            if end > start && bytes.saturating_add(next) > PUBLISH_BATCH_BYTES {
-                break;
-            }
-            bytes = bytes.saturating_add(next);
-            end += 1;
-        }
+        let end = next_batch(units, start, cap);
         batches.push(&units[start..end]);
         start = end;
     }
@@ -335,6 +388,7 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
         stats,
     } = ctx;
     let mut backoff = Duration::from_millis(0);
+    let mut sizer = BatchSizer::new();
     loop {
         // Wait for work: wake flag, 5 s poll, or stop.
         if let Ok(mut flag) = wake.0.lock() {
@@ -389,12 +443,20 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
         // turning the drain bandwidth-bound instead of round-trip-bound.
         // The durable record still goes through the single writer channel;
         // a backend failure anywhere in a batch ends the pass and backs off.
+        // The in-flight budget adapts to the measured link rate: batches are
+        // carved off a cursor so each one uses the budget current when it
+        // starts.
         let units = publish_units(&pending);
         let mut any_error = false;
-        for batch in publish_batches(&units) {
+        let mut cursor = 0;
+        while cursor < units.len() {
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            let end = next_batch(&units, cursor, sizer.cap());
+            let batch = &units[cursor..end];
+            let batch_bytes = batch.iter().map(unit_bytes).fold(0u64, u64::saturating_add);
+            let started = Instant::now();
             let results: Vec<Result<(), PublishFailure>> = std::thread::scope(|scope| {
                 let workers: Vec<_> = batch
                     .iter()
@@ -413,9 +475,12 @@ fn publisher_loop(ctx: &PublisherCtx, wake: Arc<(Mutex<bool>, Condvar)>, stop: A
                 .iter()
                 .any(|result| matches!(result, Err(PublishFailure::Backend)))
             {
+                sizer.record_failure();
                 any_error = true;
                 break;
             }
+            sizer.record_success(batch_bytes, started.elapsed());
+            cursor = end;
         }
         backoff = if any_error {
             (backoff * 2)
@@ -1115,18 +1180,26 @@ mod batch_tests {
 
     #[test]
     fn batches_bound_count_and_bytes() {
+        // The previous fixed cap is today's floor: the MIN-cap behaviour must
+        // be identical to before.
         let small: Vec<_> = (0..40).map(|_| payload(1 << 20)).collect();
         let units: Vec<_> = small.iter().map(unit).collect();
-        let sizes: Vec<usize> = publish_batches(&units).iter().map(|b| b.len()).collect();
+        let sizes: Vec<usize> = publish_batches(&units, PUBLISH_BATCH_BYTES)
+            .iter()
+            .map(|b| b.len())
+            .collect();
         assert_eq!(sizes, vec![16, 16, 8]);
         let large: Vec<_> = (0..20).map(|_| payload(32 << 20)).collect();
         let units: Vec<_> = large.iter().map(unit).collect();
-        let sizes: Vec<usize> = publish_batches(&units).iter().map(|b| b.len()).collect();
+        let sizes: Vec<usize> = publish_batches(&units, PUBLISH_BATCH_BYTES)
+            .iter()
+            .map(|b| b.len())
+            .collect();
         assert_eq!(sizes, vec![2; 10]);
         let huge = [payload(1 << 30)];
         let units: Vec<_> = huge.iter().map(unit).collect();
         assert_eq!(
-            publish_batches(&units).len(),
+            publish_batches(&units, PUBLISH_BATCH_BYTES).len(),
             1,
             "an oversized payload still publishes"
         );
@@ -1136,5 +1209,52 @@ mod batch_tests {
             members: members.iter().collect(),
         };
         assert_eq!(unit_bytes(&packed), 64 << 20);
+    }
+
+    #[test]
+    fn batch_sizer_holds_min_on_slow_link_grows_2x_to_max_and_resets() {
+        let mut sizer = BatchSizer::new();
+        assert_eq!(sizer.cap(), PUBLISH_BATCH_BYTES);
+        // A slow link: 64 MiB in 45 s lands exactly on the target, so the
+        // cap never leaves the floor.
+        for _ in 0..8 {
+            sizer.record_success(PUBLISH_BATCH_BYTES, BATCH_TARGET);
+        }
+        assert_eq!(sizer.cap(), PUBLISH_BATCH_BYTES);
+        // A fast link: the target saturates at MAX but growth is 2x a step.
+        let mut expected = PUBLISH_BATCH_BYTES;
+        for _ in 0..5 {
+            sizer.record_success(PUBLISH_BATCH_BYTES, Duration::from_secs(1));
+            expected = expected.saturating_mul(2).min(PUBLISH_BATCH_MAX_BYTES);
+            assert_eq!(sizer.cap(), expected);
+        }
+        assert_eq!(sizer.cap(), PUBLISH_BATCH_MAX_BYTES);
+        sizer.record_failure();
+        assert_eq!(sizer.cap(), PUBLISH_BATCH_BYTES);
+    }
+
+    #[test]
+    fn dynamic_batching_respects_unit_and_byte_caps() {
+        // Parallelism still bounds units per batch whatever the byte cap.
+        let small: Vec<_> = (0..17).map(|_| payload(1 << 20)).collect();
+        let units: Vec<_> = small.iter().map(unit).collect();
+        let sizes: Vec<usize> = publish_batches(&units, PUBLISH_BATCH_MAX_BYTES)
+            .iter()
+            .map(|b| b.len())
+            .collect();
+        assert_eq!(sizes, vec![16, 1]);
+        // A grown cap batches more bytes: 32 MiB units go 3-up under 96 MiB
+        // where the floor paired them.
+        let large: Vec<_> = (0..8).map(|_| payload(32 << 20)).collect();
+        let units: Vec<_> = large.iter().map(unit).collect();
+        let sizes: Vec<usize> = publish_batches(&units, 96 << 20)
+            .iter()
+            .map(|b| b.len())
+            .collect();
+        assert_eq!(sizes, vec![3, 3, 2]);
+        // Oversized units still form their own batch at any cap.
+        let huge = [payload(1 << 30)];
+        let units: Vec<_> = huge.iter().map(unit).collect();
+        assert_eq!(next_batch(&units, 0, PUBLISH_BATCH_BYTES), 1);
     }
 }
