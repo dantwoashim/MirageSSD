@@ -1,0 +1,208 @@
+{
+  "Captured": "2026-10-12T20:10:20.0617763+05:45",
+  "Before": {
+    "label": "verify-before",
+    "captured_unix": 1791814769.3477325,
+    "samples": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/12/27651978.blk",
+        "size": 31974113,
+        "seconds": 2.1000866999966092,
+        "mib_per_second": 14.51982451868317,
+        "md5_matches": true,
+        "cdn_bytes": 31964049,
+        "origin_bytes": 32036552,
+        "errors_delta": 0
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16681240.blk",
+        "size": 32829414,
+        "seconds": 1.0237086999986786,
+        "mib_per_second": 30.583474531874337,
+        "md5_matches": true,
+        "cdn_bytes": 32423716,
+        "origin_bytes": 32895186,
+        "errors_delta": 0
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16658894.blk",
+        "size": 32455254,
+        "seconds": 1.0057664999912959,
+        "mib_per_second": 30.774282273777338,
+        "md5_matches": true,
+        "cdn_bytes": 32456388,
+        "origin_bytes": 32519602,
+        "errors_delta": 0
+      }
+    ],
+    "scope": "Three complete uncached assets, 1 MiB application reads; MD5 and length checked. Different assets across runs; network and in-memory chunk overlap can vary."
+  },
+  "After": {
+    "label": "verify-after",
+    "captured_unix": 1791814853.7818038,
+    "samples": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16612435.blk",
+        "size": 33399461,
+        "seconds": 1.4298592999984976,
+        "mib_per_second": 22.276463241904764,
+        "md5_matches": true,
+        "cdn_bytes": 32745462,
+        "origin_bytes": 33461840,
+        "errors_delta": 0
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16604216.blk",
+        "size": 36403779,
+        "seconds": 0.9581999000074575,
+        "mib_per_second": 36.23184374383571,
+        "md5_matches": true,
+        "cdn_bytes": 34668029,
+        "origin_bytes": 36468108,
+        "errors_delta": 0
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16592613.blk",
+        "size": 37743615,
+        "seconds": 6.223128199999337,
+        "mib_per_second": 5.78408721096723,
+        "md5_matches": true,
+        "cdn_bytes": 37637602,
+        "origin_bytes": 37808388,
+        "errors_delta": 0
+      }
+    ],
+    "scope": "Three complete uncached assets, 1 MiB application reads; MD5 and length checked. Different assets across runs; network and in-memory chunk overlap can vary."
+  },
+  "Warm": {
+    "samples": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16612435.blk",
+        "size": 33399461,
+        "seconds": 0.09956170000077691,
+        "mib_per_second": 319.9243096217085,
+        "md5_matches": true
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16604216.blk",
+        "size": 36403779,
+        "seconds": 0.10460730000340845,
+        "mib_per_second": 331.88266068714125,
+        "md5_matches": true
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16592613.blk",
+        "size": 37743615,
+        "seconds": 0.11706160000176169,
+        "mib_per_second": 307.4886746233093,
+        "md5_matches": true
+      }
+    ],
+    "seconds": 0.3290134999988368,
+    "origin_bytes_delta": 262,
+    "cdn_bytes_delta": 0,
+    "errors_delta": 0
+  },
+  "Profile": {
+    "Profile": "Verify",
+    "Pid": 6236,
+    "Arguments": [
+      "--vfs-cache-mode",
+      "full",
+      "--cache-dir",
+      "<runtime>/cache",
+      "--vfs-cache-max-size",
+      "100G",
+      "--vfs-cache-min-free-space",
+      "15G",
+      "--vfs-cache-max-age",
+      "87600h",
+      "--volname",
+      "GenshinStream",
+      "--vfs-read-chunk-size",
+      "8M",
+      "--vfs-read-chunk-size-limit",
+      "8M",
+      "--vfs-read-chunk-streams",
+      "2",
+      "--buffer-size",
+      "2M",
+      "--vfs-read-ahead",
+      "16M"
+    ],
+    "Started": "2026-10-12T20:05:33.3894878+05:45"
+  },
+  "Selected": {
+    "Profile": "Verify",
+    "Selected": "2026-10-12T20:06:50.3315846+05:45"
+  },
+  "Live": {
+    "Captured": "2026-10-12T20:11:11.8730159+05:45",
+    "GameRunning": true,
+    "Seconds": 10.0775002,
+    "SourceMiBPerSecond": 31.556526812652223,
+    "CdnMiBPerSecond": 31.61085137497361,
+    "ErrorsDelta": 0,
+    "NotFoundDelta": 0,
+    "LiveGameRestartGuardPassed": true,
+    "MountPids": [
+      6236,
+      9920
+    ],
+    "Before": {
+      "requests": 28316,
+      "bytes": 26701556153,
+      "chunks_mem": 29750,
+      "chunks_seed": 0,
+      "chunks_cdn": 23057,
+      "cdn_bytes": 26451274869,
+      "errors": 0,
+      "not_found": 0,
+      "prefetched": 13640
+    },
+    "After": {
+      "requests": 28368,
+      "bytes": 27035014756,
+      "chunks_mem": 29777,
+      "chunks_seed": 0,
+      "chunks_cdn": 23337,
+      "cdn_bytes": 26785307521,
+      "errors": 0,
+      "not_found": 0,
+      "prefetched": 13640
+    }
+  },
+  "CacheReuseAndVideo": {
+    "samples": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/12/27651978.blk",
+        "size": 31974113,
+        "seconds": 1.5274922999960836,
+        "md5_matches": true,
+        "cdn_bytes_delta": 42416585
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16681240.blk",
+        "size": 32829414,
+        "seconds": 2.079001400008565,
+        "md5_matches": true,
+        "cdn_bytes_delta": 65380773
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/16658894.blk",
+        "size": 32455254,
+        "seconds": 1.215373400002136,
+        "md5_matches": true,
+        "cdn_bytes_delta": 38750565
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/VideoAssets/StandaloneWindows64/Cs_ShieldingResources_02.usm",
+        "size": 581792,
+        "seconds": 0.22326329999486916,
+        "md5_matches": true,
+        "cdn_bytes_delta": 11608246
+      }
+    ],
+    "scope": "Baseline files reread after mount restart to verify cache reuse; one full video validates the separate cache mount. Concurrent game reads, if present, affect global CDN deltas."
+  }
+}

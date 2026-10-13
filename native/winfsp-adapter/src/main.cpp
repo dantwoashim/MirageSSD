@@ -32,10 +32,12 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "mirage-fs " << MIRAGE_HOST_VERSION << "\n";
         return 0;
     }
-    if (argc != 5 && (argc < 8 || argc % 2 != 0 || argc > 26)) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache|--managed total-bytes free-bytes [--origin path] [--drive-manifest p --repository-key p]]\n  --managed: total-bytes = advertised volume size; free-bytes = dirty-payload budget unless --budget sets it separately\n  options: --origin --drive-manifest --repository-key --floor --label --budget --journal-root\n"; return 2; }
+    if (argc != 5 && (argc < 8 || argc % 2 != 0 || argc > 26)) { std::wcerr << L"usage: mirage-fs <mount-directory> <mount-index> <storage-root> <owner-sid> [--cache|--managed total-bytes free-bytes [--origin path] [--drive-manifest p --repository-key p]]\n  publisher source: mirage-fs <mount-directory> <source-config.json> <storage-root> <owner-sid> --sophon total-bytes free-bytes [--label name]\n  --managed: total-bytes = advertised volume size; free-bytes = dirty-payload budget unless --budget sets it separately\n  options: --origin --drive-manifest --repository-key --floor --label --budget --journal-root\n"; return 2; }
     const bool cache_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--cache";
     const bool managed_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--managed";
-    if (argc >= 8 && !cache_mode && !managed_mode) { std::wcerr << L"unknown storage mode\n"; return 2; }
+    const bool sophon_mode = argc >= 8 && std::wstring_view(argv[5]) == L"--sophon";
+    if (argc >= 8 && !cache_mode && !managed_mode && !sophon_mode) { std::wcerr << L"unknown storage mode\n"; return 2; }
+    if (sophon_mode && argc != 8 && argc != 10) { std::wcerr << L"--sophon accepts only --label\n"; return 2; }
     // Trailing option pairs: --origin names the committed-content source (an
     // origin pack directory for --cache, the local pack mirror for --managed);
     // --drive-manifest + --repository-key enable the on-demand Drive provider
@@ -44,6 +46,7 @@ int wmain(int argc, wchar_t** argv) {
     std::uint64_t disk_floor = 0, dirty_budget = 0;
     for (int i = 8; i < argc; i += 2) {
         const std::wstring_view flag = argv[i];
+        if (sophon_mode && flag != L"--label") { std::wcerr << L"--sophon accepts only --label\n"; return 2; }
         if (i + 1 >= argc) { std::wcerr << L"missing value for " << flag << L"\n"; return 2; }
         if (flag == L"--origin") origin = argv[i + 1];
         else if (flag == L"--drive-manifest") drive_manifest = argv[i + 1];
@@ -60,7 +63,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!std::filesystem::exists(drive_manifest) || !std::filesystem::exists(repository_key)) { std::wcerr << L"drive manifest or repository key not found\n"; return 2; }
     }
     std::uint64_t total_bytes{}; std::uint64_t free_bytes{};
-    if (cache_mode || managed_mode) {
+    if (cache_mode || managed_mode || sophon_mode) {
         if (!parse_capacity(argv[6], total_bytes) || !parse_capacity(argv[7], free_bytes) || total_bytes == 0 || free_bytes > total_bytes) { std::wcerr << L"invalid volume capacity\n"; return 2; }
     } else {
         std::error_code error; const auto space = std::filesystem::space(argv[3], error);
@@ -71,6 +74,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool drive_mount = mount.native().size() == 2 && mount.native()[1] == L':';
     if (!drive_mount && std::filesystem::exists(mount) && (!std::filesystem::is_directory(mount) || !std::filesystem::is_empty(mount))) { std::wcerr << L"mount path must be a free drive letter, absent path, or empty directory\n"; return 2; }
     mirage::FileSystemHost host; active = &host; SetConsoleCtrlHandler(stop_handler, TRUE);
+    host.set_sophon_source(sophon_mode);
     // A managed mount is the local-first writable volume: same state root
     // and cache constructor as --cache, but mutation callbacks are live.
     if (!label.empty()) host.set_volume_label(label);

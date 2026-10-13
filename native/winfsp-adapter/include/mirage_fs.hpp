@@ -45,6 +45,7 @@ public:
     // Journal payload directory on the user's chosen cache disk (--journal-root);
     // empty keeps the engine default <state-root>\journal.
     void set_journal_root(const std::wstring& root) { journal_root_ = root; }
+    void set_sophon_source(bool value) noexcept { sophon_source_ = value; }
     void begin_pending() noexcept;
     void end_pending() noexcept;
 private:
@@ -61,6 +62,7 @@ private:
     // Managed-volume mode: writable mutations and finite metadata caching.
     // Legacy cache/local mounts stay read-only with immutable-content caching.
     bool writable_{};
+    bool sophon_source_{};
     std::uint64_t volume_total_bytes_{1};
     std::uint64_t volume_free_bytes_{};
     std::uint64_t dirty_budget_{};

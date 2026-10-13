@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "scope": "Native Genshin source migration; byte/mount qualification, no gameplay qualification",
+  "manifest_exported_assets": 2572,
+  "deployed_fs_sha256": "E062B96AA96B37C07F2EE8074D41A8A7670560DB95ED4F8C99C1A60F9A4E0D50",
+  "provider": "MirageSophon",
+  "legacy_helpers_retired": 3,
+  "cache_policy": {
+    "memory_residency_bytes": 67108864,
+    "owned_disk_budget_bytes": 4294967296,
+    "free_floor_bytes": 16106127360,
+    "legacy_seed_main_gib": 69.582,
+    "legacy_seed_is_read_only": true
+  },
+  "checks": {
+    "fmt": "passed",
+    "workspace_clippy_all_targets": "passed",
+    "workspace_tests": "passed",
+    "debug_adapter_rebuilt": true,
+    "release_adapter_rebuilt": true,
+    "new_source_tests": 6,
+    "checked_startup": "passed"
+  },
+  "release_full_files": [
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/11790361.blk",
+      "bytes": 10530585,
+      "matched": true,
+      "seconds": 0.05752649999340065
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049740.blk",
+      "bytes": 36674845,
+      "matched": true,
+      "seconds": 0.13152709999121726
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049741.blk",
+      "bytes": 2464870,
+      "matched": true,
+      "seconds": 0.021841400011908263
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/VideoAssets/26236578.blk",
+      "bytes": 5488,
+      "matched": true,
+      "seconds": 0.007129100005840883
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AudioAssets/MusicGame/MGBanks0.pck",
+      "bytes": 161791,
+      "matched": true,
+      "seconds": 0.01579219999257475
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AudioAssets/Japanese/2055.pck",
+      "bytes": 3556661,
+      "matched": true,
+      "seconds": 0.027817800000775605
+    }
+  ],
+  "cold_asset": {
+    "name": "GenshinImpact_Data/StreamingAssets/VideoAssets/StandaloneWindows64/Cs_Sumeru_AQ302009_MOTM.usm",
+    "bytes": 6735616,
+    "matched": true,
+    "seconds": 1.3500987000006717
+  },
+  "post_remount_asset": {
+    "name": "GenshinImpact_Data/StreamingAssets/VideoAssets/StandaloneWindows64/Cs_Sumeru_AQ302009_MOTM.usm",
+    "bytes": 6735616,
+    "matched": true,
+    "seconds": 0.03444160000071861
+  },
+  "actual_game_junction_files": [
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/11790361.blk",
+      "bytes": 10530585,
+      "matched": true,
+      "seconds": 0.04102119998424314
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049740.blk",
+      "bytes": 36674845,
+      "matched": true,
+      "seconds": 0.10173450000002049
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049741.blk",
+      "bytes": 2464870,
+      "matched": true,
+      "seconds": 0.008574999985285103
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/VideoAssets/26236578.blk",
+      "bytes": 5488,
+      "matched": true,
+      "seconds": 0.0027015999949071556
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AudioAssets/MusicGame/MGBanks0.pck",
+      "bytes": 161791,
+      "matched": true,
+      "seconds": 0.006037799990735948
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AudioAssets/Japanese/2055.pck",
+      "bytes": 3556661,
+      "matched": true,
+      "seconds": 0.01788269999087788
+    }
+  ],
+  "post_cutover_stats": {
+    "memory_hits": 7,
+    "disk_hits": 7,
+    "seed_hits": 7,
+    "cdn_chunks": 0,
+    "cdn_bytes": 0,
+    "failures": 0,
+    "shared_waiters": 2,
+    "memory_bytes": 10387713,
+    "managed_disk_bytes": 6735616
+  },
+  "sampled_working_set_bytes": 104210432,
+  "game_launch_since_migration": "user_has_not_launched_yet",
+  "limits": [
+    "CDN-dependent cold reads",
+    "Publisher chunk granularity, no encrypted-sector proof reuse",
+    "Pinned local manifests, no automatic update integration",
+    "No service/UI source registration",
+    "Legacy seed disk bytes retained",
+    "No gameplay or all-game qualification"
+  ]
+}

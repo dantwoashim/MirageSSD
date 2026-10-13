@@ -623,3 +623,32 @@ All twenty bottlenecks have an explicit resolution path and a falsifiable accept
 | 9-10. Real-game qualification and publisher interface | External; not actionable in this repository. |
 
 The WinFsp host still serves misses from a local origin directly (`crates/mirage-ffi/src/lib.rs`, `read_span_from_origin`) and is not yet bridged to `PageProvider::get_or_fetch`; that bridge needs a DB-writer boundary decision (ADR 0006) before it can be built.
+
+### Managed payload follow-up (2026-10-13)
+
+The separate managed encrypted-payload reader now learns local 64 KiB BLAKE3
+verification catalogs from complete AEAD-verified legacy frames. Later sparse
+misses can fetch only covering ciphertext sectors, retaining verification
+knowledge independently of data. Shared immutable caches, incremental LRU
+eviction, a global demand/background miss bound, balanced frame ranges, sparse
+restage abstention, and exact pre-fetch restage reservations are implemented.
+See [the integration report](../experiments/2026-10-13-verified-sector-upgrade.md)
+and [the read contract](../specs/engine-api.md).
+
+This does not complete the general PageProvider bridge, persistent catalog
+recovery, a separate durable clean-sector arena, readiness qualification, or
+real-game gates. The encrypted representation and publication schema remain
+unchanged; catalog bootstrap still requires a full verified frame.
+
+### 2026-10-13 — Native publisher source deployed for Genshin
+
+The native read-only Sophon source now projects the real game manifests,
+verifies publisher chunks, reuses checked legacy seed bytes, shares misses and
+separately bounds local/network admission and new disk residency. Genshin's
+three asset junctions and checked startup were switched to the tested native
+mount; the rclone/Python helpers were retired. See
+[the migration evidence](../experiments/2026-10-13-native-genshin-source.md).
+
+This closes the live game's bypass of the native Mirage filesystem. It does
+not complete automatic manifest/update integration, service/UI registration,
+persistent encrypted-sector proofs, gameplay qualification or readiness gates.

@@ -1,0 +1,58 @@
+{
+  "date": "2026-10-12",
+  "startup_failure": "Missing gameplay mount and asset origin; resource-index errors and repeated initialization exceptions in the game log",
+  "helper_exit_cause": "Not captured; maintenance job lifetime is a hypothesis, not a logged cause",
+  "verified_startup_files": [
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/11790361.blk",
+      "bytes": 10530585,
+      "md5_matches_manifest": true,
+      "elapsed_s": 0.04778490000171587
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049740.blk",
+      "bytes": 36674845,
+      "md5_matches_manifest": true,
+      "elapsed_s": 2.0134715999884065
+    },
+    {
+      "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/31049741.blk",
+      "bytes": 2464870,
+      "md5_matches_manifest": true,
+      "elapsed_s": 0.016371000005165115
+    }
+  ],
+  "user_startup_registration": {
+    "PreviousGenshinStream": null,
+    "NewGenshinStream": "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"stream-root\\start-genshinstream.ps1\""
+  },
+  "active_pids": {
+    "origin.pid": 18272,
+    "rclone-main.pid": 14868,
+    "rclone-video.pid": 4052
+  },
+  "origin_stats": {
+    "counters": {
+      "requests": 1501,
+      "bytes": 37073956,
+      "chunks_mem": 55,
+      "chunks_seed": 0,
+      "chunks_cdn": 31,
+      "cdn_bytes": 31277122,
+      "errors": 0,
+      "not_found": 0,
+      "prefetched": 26
+    },
+    "lru_chunks": 31,
+    "lru_bytes": 36674845,
+    "assets": 2572,
+    "dirs": 27
+  },
+  "checked_launcher_preflight": "Passed under Windows PowerShell with CheckOnly",
+  "gameplay_or_title_screen_confirmed": false,
+  "source_sha256": {
+    "stream-root\\start-genshinstream.ps1": "2a3f4d2900afb2192d1c5d0cc2b38f43a7e11177fdd66a934d5870091ab31623",
+    "stream-root\\launch-genshin-checked.ps1": "581b673cd44692ecf48feb0c078f213f1fa358fee5917718800502373ef6e7b5",
+    "stream-root\\origin\\sophon_origin.py": "e4a92fe7f5a6f16fa189cde3015b3186ac68ffe826c828e26ee056a5466a7c92"
+  }
+}

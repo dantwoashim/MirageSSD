@@ -271,6 +271,7 @@ struct CountingBackend {
     inflight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
     /// `read_range` start offsets, for asserting how one frame is fetched.
     starts: Arc<std::sync::Mutex<Vec<u64>>>,
     delay: Duration,
@@ -280,6 +281,7 @@ struct CountingBackend {
 struct CountingMetrics {
     peak: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
     starts: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
@@ -288,6 +290,7 @@ impl CountingBackend {
         let metrics = CountingMetrics {
             peak: Arc::new(AtomicUsize::new(0)),
             calls: Arc::new(AtomicUsize::new(0)),
+            bytes: Arc::new(AtomicUsize::new(0)),
             starts: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         (
@@ -300,6 +303,7 @@ impl CountingBackend {
                 inflight: Arc::new(AtomicUsize::new(0)),
                 peak: Arc::clone(&metrics.peak),
                 calls: Arc::clone(&metrics.calls),
+                bytes: Arc::clone(&metrics.bytes),
                 starts: Arc::clone(&metrics.starts),
                 delay,
             },
@@ -322,6 +326,7 @@ impl mirage_backend::ObjectBackend for CountingBackend {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<mirage_backend::BackendRead, mirage_backend::BackendError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.bytes.fetch_add(range.len() as usize, Ordering::SeqCst);
         if let Ok(mut starts) = self.starts.lock() {
             starts.push(range.start());
         }
@@ -565,8 +570,8 @@ fn cold_read_lookahead_restages_the_next_evicted_payloads() {
     assert!(freed >= 3 * 256 * 1024);
     assert!(payload_names(&journal).is_empty());
 
-    // Reading the first payload must look ahead and re-stage the rest.
-    let (status, bytes) = read_range(engine, "stream.bin", 0, 64 * 1024);
+    // Fully consuming the first payload is dense demand and admits lookahead.
+    let (status, bytes) = read_range(engine, "stream.bin", 0, 256 * 1024);
     assert_eq!(status, MirageStatus::Ok);
     assert!(bytes.iter().all(|b| *b == 0xA0));
     wait_payload_count(&journal, 3, Duration::from_secs(20));
@@ -577,4 +582,359 @@ fn cold_read_lookahead_restages_the_next_evicted_payloads() {
         assert!(bytes.iter().all(|b| *b == chunk[0]));
     }
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn learned_proofs_make_later_sparse_misses_small_and_shared() {
+    use mirage_ffi::publisher::{RemotePayloadStore, RemoteReadBudgets};
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_with_budget(&index, state.path(), objects.path(), BUDGET);
+    let content: Vec<u8> = (0..4 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
+    create_write(engine, "sectors.bin", &content);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    let db = control_db(state.path());
+    let id = published_payload_ids(&db)[0];
+    // A deterministic packed-member fixture: preserve ciphertext and add a
+    // prefix before its provider object, recording the new immutable location.
+    let mut record = db.payload_publication(volume_id(), &id).unwrap().unwrap();
+    let encoded = std::fs::read(objects.path().join(&record.provider_object_id)).unwrap();
+    let mut packed = vec![0xA7; 8192];
+    packed.extend_from_slice(&encoded);
+    let hash = mirage_types::ContentHash::from_bytes(*blake3::hash(&packed).as_bytes());
+    let pack_backend =
+        mirage_ffi::directory_backend::DirectoryObjectBackend::new(objects.path(), volume_id())
+            .unwrap();
+    let reference = futures_executor::block_on(mirage_backend::ObjectBackend::put_immutable(
+        &pack_backend,
+        mirage_backend::ObjectKind::Payload,
+        mirage_backend::UploadSource::from_bytes(packed.into()),
+        hash,
+        tokio_util::sync::CancellationToken::new(),
+    ))
+    .unwrap();
+    record.member_offset += 8192;
+    let packed_start = record.member_offset as u64;
+    record.provider_object_id = reference.provider_object_id.as_str().to_owned();
+    record.object_length = reference.byte_length.as_u64() as i64;
+    record.object_hash = *hash.as_bytes();
+    db.writer().payload_published(record).unwrap();
+    let (backend, metrics) = CountingBackend::new(objects.path(), Duration::from_millis(30));
+    let store = Arc::new(RemotePayloadStore::with_budgets(
+        Arc::new(backend),
+        Arc::new(AtomicBool::new(true)),
+        local_publication_key(),
+        volume_id(),
+        RemoteReadBudgets {
+            frame_bytes: 0,
+            sector_bytes: 128 * 1024,
+            proof_bytes: 4096,
+        },
+    ));
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, 17, 4096)
+            .unwrap()
+            .unwrap(),
+        content[17..4113]
+    );
+    assert_eq!(
+        metrics.calls.load(Ordering::SeqCst),
+        4,
+        "a complete frame must not have a fifth envelope request"
+    );
+    assert_eq!(
+        *metrics.starts.lock().unwrap().iter().min().unwrap(),
+        packed_start
+    );
+    assert_eq!(
+        metrics.bytes.load(Ordering::SeqCst),
+        content.len() + mirage_ffi::publisher::frame_overhead() as usize
+    );
+    let usage = store.residency().unwrap();
+    assert_eq!(usage.frame_bytes, 0);
+    assert_eq!(usage.sector_bytes, 65536);
+    assert!(usage.proof_bytes <= 4096 && usage.proof_bytes > 2048);
+    assert_eq!(
+        store.read(&db, volume_id(), &id, 31, 100).unwrap().unwrap(),
+        content[31..131]
+    );
+    assert_eq!(
+        metrics.calls.load(Ordering::SeqCst),
+        4,
+        "sector hits must not fetch again"
+    );
+    let before = metrics.bytes.load(Ordering::SeqCst);
+    let offset = 2 * 1024 * 1024 + 37;
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, offset as u64, 4096)
+            .unwrap()
+            .unwrap(),
+        content[offset..offset + 4096]
+    );
+    assert_eq!(metrics.bytes.load(Ordering::SeqCst) - before, 65536);
+    assert_eq!(
+        *metrics.starts.lock().unwrap().last().unwrap(),
+        packed_start + 52 + 2 * 1024 * 1024
+    );
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, content.len() as u64, 0)
+            .unwrap()
+            .unwrap(),
+        Vec::<u8>::new()
+    );
+
+    let before = metrics.calls.load(Ordering::SeqCst);
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let (store, db, barrier, content) = (
+                Arc::clone(&store),
+                db.clone(),
+                Arc::clone(&barrier),
+                &content,
+            );
+            scope.spawn(move || {
+                barrier.wait();
+                let start = 3 * 1024 * 1024 + 11;
+                assert_eq!(
+                    store
+                        .read(&db, volume_id(), &id, start as u64, 4096)
+                        .unwrap()
+                        .unwrap(),
+                    content[start..start + 4096]
+                );
+            });
+        }
+    });
+    assert_eq!(
+        metrics.calls.load(Ordering::SeqCst) - before,
+        1,
+        "concurrent readers must share their sector miss"
+    );
+    let usage = store.residency().unwrap();
+    assert!(usage.sector_bytes <= 128 * 1024 && usage.proof_bytes <= 4096);
+    println!(
+        "verified_sparse_read: bootstrap_bytes={}, later_miss_bytes=65536, shared_readers=16, sector_residency={}, proof_residency={}",
+        content.len() + mirage_ffi::publisher::frame_overhead() as usize,
+        usage.sector_bytes,
+        usage.proof_bytes
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn learned_sector_rejects_corruption_and_allows_a_clean_retry() {
+    use mirage_ffi::publisher::{RemotePayloadStore, RemoteReadBudgets};
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_with_budget(&index, state.path(), objects.path(), BUDGET);
+    let content = vec![0x3Cu8; 4 * 1024 * 1024];
+    create_write(engine, "sector-corrupt.bin", &content);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    let db = control_db(state.path());
+    let id = published_payload_ids(&db)[0];
+    let record = db.payload_publication(volume_id(), &id).unwrap().unwrap();
+    let backend =
+        mirage_ffi::directory_backend::DirectoryObjectBackend::new(objects.path(), volume_id())
+            .unwrap();
+    let store = RemotePayloadStore::with_budgets(
+        Arc::new(backend),
+        Arc::new(AtomicBool::new(true)),
+        local_publication_key(),
+        volume_id(),
+        RemoteReadBudgets {
+            frame_bytes: 0,
+            sector_bytes: 0,
+            proof_bytes: 4096,
+        },
+    );
+    assert_eq!(
+        store.read(&db, volume_id(), &id, 0, 4096).unwrap().unwrap(),
+        content[..4096]
+    );
+    let path = objects.path().join(&record.provider_object_id);
+    let original = std::fs::read(&path).unwrap();
+    let mut damaged = original.clone();
+    let position = record.member_offset as usize + 52 + 65536 + 17;
+    damaged[position] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, 65536, 4096)
+            .unwrap_err()
+            .kind,
+        mirage_types::MirageErrorKind::IntegrityMismatch
+    );
+    std::fs::write(&path, &original).unwrap();
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, 65536, 4096)
+            .unwrap()
+            .unwrap(),
+        content[65536..69632]
+    );
+    let mut bad_tag = original.clone();
+    let tag = record.member_offset as usize
+        + content.len()
+        + mirage_ffi::publisher::frame_overhead() as usize
+        - 1;
+    bad_tag[tag] ^= 1;
+    std::fs::write(&path, bad_tag).unwrap();
+    assert_eq!(
+        store
+            .fetch_whole(&db, volume_id(), &id, None)
+            .err()
+            .expect("damaged full tag must fail")
+            .kind,
+        mirage_types::MirageErrorKind::IntegrityMismatch,
+        "whole-payload restage must still validate the full AEAD tag"
+    );
+    std::fs::write(&path, original).unwrap();
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn sparse_header_reads_do_not_restage_payloads_or_neighbors() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_with_budget(&index, state.path(), objects.path(), BUDGET);
+    let chunks: Vec<Vec<u8>> = (0..3).map(|i| vec![0x80 + i; 256 * 1024]).collect();
+    create_write_multi(engine, "headers.bin", &chunks);
+    wait_for(engine, |s| s.published_payloads >= 3);
+    assert_eq!(evict(engine, u64::MAX).0, MirageStatus::Ok);
+    let journal = state.path().join("journal");
+    assert!(payload_names(&journal).is_empty());
+    for _ in 0..3 {
+        let (status, bytes) = read_range(engine, "headers.bin", 0, 4096);
+        assert_eq!(status, MirageStatus::Ok);
+        assert_eq!(bytes, chunks[0][..4096]);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        payload_names(&journal).is_empty(),
+        "sparse reads must retain verification knowledge rather than materializing whole payloads"
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn sector_work_is_globally_bounded_and_cross_frame_reads_are_exact() {
+    use mirage_ffi::publisher::{RemotePayloadStore, RemoteReadBudgets};
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_with_budget(&index, state.path(), objects.path(), BUDGET);
+    let content: Vec<u8> = (0..6 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(13) % 251) as u8)
+        .collect();
+    create_write(engine, "bounded.bin", &content);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    let db = control_db(state.path());
+    let id = published_payload_ids(&db)[0];
+    let (backend, metrics) = CountingBackend::new(objects.path(), Duration::from_millis(30));
+    let store = Arc::new(RemotePayloadStore::with_budgets(
+        Arc::new(backend),
+        Arc::new(AtomicBool::new(true)),
+        local_publication_key(),
+        volume_id(),
+        RemoteReadBudgets {
+            frame_bytes: 0,
+            sector_bytes: 0,
+            proof_bytes: 8192,
+        },
+    ));
+    let boundary = 4 * 1024 * 1024;
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, (boundary - 8192) as u64, 16384)
+            .unwrap()
+            .unwrap(),
+        content[boundary - 8192..boundary + 8192]
+    );
+    let before = metrics.bytes.load(Ordering::SeqCst);
+    assert_eq!(
+        store
+            .read(&db, volume_id(), &id, (boundary - 31) as u64, 62)
+            .unwrap()
+            .unwrap(),
+        content[boundary - 31..boundary + 31]
+    );
+    assert_eq!(metrics.bytes.load(Ordering::SeqCst) - before, 2 * 65536);
+    metrics.peak.store(0, Ordering::SeqCst);
+    let barrier = Arc::new(std::sync::Barrier::new(24));
+    std::thread::scope(|scope| {
+        for sector in 0..24 {
+            let (store, db, barrier, content) = (
+                Arc::clone(&store),
+                db.clone(),
+                Arc::clone(&barrier),
+                &content,
+            );
+            scope.spawn(move || {
+                barrier.wait();
+                let start = sector * 65536 + 71;
+                assert_eq!(
+                    store
+                        .read(&db, volume_id(), &id, start as u64, 4096)
+                        .unwrap()
+                        .unwrap(),
+                    content[start..start + 4096]
+                );
+            });
+        }
+    });
+    assert!(
+        metrics.peak.load(Ordering::SeqCst) <= 8,
+        "independent readers exceeded the store-wide miss limit"
+    );
+    assert!(metrics.peak.load(Ordering::SeqCst) > 1);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn restage_refuses_insufficient_headroom_before_fetching_whole_payload() {
+    use mirage_ffi::publisher::{RemotePayloadStore, RemoteReadBudgets};
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state();
+    let engine = managed_with_budget(&index, state.path(), objects.path(), BUDGET);
+    let content = vec![0x61; 512 * 1024];
+    create_write(engine, "headroom.bin", &content);
+    wait_for(engine, |s| s.published_payloads >= 1);
+    assert_eq!(evict(engine, u64::MAX).0, MirageStatus::Ok);
+    let (backend, metrics) = CountingBackend::new(objects.path(), Duration::from_millis(10));
+    // Disable data/proof residency to ensure a rejected restage cannot hide
+    // an unnecessary second download behind the foreground cache.
+    let remote = Arc::new(RemotePayloadStore::with_budgets(
+        Arc::new(backend),
+        Arc::new(AtomicBool::new(true)),
+        local_publication_key(),
+        volume_id(),
+        RemoteReadBudgets {
+            frame_bytes: 0,
+            sector_bytes: 0,
+            proof_bytes: 0,
+        },
+    ));
+    let dirty = unsafe { Arc::clone((*engine).dirty.as_ref().unwrap()) };
+    unsafe {
+        (*engine).remote_payloads = Some(remote);
+    }
+    // Model another writer's reservation in this disposable ledger.
+    dirty.used.store(BUDGET - 1024, Ordering::Release);
+    let (status, bytes) = read_range(engine, "headroom.bin", 0, content.len());
+    assert_eq!(status, MirageStatus::Ok);
+    assert_eq!(bytes, content);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+    assert_eq!(
+        metrics.calls.load(Ordering::SeqCst),
+        1,
+        "restaging must reject its exact reservation before downloading again"
+    );
+    assert!(payload_names(&state.path().join("journal")).is_empty());
+    assert_eq!(dirty.used.load(Ordering::Acquire), BUDGET - 1024);
 }

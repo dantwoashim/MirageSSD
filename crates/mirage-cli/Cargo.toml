@@ -43,6 +43,7 @@ zeroize.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["http2"] }
 tempfile.workspace = true
 
 [lib]

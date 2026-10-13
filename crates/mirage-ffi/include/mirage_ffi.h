@@ -9,6 +9,8 @@ typedef struct MirageEngineHandle MirageEngineHandle;
 typedef struct MirageFileHandle MirageFileHandle;
 typedef enum MirageStatus { MIRAGE_OK=0, MIRAGE_INVALID_ARGUMENT=1, MIRAGE_NOT_FOUND=2, MIRAGE_ACCESS_DENIED=3, MIRAGE_WOULD_BLOCK=4, MIRAGE_CANCELLED=5, MIRAGE_INTEGRITY_FAILURE=6, MIRAGE_BACKEND_UNAVAILABLE=7, MIRAGE_IO_ERROR=8, MIRAGE_CONFLICT=9, MIRAGE_DISK_FULL=10, MIRAGE_INTERNAL=255 } MirageStatus;
 MirageStatus mirage_engine_create_empty(MirageEngineHandle **output);
+/* Read-only publisher chunk source, configured by pinned local manifests. */
+MirageStatus mirage_engine_create_sophon(const uint16_t *config,size_t config_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_index(const uint16_t *path,size_t path_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_local(const uint16_t *index_path,size_t index_path_len,const uint16_t *object_root,size_t object_root_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_cache(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,MirageEngineHandle **output);

@@ -598,12 +598,42 @@ pub(super) fn restage_evicted_payload(
         .remote
         .begin_restage(payload_id)
         .ok_or_else(|| MirageError::repository_conflict("payload restage already in flight"))?;
-    // Cheap pre-check: a ledger already at its budget can never admit the
-    // payload, so skip the fetch rather than download and then refuse. The
-    // serialized check below still governs the admission itself.
-    if ctx.dirty.used.load(Ordering::Acquire) >= ctx.dirty.budget_bytes {
-        return Err(MirageError::repository_conflict("dirty budget full"));
-    }
+    let length = ctx
+        .remote
+        .published_length(&ctx.db, ctx.volume, payload_id)?
+        .ok_or_else(|| MirageError::backend_unavailable("no publication record"))?;
+    // Reserve the exact known size BEFORE network work, under the same ledger
+    // lock used by writes. Failure/cancellation releases this temporary charge.
+    let mut reservation = {
+        let _serialize = ctx
+            .dirty
+            .mutex
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("dirty ledger lock poisoned"))?;
+        if ctx
+            .dirty
+            .used
+            .load(Ordering::Acquire)
+            .saturating_add(length)
+            > ctx.dirty.budget_bytes
+        {
+            return Err(MirageError::repository_conflict("dirty budget full"));
+        }
+        let floor = ctx.disk_floor.load(Ordering::Acquire);
+        if floor > 0 {
+            let free = floor_free_space(&ctx.floor_free_cache, &ctx.journal_dir, false)
+                .ok_or_else(|| MirageError::backend_unavailable("free space probe failed"))?;
+            if free.saturating_sub(length) < floor {
+                return Err(MirageError::repository_conflict("disk floor would breach"));
+            }
+        }
+        ctx.dirty.used.fetch_add(length, Ordering::AcqRel);
+        RestageReservation {
+            dirty: Arc::clone(&ctx.dirty),
+            length,
+            committed: false,
+        }
+    };
     let Some(whole) = ctx
         .remote
         .fetch_whole(&ctx.db, ctx.volume, payload_id, cancel)?
@@ -611,22 +641,17 @@ pub(super) fn restage_evicted_payload(
         return Err(MirageError::backend_unavailable("no publication record"));
     };
     let bytes = whole.bytes;
-    let length = bytes.len() as u64;
+    if bytes.len() as u64 != length {
+        return Err(MirageError::integrity_mismatch(
+            "restage length differs from reservation",
+        ));
+    }
     // The ledger mutex serializes the budget check with the byte add.
     let _serialize = ctx
         .dirty
         .mutex
         .lock()
         .map_err(|_| MirageError::internal_invariant("dirty ledger lock poisoned"))?;
-    if ctx
-        .dirty
-        .used
-        .load(Ordering::Acquire)
-        .saturating_add(length)
-        > ctx.dirty.budget_bytes
-    {
-        return Err(MirageError::repository_conflict("dirty budget full"));
-    }
     let floor = ctx.disk_floor.load(Ordering::Acquire);
     if floor > 0 {
         let free = floor_free_space(&ctx.floor_free_cache, &ctx.journal_dir, false)
@@ -648,12 +673,25 @@ pub(super) fn restage_evicted_payload(
         staged.checksum,
         now_ns_i64(),
     )?;
-    ctx.dirty.used.fetch_add(length, Ordering::AcqRel);
+    reservation.committed = true;
     // Force the next floor probe to see the re-staged bytes.
     if let Ok(mut cache) = ctx.floor_free_cache.lock() {
         cache.0 = std::time::Instant::now() - std::time::Duration::from_secs(2);
     }
     Ok(())
+}
+
+struct RestageReservation {
+    dirty: Arc<handles::DirtyLedger>,
+    length: u64,
+    committed: bool,
+}
+impl Drop for RestageReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.dirty.used.fetch_sub(self.length, Ordering::AcqRel);
+        }
+    }
 }
 
 /// How many evicted payloads ahead of a cold read to pre-stage: sequential

@@ -1,0 +1,285 @@
+{
+  "date": "2026-10-12",
+  "scope": "Live GenshinStream fixes; mounted asset probes and controlled concurrency regression; no gameplay frame-time claim",
+  "active_main_cache": {
+    "max_size_GiB": 6,
+    "minimum_free_space_GiB": 2,
+    "pid": 22744
+  },
+  "active_origin_pid": 4240,
+  "warm_preparation_policy": {
+    "workers": 2,
+    "maximum_requested_GiB": 4.5,
+    "stop_before_read_if_free_below_GiB": 3
+  },
+  "regression_before": {
+    "source": "stream-root\\run\\sophon_origin.before-lag-fix-20261012.py",
+    "prefetch_requests_admitted": 512,
+    "background_started_before_release": 4,
+    "demand_completed_while_prefetch_blocked": false,
+    "demand_wait_ms": 753.8768000085838
+  },
+  "regression_after": {
+    "source": "stream-root\\origin\\sophon_origin.py",
+    "prefetch_requests_admitted": 4,
+    "background_started_before_release": 4,
+    "demand_completed_while_prefetch_blocked": true,
+    "demand_wait_ms": 0.43169999844394624,
+    "exact_byte_range_cases": 32,
+    "immediate_callback_checked": true,
+    "canceled_prefetch_releases_admission": true
+  },
+  "mounted_probe": {
+    "captured_unix": 1791803044.5744085,
+    "read_size": 65536,
+    "samples": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/07062888.blk",
+        "offset": 19033549,
+        "sha256": "50b0d3533aa365f5c3bf06ccb8133f83a756ddba7716508b1301e41c79af9fba",
+        "observations": [
+          {
+            "iteration": 0,
+            "open_and_read_ms": 240.5191999860108,
+            "origin_requests_delta": 4,
+            "cdn_chunks_delta": 2
+          },
+          {
+            "iteration": 1,
+            "open_and_read_ms": 7.683799994993024,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 2,
+            "open_and_read_ms": 6.088099995395169,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 3,
+            "open_and_read_ms": 6.155600000056438,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 4,
+            "open_and_read_ms": 6.511400002636947,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 5,
+            "open_and_read_ms": 7.330500011448748,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          }
+        ],
+        "warm_median_ms": 6.511400002636947
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/00480430.blk",
+        "offset": 28450103,
+        "sha256": "4b8a46d5150e792ff420dd2a2ee95942d5a79c765f4b971ec7771f29859641d7",
+        "observations": [
+          {
+            "iteration": 0,
+            "open_and_read_ms": 106.00220000196714,
+            "origin_requests_delta": 3,
+            "cdn_chunks_delta": 2
+          },
+          {
+            "iteration": 1,
+            "open_and_read_ms": 6.461400000262074,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 2,
+            "open_and_read_ms": 6.483999997726642,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 3,
+            "open_and_read_ms": 6.9780000048922375,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 4,
+            "open_and_read_ms": 5.69079999695532,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 5,
+            "open_and_read_ms": 7.036900002276525,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          }
+        ],
+        "warm_median_ms": 6.483999997726642
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/12602358.blk",
+        "offset": 10215086,
+        "sha256": "df9519c2f76ba887b1401bf974085b759d692b58582aaaacb5adfa51aaba6e53",
+        "observations": [
+          {
+            "iteration": 0,
+            "open_and_read_ms": 107.48229999444447,
+            "origin_requests_delta": 3,
+            "cdn_chunks_delta": 2
+          },
+          {
+            "iteration": 1,
+            "open_and_read_ms": 7.520700004533865,
+            "origin_requests_delta": 2,
+            "cdn_chunks_delta": 1
+          },
+          {
+            "iteration": 2,
+            "open_and_read_ms": 7.093299995176494,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 3,
+            "open_and_read_ms": 6.910099997185171,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 4,
+            "open_and_read_ms": 6.001899993862025,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          },
+          {
+            "iteration": 5,
+            "open_and_read_ms": 6.68430000951048,
+            "origin_requests_delta": 1,
+            "cdn_chunks_delta": 0
+          }
+        ],
+        "warm_median_ms": 6.910099997185171
+      }
+    ],
+    "origin_stats": {
+      "counters": {
+        "requests": 48,
+        "bytes": 6685262,
+        "chunks_mem": 3,
+        "chunks_seed": 0,
+        "chunks_cdn": 11,
+        "cdn_bytes": 12428773,
+        "errors": 0,
+        "not_found": 0
+      },
+      "lru_chunks": 11,
+      "lru_bytes": 12729219,
+      "assets": 2572,
+      "dirs": 27
+    },
+    "scope": "Actual game asset paths through existing junctions; open/seek/read/close included. Warm results may also benefit from Windows cache. Exact bytes compared to chunk-verified localhost origin. No game execution or frame-time claim."
+  },
+  "cache_persistence": {
+    "seconds_since_initial_probe": 114.82832169532776,
+    "reads": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/07062888.blk",
+        "open_read_close_ms": 9.127999990596436
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/00480430.blk",
+        "open_read_close_ms": 7.524000000557862
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/12602358.blk",
+        "open_read_close_ms": 8.299399996758439
+      }
+    ],
+    "cdn_chunks_delta": 0,
+    "byte_exact": true
+  },
+  "warming": {
+    "stage": "complete",
+    "planned_files": 822,
+    "planned_bytes": 4692321094,
+    "completed_files": 391,
+    "read_bytes": 3383493058,
+    "errors": [],
+    "stopped_for_disk_headroom": true,
+    "elapsed_s": 305.5210728000093,
+    "free_D_bytes": 3218743296,
+    "scope": "Cache preparation from observed origin ranges, including transport read-ahead; not an application demand trace or gameplay certification."
+  },
+  "removal": {
+    "title": "Where Winds Meet",
+    "complete": false,
+    "game_path": "removed-game-root",
+    "launcher_path": "launcher-root",
+    "installer_path": "launcher-installer",
+    "logical_bytes": 145516363188,
+    "per_file_allocated_bytes_sum": 145516363188,
+    "direct_removal_rejected_reason": "blocked by policy",
+    "official_uninstaller_result": "The operation was canceled by the user",
+    "game_root_exists": true,
+    "launcher_exists": true,
+    "installer_exists": true
+  },
+  "final_origin_stats": {
+    "counters": {
+      "requests": 6162,
+      "bytes": 5575904890,
+      "chunks_mem": 5613,
+      "chunks_seed": 0,
+      "chunks_cdn": 7533,
+      "cdn_bytes": 8293334583,
+      "errors": 0,
+      "not_found": 0,
+      "prefetched": 4308
+    },
+    "lru_chunks": 469,
+    "lru_bytes": 536297795,
+    "assets": 2572,
+    "dirs": 27
+  },
+  "source_sha256": {
+    "stream-root\\start-genshinstream.ps1": "e9a2b4bea8175cc788f628025b0f255e5f133a8868bc3249bbcfc5d886e92085",
+    "stream-root\\origin\\sophon_origin.py": "e4a92fe7f5a6f16fa189cde3015b3186ac68ffe826c828e26ee056a5466a7c92",
+    "stream-root\\run\\start-genshinstream.before-cache-fix-20261012.ps1": "72010355b9fb1d3369895b9b88ebf47b3795a319b01c045f220d0b3d72dee061",
+    "stream-root\\run\\sophon_origin.before-lag-fix-20261012.py": "1d76dead8315bd834333f7141eef339bd3a316839034be49240eefcdfcfa08d7",
+    "target\\perf\\genshin-fix-20261012\\check_origin.py": "17b8e76f828d90547b03969110b10ec2dc1092a0843ffe7f90485ae2ebe89ec6",
+    "target\\perf\\genshin-fix-20261012\\probe_mount.py": "085ef9a47c52962530ab2658969bf3edfd14991789b8728b3ad9b5d7fffb836f",
+    "target\\perf\\genshin-fix-20261012\\warm_recent.py": "9ea81388c5a72d8139a2a42bc87990c582d9862b07101da584f47ea9169faa88"
+  },
+  "raw_output_sha256": {
+    "cache-persistence.json": "c61222de0d8f78f7e015223d95027d1196ba3504da380f212714e1862f2e2ff6",
+    "mounted-after-fix.json": "4b459094ee8ba414393cc853518cab06efdb1eadc527c825d4f6daf31fa94f7a",
+    "origin-after.json": "06d0c1c106f559736c6256a83e59c92b5e77f8dd3a0bb627eabfdca61c6e6d57",
+    "origin-before.json": "8ecdb8fd289e80c953cf8157324a24ead7b28bad0700a2032a3023d09e845c5c",
+    "warm-recent.json": "f86bbb0d7ff782912aca397d812356566d83855135b38105fc82bc0bb865cb51",
+    "post-warm-check.json": "80e118a02b3902ae3a28bb27683f35cc4508fa5a28e6d2e756dfb51145847498"
+  },
+  "post_warm_check": {
+    "byte_exact": true,
+    "reads": [
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/07062888.blk",
+        "open_read_close_ms": 9.488799987593666
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/00480430.blk",
+        "open_read_close_ms": 8.00070000695996
+      },
+      {
+        "name": "GenshinImpact_Data/StreamingAssets/AssetBundles/blocks/00/12602358.blk",
+        "open_read_close_ms": 7.481599997845478
+      }
+    ],
+    "cdn_chunks_delta": 0,
+    "origin_error_delta": 0
+  }
+}

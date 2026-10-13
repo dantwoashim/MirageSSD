@@ -170,6 +170,27 @@ pub unsafe extern "C" fn mirage_enumerate(
                 Err(_) => return MirageStatus::InvalidArgument,
             }
         };
+        if let Some(source) = &handle.sophon {
+            let children = match source.children(handle.entry.index, marker.as_deref(), limit) {
+                Ok(children) => children,
+                Err(status) => return status,
+            };
+            for (name, entry) in children {
+                let name: Vec<_> = name.encode_utf16().collect();
+                let info = MirageFileInfo {
+                    stable_index: entry.index,
+                    size: entry.size,
+                    directory: u8::from(entry.directory),
+                    reserved: [0; 7],
+                    created_ns: 0,
+                    modified_ns: 0,
+                };
+                if unsafe { callback(context, name.as_ptr(), name.len(), info) } == 0 {
+                    break;
+                }
+            }
+            return MirageStatus::Ok;
+        }
         // Managed volumes enumerate the durable namespace — it covers the
         // seeded index tree plus every locally created or renamed entry.
         if handle.managed

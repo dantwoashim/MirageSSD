@@ -29,6 +29,11 @@ futures-executor.workspace=true
 futures-util.workspace=true
 tokio-util.workspace=true
 zeroize.workspace=true
+serde.workspace=true
+serde_json.workspace=true
+reqwest.workspace=true
+md-5 = "0.10.6"
+zstd = "0.13.3"
 [dev-dependencies]
 mirage-manifest.workspace=true
 mirage-cache.workspace=true

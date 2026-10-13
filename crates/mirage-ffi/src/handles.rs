@@ -303,6 +303,7 @@ pub fn invalidate_payload_file(cache: &Mutex<PayloadFileCache>, payload_id: &[u8
     }
 }
 pub struct MirageEngineHandle {
+    pub sophon: Option<Arc<crate::sophon::SophonSource>>,
     pub entries: BTreeMap<Vec<u16>, Entry>,
     pub index: Option<Arc<MountIndex>>,
     pub object_root: Option<Arc<PathBuf>>,
@@ -494,6 +495,7 @@ impl ManagedProvider {
     }
 }
 pub struct MirageFileHandle {
+    pub sophon: Option<Arc<crate::sophon::SophonSource>>,
     pub entry: Entry,
     pub index: Option<Arc<MountIndex>>,
     pub node: Option<NodeIndex>,
@@ -581,6 +583,25 @@ pub struct PrefetchState {
     /// Position in `hashes` of the last provider-served miss; -1 until the
     /// first miss so the first fetch arms readahead.
     pub last: AtomicI64,
+    /// Logical read continuity, separate from committed-page miss tracking.
+    pub remote_pattern: Mutex<(Option<u64>, u64, usize)>,
+}
+impl PrefetchState {
+    pub(crate) fn remote_sequential(&self, start: u64, length: usize) -> bool {
+        let Ok(mut pattern) = self.remote_pattern.lock() else {
+            return false;
+        };
+        let (previous_end, bytes, reads) = &mut *pattern;
+        if *previous_end == Some(start) {
+            *bytes = bytes.saturating_add(length as u64);
+            *reads = reads.saturating_add(1);
+        } else {
+            *bytes = length as u64;
+            *reads = 1;
+        }
+        *previous_end = start.checked_add(length as u64);
+        *reads >= 2 && *bytes >= 1024 * 1024
+    }
 }
 impl MirageFileHandle {
     pub fn caller_image(&self, pid: u32) -> Arc<str> {
@@ -604,6 +625,7 @@ impl MirageEngineHandle {
             index: None,
             object_root: None,
             encryption: None,
+            sophon: None,
             readers: Arc::new(Mutex::new(BTreeMap::new())),
             pages: Arc::new(Mutex::new(DecodedPageCache::bounded(128))),
             origin_flights: mirage_scheduler::FlightMap::default(),

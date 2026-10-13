@@ -5,6 +5,7 @@ use super::write::extent_map_for;
 use super::write::handle_journal_dir;
 use super::write::{restage_context_for, schedule_restage_with_lookahead};
 use super::*;
+use std::sync::Mutex;
 
 /// # Safety
 /// Pointers must be valid for their explicit lengths; output is writable and the engine outlives the call.
@@ -175,6 +176,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         node,
                         object_root: engine.object_root.clone(),
                         encryption: engine.encryption.clone(),
+                        sophon: engine.sophon.clone(),
                         readers: Arc::clone(&engine.readers),
                         pages: Arc::clone(&engine.pages),
                         origin_flights: engine.origin_flights.clone(),
@@ -198,6 +200,7 @@ pub unsafe extern "C" fn mirage_lookup(
                         prefetch_state: Arc::new(handles::PrefetchState {
                             hashes: std::sync::OnceLock::new(),
                             last: AtomicI64::new(-1),
+                            remote_pattern: Mutex::new((None, 0, 0)),
                         }),
                         logical_path: Default::default(),
                         caller_image: Default::default(),
@@ -242,6 +245,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     node: None,
                     object_root: None,
                     encryption: None,
+                    sophon: engine.sophon.clone(),
                     readers: Arc::clone(&engine.readers),
                     pages: Arc::clone(&engine.pages),
                     origin_flights: engine.origin_flights.clone(),
@@ -265,6 +269,7 @@ pub unsafe extern "C" fn mirage_lookup(
                     prefetch_state: Arc::new(handles::PrefetchState {
                         hashes: std::sync::OnceLock::new(),
                         last: AtomicI64::new(-1),
+                        remote_pattern: Mutex::new((None, 0, 0)),
                     }),
                     logical_path: Default::default(),
                     caller_image: Default::default(),
@@ -507,6 +512,16 @@ unsafe fn read_impl(
             return MirageStatus::Ok;
         }
         let handle = unsafe { &*handle };
+        if let Some(source) = &handle.sophon {
+            let output = unsafe { std::slice::from_raw_parts_mut(output, output_len) };
+            return match source.read(handle.entry.index, offset, output) {
+                Ok(count) => {
+                    unsafe { ptr::write(transferred, count) };
+                    MirageStatus::Ok
+                }
+                Err(status) => status,
+            };
+        }
         if !extent_handled && let Some(inode) = handle.inode {
             // A file with durable extent history must resolve it — failure to
             // load the map fails closed rather than falling back to the
@@ -1175,10 +1190,24 @@ unsafe fn read_via_extents(
                         match remote_read {
                             Ok(Some(bytes)) => {
                                 destination.copy_from_slice(&bytes);
-                                // Best-effort: bounded pool, deduped, budget-
-                                // and floor-admitted inside the task itself.
+                                // Sparse demand must not materialize whole
+                                // payloads and neighbors. Admit only a fully
+                                // consumed payload, a full-frame-size demand,
+                                // or sustained contiguous reads on this handle.
+                                let sequential = handle
+                                    .prefetch_state
+                                    .remote_sequential(offset + dst as u64, len);
+                                let dense = payload_offset == 0
+                                    && remote
+                                        .published_length(db, volume, &payload_id)
+                                        .ok()
+                                        .flatten()
+                                        == Some(len as u64);
                                 let _restage = trace::Scope::new(trace::Slot::ReadRestage);
-                                if let Some(pool) = &handle.restage_pool
+                                if (sequential
+                                    || dense
+                                    || len as u64 >= publisher::PAYLOAD_FRAME_BYTES)
+                                    && let Some(pool) = &handle.restage_pool
                                     && let Some(ctx) =
                                         restage_context_for(handle, journal_dir, volume)
                                 {

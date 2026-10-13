@@ -13,6 +13,7 @@ pub mod page;
 pub mod pager;
 pub mod range_plan;
 pub mod reader;
+pub mod verified_sector;
 pub mod writer;
 
 pub use encrypted_frame::{

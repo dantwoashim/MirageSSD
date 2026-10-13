@@ -1,0 +1,134 @@
+{
+  "date": "2026-10-13",
+  "scope": "Integrated managed encrypted-payload reader; installed development upgrade. No gameplay speedup or first-read elimination claim.",
+  "mechanism": {
+    "legacy_bootstrap_bytes": 4194372,
+    "later_sector_miss_bytes": 65536,
+    "conditional_transfer_reduction_ratio": 64.00103759765625,
+    "shared_readers_for_one_sector_request": 16,
+    "retained_sector_bytes_in_fixture": 131072,
+    "catalog_bytes_for_4MiB_frame": 2184,
+    "default_frame_budget_bytes": 33554432,
+    "default_sector_budget_bytes": 8388608,
+    "default_proof_budget_bytes": 8388608,
+    "previous_frame_budget_bytes": 134217728,
+    "budget_reduction_percent": 62.5,
+    "budgets_exclude": "Cache bookkeeping, publication records, caller outputs and active fetch buffers",
+    "catalog_persistence": "ephemeral; bootstrapped again after remount or catalog eviction",
+    "global_miss_owners": 8,
+    "background_miss_owners": 2
+  },
+  "validation": {
+    "workspace_exit_code": 0,
+    "test_summary_lines": 207,
+    "reported_passed_sum": 686,
+    "reported_ignored_sum": 12,
+    "note": "Summary-line totals include subprocess harnesses and are not a deduplicated test-case census. Ignored live-cloud and extended endurance gates were not run.",
+    "cold_read_tests": 10,
+    "pack_verified_sector_tests": 2,
+    "ui_tests": 60,
+    "ui_build_files": [
+      "index.html",
+      "assets/mirage-ui.js",
+      "assets/mirage-ui.css"
+    ],
+    "fmt": "passed",
+    "clippy": "passed",
+    "debug_native_build": "passed",
+    "release_binaries_and_native_build": "passed"
+  },
+  "installation": {
+    "installed": true,
+    "version": "0.1.19",
+    "development_build": true,
+    "source_commit": "4402660a21b764cfaad901d6955a435231ca9ed3",
+    "package_sha256": "89B893769A96A8042B2EB677E87F4C784CDF5717B42CD9603915FE48F426523F",
+    "executables": [
+      {
+        "Name": "mirage.exe",
+        "Sha256": "D668DBEDA2A097FD1A869D48305EAC389F335C2BC1B43C09E5C1257744A1AF47"
+      },
+      {
+        "Name": "mirage-service.exe",
+        "Sha256": "6200E6C7E396A15702EFC6AA935C13430024990CA73CF656A4207B926B6B2ACB"
+      },
+      {
+        "Name": "mirage-ui.exe",
+        "Sha256": "2ACE724CC883540FD47786E2690767BAE25242AE9D99DA2B035E898C8BEED7D1"
+      },
+      {
+        "Name": "mirage-fs.exe",
+        "Sha256": "B8688FD04A67CB98F0019C4F47AF4909D4E3BE5687680AA603839A47325E257B"
+      }
+    ],
+    "configured_volume_identities_and_totals_preserved": true,
+    "game_drive_remounted": true,
+    "installer_exit_code": 3010,
+    "reboot_required": true,
+    "first_attempt_exit_code": 1638,
+    "repair_mode": "vamus"
+  },
+  "installed_probe": {
+    "samples": [
+      {
+        "asset": "Ambor_Readings.usm",
+        "offset": 0,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 3886.7447999946307,
+        "sha256": "d9d27ca8a52b4e11b473498cf7f87128c93a7269706f1a4cf49b85882c55d772"
+      },
+      {
+        "asset": "Ambor_Readings.usm",
+        "offset": 65536,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 0.8362999942619354,
+        "sha256": "35d505a2f72bca82972a1b66d5c567e18ac465d35009c034011de762394ba0d0"
+      },
+      {
+        "asset": "battlePass.usm",
+        "offset": 0,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 3603.3195000200067,
+        "sha256": "389dd698767f1e9bbb65f40c86ca1115c7e26b630f2b31cec348354ed0b871c2"
+      },
+      {
+        "asset": "battlePass.usm",
+        "offset": 65536,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 0.8841999806463718,
+        "sha256": "1b455a8a6a8e7ca4defab35bfc99d2b1f69f5a09cf2a84ae50b2a2233684d122"
+      },
+      {
+        "asset": "ChangeWeather.usm",
+        "offset": 0,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 3776.101399998879,
+        "sha256": "121893c82016e559b360154830a371df5551ddf2aed3a896c4c5b19472426373"
+      },
+      {
+        "asset": "ChangeWeather.usm",
+        "offset": 65536,
+        "bytes": 4096,
+        "matches_current_verified_origin": true,
+        "read_ms": 0.7836000004317611,
+        "sha256": "e5554a78149dc449e593b659143e74cbb5386a19ee6e7e4928ae3726ecd074d0"
+      }
+    ],
+    "scope": "Read-only installed G: smoke probe. Compares selected bytes against the chunk-verified official Sophon origin when the named archived assets exist. This is not a paired latency benchmark."
+  },
+  "source_sha256": {
+    "crates/mirage-pack/src/verified_sector.rs": "530ae0c1c638cf2278fa2fde18a475c91677cfecf31e07125cee3d2a86e08bba",
+    "crates/mirage-ffi/src/remote_cache.rs": "ed0f38dd2d33316cefe7672f283ff0b990cafd30103b5b4cb5ac29916fb5c058",
+    "crates/mirage-ffi/src/remote_read_impl.rs": "2200fb7ccf3e01fe02fc9d46031875bdf8c54d51d6cba134e6ed8fe2ec0e32fa",
+    "crates/mirage-ffi/src/publisher.rs": "1ea1b8773fff5c7aee58f0067257959028e6760484f7291989d74e39edba58b6",
+    "crates/mirage-ffi/src/read.rs": "eb510d79f9a27f60b0cbea98225b580dee56f6a6083360f38fb0b56a9e449536",
+    "crates/mirage-ffi/src/write.rs": "dac074b27052b2a485a74ca31745124cd975e8cd559a8a09b0bbd6adf00c379d",
+    "crates/mirage-ffi/src/handles.rs": "59e0026de0cfb161ec769c1edd91e96fa0925de47053b569698c659d1fbd5a6c",
+    "crates/mirage-ffi/tests/cold_read.rs": "ff3b92c4a316723f061210ae9748deb0ef2601b233d23c596c8ece05b94e4f5c"
+  }
+}

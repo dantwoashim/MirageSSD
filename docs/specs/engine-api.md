@@ -51,3 +51,64 @@ A crash loses at most the unsealed tail of an open segment: durable extent
 versions are committed from a map snapshot taken when the segment closes, so
 no durable version can ever reference an unsealed payload file. Orphan
 payload files left by a crash are swept at the next mount.
+
+## Managed payload reads and learned verification knowledge
+
+The managed WinFsp payload path uses `RemotePayloadStore` for published journal
+payloads whose local `.payload` file has been evicted. This is distinct from
+the platform-neutral `PageProvider` scheduler above.
+
+An unindexed frame is fetched completely and verified using the unchanged
+`MENCv001` AEAD decoder and its trusted publication BLAKE3 root and length.
+After verification, the reader derives a compact catalog of absolute-offset
+BLAKE3 subtree chaining values. Catalogs are local, ephemeral, bounded, and
+derived only from fully authenticated content; they do not alter publication
+metadata, ciphertext, or the on-disk database schema.
+
+After full-frame data eviction, a sparse miss with a retained catalog fetches
+only covering 64 KiB ciphertext sectors. XChaCha20 seeks past the AEAD key
+derivation block, decrypts into a private zeroized-on-failure buffer, and proves
+each selected sector to the existing trusted plaintext root. Bytes are
+released only after all requested sectors pass. This authenticates the selected
+plaintext; it does not validate unread ciphertext or the original whole-frame
+tag. Full-frame demand and whole-payload restaging retain complete AEAD checks.
+Missing catalogs fall back to full-frame verification; invalid sectors fail
+with integrity errors, without being cached or silently substituted.
+
+Data and proof keys bind payload identity, frame index, root, plaintext length,
+representation hash, and packed-member offset. Object/frame/range arithmetic is
+checked; backend replies must have the exact requested range and byte count.
+Explicit contradictory revision evidence is rejected. Publication roots remain
+the trust anchor for providers that echo rather than attest revision identity.
+
+Default cache content budgets are 32 MiB of shared full frames, 8 MiB of
+verified sectors, and 8 MiB of catalog allocations. LRU eviction is incremental;
+oversized entries are not admitted. Active readers retain immutable shared
+references outside cache locks. These budgets exclude cache bookkeeping,
+publication records, returned buffers, and active miss buffers, so they are not
+a process-RSS ceiling. A store-wide gate bounds eight simultaneous miss owners
+and at most two background owners. A full-frame owner uses at most four balanced
+backend range requests, including its envelope in those requests. Separate
+whole-frame and sector flights prevent partial coverage from masquerading as a
+complete frame. Cached single-frame reads avoid worker spawning and whole-frame
+copying. Cancellation on the existing cancelable API remains between batches;
+this does not introduce per-request deadline cancellation into the FFI API.
+
+Sparse isolated reads do not schedule whole-payload disk restaging. Restaging
+is admitted for complete-payload demand, frame-sized demand, or at least 1 MiB
+of contiguous demand across multiple reads on one open handle. A restage owner
+reserves the exact published payload length under the shared dirty-ledger lock
+before fetching. Failed/cancelled work releases the temporary reservation;
+successful placement converts it to resident accounting. Disk-floor checks
+still apply before fetching and before placement. The existing bounded
+lookahead applies only after this demand admission, and still shares the dirty
+journal budget; a separate durable clean-sector arena is not implemented.
+
+## Publisher chunk reads
+
+The native read-only `--sophon` mode projects pinned publisher manifests and
+reads through Mirage's `SophonSource`, without rclone or an HTTP helper. Its
+chunk verification, seed reuse, bounded admission and lifecycle are specified
+in [sophon-source-v1.md](sophon-source-v1.md). This is a separate source
+representation: publisher MD5 chunks do not inherit the encrypted reader's
+BLAKE3 sector proofs or readiness guarantees.

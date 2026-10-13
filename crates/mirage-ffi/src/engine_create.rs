@@ -6,6 +6,37 @@ use super::mutation::hex16_decode;
 use super::mutation::now_ns_i64;
 use super::*;
 
+/// Read-only native publisher-chunk mount with verified cache reuse.
+/// # Safety
+/// The UTF-16 configuration path and output must be valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_engine_create_sophon(
+    config: *const u16,
+    config_len: usize,
+    output: *mut *mut MirageEngineHandle,
+) -> MirageStatus {
+    contained(|| {
+        if config.is_null() || config_len == 0 || output.is_null() {
+            return MirageStatus::InvalidArgument;
+        }
+        unsafe { ptr::write(output, ptr::null_mut()) };
+        let Ok(path) =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(config, config_len) })
+        else {
+            return MirageStatus::InvalidArgument;
+        };
+        let source = match crate::sophon::SophonSource::open(Path::new(&path)) {
+            Ok(source) => Arc::new(source),
+            Err(status) => return status,
+        };
+        let mut engine = MirageEngineHandle::empty();
+        engine.entries = source.entries.clone();
+        engine.sophon = Some(source);
+        unsafe { ptr::write(output, Box::into_raw(Box::new(engine))) };
+        MirageStatus::Ok
+    })
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 /// `output` must be writable for one engine-handle pointer.
@@ -46,6 +77,7 @@ pub unsafe extern "C" fn mirage_engine_create_index(
             index: Some(Arc::new(index)),
             object_root: None,
             encryption: None,
+            sophon: None,
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             origin_flights: FlightMap::default(),
@@ -142,6 +174,7 @@ pub unsafe extern "C" fn mirage_engine_create_local(
             index: Some(Arc::new(index)),
             object_root: Some(Arc::new(root)),
             encryption,
+            sophon: None,
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             origin_flights: FlightMap::default(),
@@ -344,6 +377,7 @@ unsafe fn create_cache_impl(
             index: Some(Arc::new(index)),
             object_root,
             encryption,
+            sophon: None,
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(
                 if origin_root_len != 0 { 128 } else { 1 },
@@ -1012,6 +1046,7 @@ fn create_managed_impl(
             index: Some(Arc::new(index)),
             object_root,
             encryption,
+            sophon: None,
             readers: Arc::new(std::sync::Mutex::new(Default::default())),
             pages: Arc::new(std::sync::Mutex::new(DecodedPageCache::bounded(128))),
             origin_flights: FlightMap::default(),

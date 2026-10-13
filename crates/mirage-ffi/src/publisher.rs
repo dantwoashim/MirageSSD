@@ -12,11 +12,16 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::remote_cache::ByteLru;
 use mirage_backend::{ObjectKind, UploadSource};
 use mirage_crypto::aead::RepositoryKey;
 use mirage_db::Database;
 use mirage_db::payload_remote::UnpublishedPayload;
 use mirage_pack::encrypted_frame::{EncryptedFrameAad, encode_encrypted_frame};
+use mirage_pack::verified_sector::{
+    ENCRYPTED_FRAME_PREFIX_BYTES, FrameProofCatalog, VERIFIED_SECTOR_BYTES, decode_verified_sector,
+    learn_verified_frame,
+};
 use mirage_types::ContentHash;
 use mirage_types::{MirageError, RepositoryId};
 use tokio_util::sync::CancellationToken;
@@ -786,11 +791,14 @@ pub struct RemotePayloadStore {
     installed: Arc<AtomicBool>,
     key: Arc<RepositoryKey>,
     repository: RepositoryId,
-    /// (payload_id, frame_index) → decrypted plaintext chunk. Bounded by
-    /// bytes; evicted wholesale when the budget is exceeded (LRU precision
-    /// is not worth the bookkeeping for correctness-only data).
+    /// Shared immutable full frames for bursts and dense reads.
     frames: FrameCache,
     flights: FrameFlights,
+    sectors: Mutex<ByteLru<SectorKey, [u8]>>,
+    sector_flights: Mutex<std::collections::BTreeMap<SectorKey, Arc<FrameFlight>>>,
+    /// Verification knowledge outlives bulk-data eviction.
+    proofs: Mutex<ByteLru<FrameKey, FrameProofCatalog>>,
+    fetch_gate: FetchGate,
     /// Bounded publication-record cache: payload_id → Option<record>.
     publications: PublicationCache,
     /// Payloads currently being re-staged to disk; dedupes concurrent reads
@@ -798,8 +806,44 @@ pub struct RemotePayloadStore {
     restaging: Mutex<std::collections::BTreeSet<[u8; 16]>>,
 }
 
-type FrameCache = Mutex<(std::collections::HashMap<([u8; 16], u64), Vec<u8>>, u64)>;
-type FrameFlights = Mutex<std::collections::BTreeMap<([u8; 16], u64), Arc<FrameFlight>>>;
+#[path = "remote_read_impl.rs"]
+mod remote_read_impl;
+
+type FrameCache = Mutex<ByteLru<FrameKey, [u8]>>;
+type FrameFlights = Mutex<std::collections::BTreeMap<FrameKey, Arc<FrameFlight>>>;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct FrameKey {
+    payload: [u8; 16],
+    index: u64,
+    root: [u8; 32],
+    length: u32,
+    representation: [u8; 32],
+    member_offset: u64,
+}
+type SectorKey = (FrameKey, usize);
+
+/// Cache content/proof budgets; bookkeeping and active readers are additional.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteReadBudgets {
+    pub frame_bytes: usize,
+    pub sector_bytes: usize,
+    pub proof_bytes: usize,
+}
+impl Default for RemoteReadBudgets {
+    fn default() -> Self {
+        Self {
+            frame_bytes: 32 << 20,
+            sector_bytes: 8 << 20,
+            proof_bytes: 8 << 20,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteReadResidency {
+    pub frame_bytes: usize,
+    pub sector_bytes: usize,
+    pub proof_bytes: usize,
+}
 type PublicationCache = Mutex<
     std::collections::HashMap<
         [u8; 16],
@@ -807,7 +851,6 @@ type PublicationCache = Mutex<
     >,
 >;
 
-const FRAME_CACHE_BUDGET: u64 = 128 * 1024 * 1024;
 const PUBLICATION_CACHE_LIMIT: usize = 4096;
 /// Frames of one `read` fetched concurrently — hides a backend round trip
 /// per frame (Drive latency dominates a cold read), bounded so a burst of
@@ -824,7 +867,7 @@ const SUBRANGE_BYTES: u64 = 1024 * 1024;
 const SUBRANGE_PARALLELISM: usize = 4;
 
 struct FrameFlight {
-    done: Mutex<Option<Result<Vec<u8>, FetchFailure>>>,
+    done: Mutex<Option<Result<Arc<[u8]>, FetchFailure>>>,
     ready: Condvar,
 }
 
@@ -832,6 +875,37 @@ struct FrameFlight {
 enum FetchFailure {
     Backend,
     Integrity,
+}
+
+/// Global across readers: at most eight whole-frame or sector miss owners.
+struct FetchGate {
+    active: Mutex<(usize, usize)>,
+    ready: Condvar,
+}
+struct FetchPermit<'a>(&'a FetchGate, bool);
+impl FetchGate {
+    fn acquire(&self, speculative: bool) -> Result<FetchPermit<'_>, FetchFailure> {
+        let mut active = self.active.lock().map_err(|_| FetchFailure::Backend)?;
+        while active.0 >= FRAME_FETCH_PARALLELISM || (speculative && active.1 >= 2) {
+            active = self.ready.wait(active).map_err(|_| FetchFailure::Backend)?;
+        }
+        active.0 += 1;
+        if speculative {
+            active.1 += 1;
+        }
+        Ok(FetchPermit(self, speculative))
+    }
+}
+impl Drop for FetchPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.active.lock() {
+            active.0 -= 1;
+            if self.1 {
+                active.1 -= 1;
+            }
+            self.0.ready.notify_all();
+        }
+    }
 }
 
 impl RemotePayloadStore {
@@ -842,16 +916,75 @@ impl RemotePayloadStore {
         key: Arc<RepositoryKey>,
         repository: RepositoryId,
     ) -> Self {
+        Self::with_budgets(
+            backend,
+            installed,
+            key,
+            repository,
+            RemoteReadBudgets::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_budgets(
+        backend: Arc<dyn mirage_backend::ObjectBackend>,
+        installed: Arc<AtomicBool>,
+        key: Arc<RepositoryKey>,
+        repository: RepositoryId,
+        budgets: RemoteReadBudgets,
+    ) -> Self {
         Self {
             backend,
             installed,
             key,
             repository,
-            frames: Mutex::new((std::collections::HashMap::new(), 0)),
+            frames: Mutex::new(ByteLru::new(budgets.frame_bytes)),
             flights: Mutex::new(std::collections::BTreeMap::new()),
+            sectors: Mutex::new(ByteLru::new(budgets.sector_bytes)),
+            sector_flights: Mutex::new(std::collections::BTreeMap::new()),
+            proofs: Mutex::new(ByteLru::new(budgets.proof_bytes)),
+            fetch_gate: FetchGate {
+                active: Mutex::new((0, 0)),
+                ready: Condvar::new(),
+            },
             publications: Mutex::new(std::collections::HashMap::new()),
             restaging: Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    pub fn residency(&self) -> Result<RemoteReadResidency, MirageError> {
+        Ok(RemoteReadResidency {
+            frame_bytes: self
+                .frames
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("remote cache lock poisoned"))?
+                .used(),
+            sector_bytes: self
+                .sectors
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("remote cache lock poisoned"))?
+                .used(),
+            proof_bytes: self
+                .proofs
+                .lock()
+                .map_err(|_| MirageError::internal_invariant("remote cache lock poisoned"))?
+                .used(),
+        })
+    }
+
+    pub fn published_length(
+        &self,
+        db: &Database,
+        volume: RepositoryId,
+        payload_id: &[u8; 16],
+    ) -> Result<Option<u64>, MirageError> {
+        self.publication(db, volume, payload_id)?
+            .map(|record| {
+                u64::try_from(record.plaintext_length).map_err(|_| {
+                    MirageError::integrity_mismatch("published payload length is negative")
+                })
+            })
+            .transpose()
     }
 
     /// The publication record for a payload, cached (bounded).
@@ -874,131 +1007,6 @@ impl RemotePayloadStore {
             cache.insert(*payload_id, record.clone());
         }
         Ok(record)
-    }
-
-    /// Decrypted plaintext for one frame: cache → single-flight fetch →
-    /// verify → cache. Errors are typed, never partial.
-    fn frame(
-        &self,
-        record: &mirage_db::payload_remote::PayloadRemoteObject,
-        frame_index: u64,
-    ) -> Result<Vec<u8>, FetchFailure> {
-        let flight_key = (record.payload_id, frame_index);
-        if let Ok(guard) = self.frames.lock()
-            && let Some(hit) = guard.0.get(&flight_key)
-        {
-            return Ok(hit.clone());
-        }
-        // Single-flight: the creator fetches, others wait on the condvar.
-        let flight = {
-            let mut flights = self.flights.lock().map_err(|_| FetchFailure::Backend)?;
-            match flights.get(&flight_key) {
-                Some(existing) => Arc::clone(existing),
-                None => {
-                    let created = Arc::new(FrameFlight {
-                        done: Mutex::new(None),
-                        ready: Condvar::new(),
-                    });
-                    flights.insert(flight_key, Arc::clone(&created));
-                    drop(flights);
-                    let result = self.fetch_frame(record, frame_index);
-                    {
-                        let mut done = flight_done(&created);
-                        *done = Some(result);
-                    }
-                    created.ready.notify_all();
-                    if let Ok(mut flights) = self.flights.lock() {
-                        flights.remove(&flight_key);
-                    }
-                    return match flight_result(&created) {
-                        Some(result) => result,
-                        None => Err(FetchFailure::Backend),
-                    };
-                }
-            }
-        };
-        let mut done = flight.done.lock().map_err(|_| FetchFailure::Backend)?;
-        while done.is_none() {
-            done = flight.ready.wait(done).map_err(|_| FetchFailure::Backend)?;
-        }
-        done.clone().unwrap()
-    }
-
-    fn fetch_frame(
-        &self,
-        record: &mirage_db::payload_remote::PayloadRemoteObject,
-        frame_index: u64,
-    ) -> Result<Vec<u8>, FetchFailure> {
-        let plaintext_len = u64::try_from(record.plaintext_length).unwrap_or(0);
-        let Some((offset, length)) = payload_frame_range(plaintext_len, frame_index) else {
-            return Err(FetchFailure::Integrity);
-        };
-        // Packed payloads sit at member_offset inside the provider object;
-        // unpacked rows carry 0.
-        let member_offset =
-            u64::try_from(record.member_offset).map_err(|_| FetchFailure::Integrity)?;
-        let range = mirage_types::CheckedRange::new(member_offset + offset, length)
-            .map_err(|_| FetchFailure::Integrity)?;
-        let reference = mirage_backend::RemoteObjectRef {
-            backend_id: mirage_backend::BackendId::new("drive")
-                .map_err(|_| FetchFailure::Backend)?,
-            provider_object_id: mirage_backend::ProviderObjectId::new(
-                record.provider_object_id.clone(),
-            )
-            .map_err(|_| FetchFailure::Backend)?,
-            immutable_revision: record
-                .immutable_revision
-                .clone()
-                .and_then(|r| mirage_backend::ImmutableRevision::new(r).ok()),
-            byte_length: mirage_types::ByteCount::from_u64(
-                u64::try_from(record.object_length).unwrap_or(0),
-            ),
-            content_hash: ContentHash::from_bytes(record.object_hash),
-            kind: ObjectKind::Payload,
-        };
-        let bytes = fetch_remote_range(&self.backend, &reference, range)?;
-        if bytes.len() as u64 != length {
-            return Err(FetchFailure::Integrity);
-        }
-        let plaintext_length = usize::try_from(
-            plaintext_len
-                .saturating_sub(frame_index * PAYLOAD_FRAME_BYTES)
-                .min(PAYLOAD_FRAME_BYTES),
-        )
-        .map_err(|_| FetchFailure::Integrity)?;
-        let expected = record
-            .frame_hashes
-            .get(frame_index as usize)
-            .copied()
-            .ok_or(FetchFailure::Integrity)?;
-        let plaintext = mirage_pack::encrypted_frame::decode_encrypted_frame(
-            &self.key,
-            &bytes,
-            EncryptedFrameAad {
-                repository: self.repository,
-                pack_id: record.payload_id,
-                frame_index,
-                plaintext_hash: mirage_types::PageHash::from_bytes(expected),
-                plaintext_length: u32::try_from(plaintext_length)
-                    .map_err(|_| FetchFailure::Integrity)?,
-            },
-        )
-        .map_err(|_| FetchFailure::Integrity)?;
-        if plaintext.len() != plaintext_length {
-            return Err(FetchFailure::Integrity);
-        }
-        // Admit to the bounded frame cache.
-        if let Ok(mut guard) = self.frames.lock() {
-            let (frames, used) = &mut *guard;
-            let len = plaintext.len() as u64;
-            if *used + len > FRAME_CACHE_BUDGET {
-                frames.clear();
-                *used = 0;
-            }
-            frames.insert(flight_key_of(record, frame_index), plaintext.clone());
-            *used += len;
-        }
-        Ok(plaintext)
     }
 
     /// Reads `length` payload bytes starting at `offset`; `None` when the
@@ -1026,81 +1034,6 @@ impl RemotePayloadStore {
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<u8>>, MirageError> {
         self.read_inner(db, volume, payload_id, offset, length, Some(cancel))
-    }
-
-    fn read_inner(
-        &self,
-        db: &Database,
-        volume: RepositoryId,
-        payload_id: &[u8; 16],
-        offset: u64,
-        length: usize,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<Vec<u8>>, MirageError> {
-        if !self.installed.load(Ordering::Acquire) {
-            return Err(MirageError::backend_unavailable(
-                "payload fetch requires an installed backend credential",
-            ));
-        }
-        let Some(record) = self.publication(db, volume, payload_id)? else {
-            return Ok(None);
-        };
-        let end = offset
-            .checked_add(length as u64)
-            .ok_or_else(|| MirageError::invalid_argument("payload read range overflows"))?;
-        if end > record.plaintext_length as u64 {
-            return Err(MirageError::integrity_mismatch(
-                "payload read exceeds the published length",
-            ));
-        }
-        let first = offset / PAYLOAD_FRAME_BYTES;
-        let last = (end.saturating_sub(1)) / PAYLOAD_FRAME_BYTES;
-        let mut frames: Vec<(u64, Vec<u8>)> = Vec::with_capacity((last - first + 1) as usize);
-        let mut pending = first..=last;
-        loop {
-            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                return Err(MirageError::backend_unavailable("payload fetch cancelled"));
-            }
-            // Fetch the next window's frames concurrently; cached frames
-            // resolve inline through the same single-flight/verify path.
-            let batch: Vec<u64> = pending.by_ref().take(FRAME_FETCH_PARALLELISM).collect();
-            if batch.is_empty() {
-                break;
-            }
-            let results: Vec<Result<Vec<u8>, FetchFailure>> = std::thread::scope(|scope| {
-                let record = record.as_ref();
-                let spawned: Vec<_> = batch
-                    .iter()
-                    .map(|&frame_index| scope.spawn(move || self.frame(record, frame_index)))
-                    .collect();
-                spawned
-                    .into_iter()
-                    .map(|thread| thread.join().unwrap_or(Err(FetchFailure::Backend)))
-                    .collect()
-            });
-            for (frame_index, plaintext) in batch.iter().copied().zip(results) {
-                let plaintext = plaintext.map_err(|failure| match failure {
-                    FetchFailure::Backend => {
-                        MirageError::backend_unavailable("evicted payload fetch failed")
-                    }
-                    FetchFailure::Integrity => {
-                        MirageError::integrity_mismatch("evicted payload failed verification")
-                    }
-                })?;
-                frames.push((frame_index, plaintext));
-            }
-        }
-        // Assemble strictly from the fetched plaintexts in range order —
-        // never back through the shared cache, which may have evicted a
-        // frame of this very read when its budget cleared.
-        let mut out = Vec::with_capacity(length);
-        for (frame_index, plaintext) in frames {
-            let frame_start = frame_index * PAYLOAD_FRAME_BYTES;
-            let take_start = offset.saturating_sub(frame_start) as usize;
-            let take_end = ((end - frame_start) as usize).min(plaintext.len());
-            out.extend_from_slice(&plaintext[take_start..take_end]);
-        }
-        Ok(Some(out))
     }
 
     /// Full verified plaintext of an evicted payload plus its record, for
@@ -1310,26 +1243,6 @@ impl RestagePool {
     }
 }
 
-fn flight_key_of(
-    record: &mirage_db::payload_remote::PayloadRemoteObject,
-    frame_index: u64,
-) -> ([u8; 16], u64) {
-    (record.payload_id, frame_index)
-}
-
-fn flight_done(
-    flight: &FrameFlight,
-) -> std::sync::MutexGuard<'_, Option<Result<Vec<u8>, FetchFailure>>> {
-    flight
-        .done
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn flight_result(flight: &FrameFlight) -> Option<Result<Vec<u8>, FetchFailure>> {
-    flight.done.lock().ok().and_then(|done| done.clone())
-}
-
 /// Fetches one backend range. Ranges larger than `SUBRANGE_BYTES` are split
 /// into sub-ranges fetched `SUBRANGE_PARALLELISM` at a time so a
 /// per-connection-limited link overlaps them; parts are concatenated in
@@ -1338,15 +1251,23 @@ fn fetch_remote_range(
     backend: &Arc<dyn mirage_backend::ObjectBackend>,
     reference: &mirage_backend::RemoteObjectRef,
     range: mirage_types::CheckedRange,
+    class: mirage_backend::FetchClass,
 ) -> Result<Vec<u8>, FetchFailure> {
     if range.len() <= SUBRANGE_BYTES {
-        return fetch_remote_part(backend, reference, range);
+        return fetch_remote_part(backend, reference, range, class);
     }
+    // Balance one frame over at most four requests. A 4 MiB frame's 68-byte
+    // envelope must not become a fifth, serialized round trip.
+    let part_count = range
+        .len()
+        .div_ceil(SUBRANGE_BYTES)
+        .min(SUBRANGE_PARALLELISM as u64);
+    let part_bytes = range.len().div_ceil(part_count);
     let mut parts: Vec<mirage_types::CheckedRange> = Vec::new();
     let mut cursor = range.start();
     let end = range.start() + range.len();
     while cursor < end {
-        let length = SUBRANGE_BYTES.min(end - cursor);
+        let length = part_bytes.min(end - cursor);
         let Some(part) = mirage_types::CheckedRange::try_new(cursor, length) else {
             return Err(FetchFailure::Integrity);
         };
@@ -1367,7 +1288,9 @@ fn fetch_remote_range(
         let results: Vec<Result<Vec<u8>, FetchFailure>> = std::thread::scope(|scope| {
             let spawned: Vec<_> = batch
                 .iter()
-                .map(|part| scope.spawn(move || fetch_remote_part(backend, reference, *part)))
+                .map(|part| {
+                    scope.spawn(move || fetch_remote_part(backend, reference, *part, class))
+                })
                 .collect();
             spawned
                 .into_iter()
@@ -1390,24 +1313,41 @@ fn fetch_remote_part(
     backend: &Arc<dyn mirage_backend::ObjectBackend>,
     reference: &mirage_backend::RemoteObjectRef,
     range: mirage_types::CheckedRange,
+    class: mirage_backend::FetchClass,
 ) -> Result<Vec<u8>, FetchFailure> {
     let read = futures_executor::block_on(backend.read_range(
         reference,
         range,
-        mirage_backend::FetchClass::BlockingRead,
+        class,
         CancellationToken::new(),
     ))
     .map_err(|_| FetchFailure::Backend)?;
-    futures_executor::block_on(collect_stream(read.stream)).map_err(|_| FetchFailure::Backend)
+    if read.requested_range != range
+        || read.received_length.as_u64() != range.len()
+        || (reference.immutable_revision.is_some()
+            && read.metadata.observed_revision.is_some()
+            && reference.immutable_revision != read.metadata.observed_revision)
+    {
+        return Err(FetchFailure::Integrity);
+    }
+    futures_executor::block_on(collect_stream(read.stream, range.len()))
 }
 
 async fn collect_stream(
     mut stream: mirage_backend::BackendByteStream,
-) -> Result<Vec<u8>, mirage_backend::BackendError> {
+    expected: u64,
+) -> Result<Vec<u8>, FetchFailure> {
     use futures_util::StreamExt;
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
-        out.extend_from_slice(&chunk?);
+        let chunk = chunk.map_err(|_| FetchFailure::Backend)?;
+        if (out.len() as u64).saturating_add(chunk.len() as u64) > expected {
+            return Err(FetchFailure::Integrity);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    if out.len() as u64 != expected {
+        return Err(FetchFailure::Integrity);
     }
     Ok(out)
 }

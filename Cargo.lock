@@ -201,6 +201,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ad534f4357a5264cce5019c989cf66a4f0dc4e0d1b1d15f8aacec0ff7360273"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -630,6 +632,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -711,6 +732,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -902,6 +924,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,6 +986,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1012,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend-drive"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "base64",
@@ -1038,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend-local"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1053,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-bench-runner"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "bytes",
  "mirage-cache",
@@ -1070,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-cache"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -1082,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-cli"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1106,6 +1148,7 @@ dependencies = [
  "mirage-predictor",
  "mirage-simulator",
  "mirage-types",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1118,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-config"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "mirage-types",
  "serde",
@@ -1128,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-corpus-gen"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "bytes",
@@ -1140,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-crypto"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "argon2",
  "blake3",
@@ -1156,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-db"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
@@ -1170,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-engine"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1199,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-etw"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "bytes",
@@ -1212,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-fault-inject"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "mirage-db",
  "tempfile",
@@ -1220,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ffi"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1228,6 +1271,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "getrandom 0.3.4",
+ "md-5",
  "memmap2",
  "mirage-backend",
  "mirage-backend-drive",
@@ -1240,15 +1284,19 @@ dependencies = [
  "mirage-pack",
  "mirage-scheduler",
  "mirage-types",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio-util",
  "windows-sys 0.61.2",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
 name = "mirage-index"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "memmap2",
@@ -1264,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-integration-tests"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1288,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ipc"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "mirage-types",
  "proptest",
@@ -1299,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-manifest"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "minicbor",
@@ -1314,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-observability"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "mirage-types",
  "serde",
@@ -1324,10 +1372,11 @@ dependencies = [
 
 [[package]]
 name = "mirage-pack"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "bytes",
+ "chacha20 0.9.1",
  "crc32fast",
  "getrandom 0.3.4",
  "mirage-backend",
@@ -1339,11 +1388,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
 name = "mirage-predictor"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -1358,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-scheduler"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1380,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-service"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1415,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-simulator"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "mirage-cache",
  "mirage-predictor",
@@ -1426,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-trace-gen"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "clap",
  "mirage-predictor",
@@ -1435,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-types"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "proptest",
  "serde",
@@ -1444,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ui-host"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "futures-executor",
  "getrandom 0.3.4",
@@ -1754,6 +1804,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -2220,6 +2271,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -2789,3 +2841,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.1+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
