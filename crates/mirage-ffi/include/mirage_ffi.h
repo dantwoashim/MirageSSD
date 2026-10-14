@@ -11,6 +11,8 @@ typedef enum MirageStatus { MIRAGE_OK=0, MIRAGE_INVALID_ARGUMENT=1, MIRAGE_NOT_F
 MirageStatus mirage_engine_create_empty(MirageEngineHandle **output);
 /* Read-only publisher chunk source, configured by pinned local manifests. */
 MirageStatus mirage_engine_create_sophon(const uint16_t *config,size_t config_len,MirageEngineHandle **output);
+/* Session controller enables this only after identifying the real game. */
+MirageStatus mirage_sophon_gameplay(const MirageEngineHandle *engine,uint32_t game_pid);
 MirageStatus mirage_engine_create_index(const uint16_t *path,size_t path_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_local(const uint16_t *index_path,size_t index_path_len,const uint16_t *object_root,size_t object_root_len,MirageEngineHandle **output);
 MirageStatus mirage_engine_create_cache(const uint16_t *index_path,size_t index_path_len,const uint16_t *state_root,size_t state_root_len,MirageEngineHandle **output);

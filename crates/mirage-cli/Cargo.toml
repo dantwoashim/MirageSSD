@@ -24,6 +24,7 @@ mirage-config = { workspace = true }
 mirage-crypto.workspace = true
 mirage-db = { workspace = true }
 mirage-engine.workspace = true
+mirage-ffi.workspace = true
 mirage-index.workspace = true
 mirage-ipc.workspace = true
 mirage-manifest = { workspace = true, features = ["test-signing"] }
@@ -40,9 +41,10 @@ url.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
+md-5 = "0.10.6"
 reqwest = { workspace = true, features = ["http2"] }
 tempfile.workspace = true
 

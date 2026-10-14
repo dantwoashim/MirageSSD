@@ -514,7 +514,7 @@ unsafe fn read_impl(
         let handle = unsafe { &*handle };
         if let Some(source) = &handle.sophon {
             let output = unsafe { std::slice::from_raw_parts_mut(output, output_len) };
-            return match source.read(handle.entry.index, offset, output) {
+            return match source.read_for_process(handle.entry.index, offset, output, caller_pid) {
                 Ok(count) => {
                     unsafe { ptr::write(transferred, count) };
                     MirageStatus::Ok

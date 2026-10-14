@@ -12,6 +12,7 @@ import { CapacityView } from './views/Capacity';
 import { Dashboard } from './views/Dashboard';
 import { DrivePanel } from './views/drive/DrivePanel';
 import { HelpView } from './views/Help';
+import { Games } from './views/Games';
 import { ImportWizard } from './views/ImportWizard';
 import { SetupWizard } from './views/SetupWizard';
 import { Launch } from './views/Launch';
@@ -21,7 +22,7 @@ import { SettingsView } from './views/Settings';
 import { UninstallPreparation } from './views/UninstallPreparation';
 import { UpdateView } from './views/Update';
 
-type View = 'overview' | 'capacity' | 'launch' | 'import' | 'setup' | 'update' | 'recovery' | 'exit' | 'settings' | 'help';
+type View = 'overview' | 'games' | 'capacity' | 'launch' | 'import' | 'setup' | 'update' | 'recovery' | 'exit' | 'settings' | 'help';
 type Scoped<T> = { scope: string; value: T };
 
 const ADVANCED_VIEWS: View[] = ['capacity', 'launch', 'update', 'recovery', 'import', 'exit'];
@@ -29,7 +30,7 @@ const ADVANCED_VIEWS: View[] = ['capacity', 'launch', 'update', 'recovery', 'imp
 export function App({ client }: { client: ServiceClient }) {
   const [view, setView] = useState<View>(() => {
     const requested = new URLSearchParams(window.location.search).get('view');
-    const allowed: View[] = ['overview', 'capacity', 'launch', 'import', 'setup', 'update', 'recovery', 'exit', 'settings', 'help'];
+    const allowed: View[] = ['overview', 'games', 'capacity', 'launch', 'import', 'setup', 'update', 'recovery', 'exit', 'settings', 'help'];
     return allowed.includes(requested as View) ? (requested as View) : 'overview';
   });
   const [updateInfo, setUpdateInfo] = useState<UpdateCheck>();
@@ -66,6 +67,7 @@ export function App({ client }: { client: ServiceClient }) {
   }, [snapshot, view]);
 
   const titles: Record<View, [string, string | undefined]> = {
+    games: ['Games', 'Publisher assets, a bounded local cache, and clear storage controls.'],
     overview: ['Drives', snapshot?.repositories.length ? 'See what is on this PC and what is still uploading.' : undefined],
     settings: ['Settings', 'Account, appearance, updates, and diagnostics.'],
     help: ['Help', 'Fix common problems and find support.'],
@@ -221,7 +223,7 @@ export function App({ client }: { client: ServiceClient }) {
             </div>
           )}
 
-          {!snapshot ? connectionError ? (
+          {view === 'games' ? <Games client={client} /> : !snapshot ? connectionError ? (
             <DisconnectedState
               bridgeTokenLost={connectionError.includes('bridge token')}
               busy={refreshing}

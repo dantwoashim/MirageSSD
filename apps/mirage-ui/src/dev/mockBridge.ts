@@ -286,6 +286,8 @@ export function mockBridge(scenario: DemoScenario): LocalBridge {
           issued_unix_seconds: authenticated ? Math.floor(Date.now() / 1000) - 420 : null,
           login: loginInFlight ? 'in_flight' : 'idle',
         };
+      case '/api/game/status':
+        return { registered: false, busy: false };
       case '/api/disks':
         return {
           disks: [

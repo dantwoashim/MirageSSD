@@ -3,6 +3,7 @@ import {
   Database,
   DownloadSimple,
   Gauge,
+  GameController,
   GearSix,
   GoogleLogo,
   HardDrives,
@@ -18,6 +19,7 @@ export type ServiceState = 'running' | 'reconnecting' | 'unavailable';
 
 const primary = [
   { id: 'overview', label: 'Drives', Icon: HardDrives },
+  { id: 'games', label: 'Games', Icon: GameController },
   { id: 'settings', label: 'Settings', Icon: GearSix },
   { id: 'help', label: 'Help', Icon: Question },
 ] as const;

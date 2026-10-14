@@ -197,6 +197,190 @@ fn malformed_generation_is_refused_before_namespace_or_network() {
 }
 
 #[test]
+fn cleanup_excludes_live_owner_and_preserves_seeds_unknown_files_and_balanced_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, bytes) = fixture(root.path(), true, 0, 8192);
+    let source = SophonSource::open(&config).unwrap();
+    let owned = root.path().join("owned");
+    let a = [1; 32];
+    let b = [2; 32];
+    source
+        .disk
+        .lock()
+        .unwrap()
+        .put(a, &bytes[..4096], 0)
+        .unwrap();
+    source
+        .disk
+        .lock()
+        .unwrap()
+        .put(b, &bytes[..4096], 0)
+        .unwrap();
+    std::fs::write(owned.join("chunks-v1/user-note.txt"), b"preserve").unwrap();
+    assert!(matches!(
+        retention::cleanup(&owned, Vec::new()),
+        Err(MirageStatus::Conflict)
+    ));
+    drop(source);
+    let balanced = retention::cleanup(&owned, vec![a]).unwrap();
+    assert!(!balanced.pending);
+    assert_eq!(balanced.reclaimed_bytes, 4096);
+    assert_eq!(balanced.retained_bytes, 4096);
+    let disposable = retention::cleanup(&owned, Vec::new()).unwrap();
+    assert!(!disposable.pending);
+    assert_eq!(disposable.reclaimed_bytes, 4096);
+    assert_eq!(disposable.retained_bytes, 0);
+    assert_eq!(
+        std::fs::read(root.path().join("seeds/Data/Mixed.blk")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read(owned.join("chunks-v1/user-note.txt")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[test]
+fn pins_bound_placement_and_shrinking_reports_unmet_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let mut disk = cache::DiskCache::open(root.path(), 4096).unwrap();
+    disk.put([1; 32], &[1; 4096], 0).unwrap();
+    disk.pin([1; 32]);
+    disk.put([2; 32], &[2; 4096], 0).unwrap();
+    assert_eq!(disk.used(), 4096);
+    assert_eq!(disk.retained_bytes(), 4096);
+    assert_eq!(disk.set_budget(4095), Err(MirageStatus::DiskFull));
+}
+
+#[test]
+fn native_materialization_reuses_verified_originals_and_never_publishes_bad_whole_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, bytes) = fixture(root.path(), true, 0, 0);
+    let path = root.path().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["assets"][0]["name"] = json!("GenshinImpact.exe");
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::write(root.path().join("seeds/GenshinImpact.exe"), &bytes).unwrap();
+    let generation = publisher::Generation {
+        version: "1.2.3".into(),
+        build_id: "fixture".into(),
+        language: "en-us".into(),
+        manifests: vec![path.clone()],
+        logical_bytes: bytes.len() as u64,
+    };
+    let native = root.path().join("native");
+    let result = install::materialize_native(
+        &generation,
+        &native,
+        vec![root.path().join("seeds")],
+        &root.path().join("acquire"),
+    )
+    .unwrap();
+    assert_eq!(result.native_bytes, bytes.len() as u64);
+    assert_eq!(
+        std::fs::read(native.join("GenshinImpact.exe")).unwrap(),
+        bytes
+    );
+    assert!(native.join("config.ini").is_file());
+    manifest["assets"][0]["md5"] = json!("00000000000000000000000000000000");
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let bad = root.path().join("bad-native");
+    assert!(matches!(
+        install::materialize_native(
+            &generation,
+            &bad,
+            vec![root.path().join("seeds")],
+            &root.path().join("bad-acquire")
+        ),
+        Err(MirageStatus::IntegrityFailure)
+    ));
+    assert!(!bad.join("config.ini").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("seeds/GenshinImpact.exe")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn learning_excludes_launcher_scans_and_prepares_only_the_budgeted_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, bytes) = fixture(root.path(), true, 0, 8192);
+    let source = SophonSource::open(&config).unwrap();
+    let i = index(&source);
+    let mut out = [0; 100];
+    source.read(i, 0, &mut out).unwrap();
+    assert_eq!(source.statistics().learned_chunks, 0);
+    source.set_gameplay_learning(true).unwrap();
+    source.read(i, 0, &mut out).unwrap();
+    source.read(i, 4096, &mut out).unwrap();
+    source.set_gameplay_learning(false).unwrap();
+    assert_eq!(source.statistics().learned_chunks, 2);
+    assert_eq!(source.prepare_learned(4096).unwrap().len(), 1);
+    assert!(matches!(
+        source.prepare_learned(8193),
+        Err(MirageStatus::InvalidArgument)
+    ));
+    drop(source);
+    let source = SophonSource::open(&config).unwrap();
+    assert_eq!(source.statistics().learned_chunks, 2);
+    drop(source);
+    let path = root.path().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["chunk_url_prefix"] = json!("https://fixture.invalid/new-generation");
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let source = SophonSource::open(&config).unwrap();
+    assert_eq!(source.statistics().learned_chunks, 0);
+    assert_eq!(
+        std::fs::read(root.path().join("seeds/Data/Mixed.blk")).unwrap(),
+        bytes
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_cleanup_stays_pending_and_recovery_precedes_next_mount() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (config, _) = fixture(root.path(), true, 0, 8192);
+    let source = SophonSource::open(&config).unwrap();
+    source
+        .disk
+        .lock()
+        .unwrap()
+        .put([1; 32], &[1; 4096], 0)
+        .unwrap();
+    drop(source);
+    let owned = root.path().join("owned");
+    let chunk = std::fs::read_dir(owned.join("chunks-v1"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(chunk)
+        .unwrap();
+    let cleanup = retention::cleanup(&owned, Vec::new()).unwrap();
+    assert!(cleanup.pending);
+    assert_eq!(cleanup.reclaimed_bytes, 0);
+    assert!(matches!(
+        SophonSource::open(&config),
+        Err(MirageStatus::IoError)
+    ));
+    drop(held);
+    let source = SophonSource::open(&config).unwrap();
+    assert_eq!(source.statistics().managed_disk_bytes, 0);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(owned.join("cleanup.json")).unwrap()).unwrap();
+    assert_eq!(journal["pending"], false);
+    assert_eq!(journal["reclaimed_bytes"], 4096);
+}
+
+#[test]
 fn native_ffi_lookup_read_stat_and_enumeration_use_the_source() {
     let root = tempfile::tempdir().unwrap();
     let (config, bytes) = fixture(root.path(), true, 8192, 8192);

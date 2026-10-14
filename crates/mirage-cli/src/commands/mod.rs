@@ -14,6 +14,8 @@ pub mod diagnostics;
 mod disk;
 mod drive_gate;
 pub mod drive_live;
+#[allow(unsafe_code)]
+pub mod games;
 pub mod offload;
 mod recovery;
 mod repo_drive;
@@ -28,6 +30,11 @@ pub mod volume;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Managed publisher-native Genshin installation and session controller.
+    Game {
+        #[command(subcommand)]
+        command: games::GameCommand,
+    },
     /// Show service-owned repository, cache, backend, update, and readiness state.
     Status,
     /// Print build and schema versions.
@@ -892,6 +899,7 @@ pub enum UpdateCommand {
 
 pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
     match command {
+        Command::Game { command } => games::run(command, json),
         Command::Status => service::run(mirage_ipc::Command::Status, json),
         Command::Version => version::run(json),
         Command::Config {

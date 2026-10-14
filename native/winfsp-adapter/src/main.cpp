@@ -1,11 +1,13 @@
 #include "mirage_fs.hpp"
 #include "trace.hpp"
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string_view>
 #include <thread>
+#include <vector>
 namespace {
 namespace tr = mirage::trace;
 mirage::FileSystemHost* active{};
@@ -86,8 +88,26 @@ int wmain(int argc, wchar_t** argv) {
     if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE) {
         control = std::thread([&host] {
             std::string command;
+            std::vector<HANDLE> games;
+            const auto release_games = [&games] { for (const auto game : games) CloseHandle(game); games.clear(); };
             while (std::getline(std::cin, command)) {
-                if (command == "STOP") { host.stop(); return; }
+                if (command == "STOP") { release_games(); host.stop(); return; }
+                if (command.compare(0, 9, "GAMEPLAY ") == 0) {
+                    std::uint32_t pid{};
+                    const auto parsed = std::from_chars(command.data() + 9, command.data() + command.size(), pid);
+                    if (parsed.ec != std::errc{} || parsed.ptr != command.data() + command.size()) { std::cerr << "invalid gameplay process\n"; continue; }
+                    // The controller already verified executable and creation
+                    // identity. Retain a process handle so helper/UI failure
+                    // cannot turn launcher exit into premature unmount.
+                    if (pid != 0) {
+                        const auto game = OpenProcess(SYNCHRONIZE, FALSE, pid);
+                        if (!game) { std::cerr << "game process handle unavailable\n"; continue; }
+                        games.push_back(game);
+                    }
+                    const auto status = mirage_sophon_gameplay(host.engine(), pid);
+                    std::cout << "MIRAGE_GAMEPLAY " << static_cast<int>(status) << "\n" << std::flush;
+                    continue;
+                }
                 // TOKEN <bearer>: deliver to the provider; the token value is
                 // never echoed or logged.
                 if (command.compare(0, 6, "TOKEN ") == 0) { host.set_drive_token(command.substr(6)); continue; }
@@ -97,6 +117,15 @@ int wmain(int argc, wchar_t** argv) {
                 if (command == "PINS-RELOAD") { tr::mirage_engine_reload_pins(host.engine()); continue; }
                 if (!command.empty()) std::cerr << "ignoring unknown control command\n";
             }
+            // Broken controller pipe is a recovery event. Preserve the source
+            // through every known actual game handle, then drain normally.
+            // No observed game handle cannot prove no launch/handoff occurred.
+            // Leave an orphan source mounted for exclusive recovery rather
+            // than unmount underneath an unidentified game.
+            if (games.empty()) return;
+            for (const auto game : games) WaitForSingleObject(game, INFINITE);
+            release_games();
+            host.stop();
         });
     }
     const auto result = host.run(); active = nullptr;

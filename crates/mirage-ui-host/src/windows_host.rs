@@ -750,6 +750,35 @@ fn handle_connection(
                 false,
             )?;
         }
+        ("GET", "/api/game/status") | ("POST", "/api/game/action") => {
+            if let Err(response) = authorize(&request, origin, token) {
+                write_response(
+                    stream,
+                    403,
+                    "application/json; charset=utf-8",
+                    &response,
+                    false,
+                )?;
+                return Ok(());
+            }
+            let result = if request.method == "GET" {
+                mirage_cli::commands::games::bridge_status()
+            } else {
+                let payload: serde_json::Value = serde_json::from_slice(&request.body)?;
+                mirage_cli::commands::games::start_job(
+                    payload["operation"].as_str().unwrap_or(""),
+                    payload["spec"].clone(),
+                )
+            };
+            let body = result.unwrap_or_else(|error| serde_json::json!({"error": error.message}));
+            write_response(
+                stream,
+                200,
+                "application/json; charset=utf-8",
+                &serde_json::to_vec(&body)?,
+                false,
+            )?;
+        }
         ("POST", "/api/invoke") | ("POST", "/api/invoke-drive") => {
             let supplied_origin = request.headers.get("origin").map(String::as_str);
             let supplied_token = request.headers.get("x-mirage-token").map(String::as_str);

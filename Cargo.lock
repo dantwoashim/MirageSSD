@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend-drive"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "base64",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-backend-local"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-bench-runner"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bytes",
  "mirage-cache",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-cache"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-cli"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1133,6 +1133,7 @@ dependencies = [
  "crc32fast",
  "futures-executor",
  "getrandom 0.3.4",
+ "md-5",
  "mirage-backend",
  "mirage-backend-drive",
  "mirage-backend-local",
@@ -1141,6 +1142,7 @@ dependencies = [
  "mirage-crypto",
  "mirage-db",
  "mirage-engine",
+ "mirage-ffi",
  "mirage-index",
  "mirage-ipc",
  "mirage-manifest",
@@ -1161,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-config"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "mirage-types",
  "serde",
@@ -1171,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-corpus-gen"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "bytes",
@@ -1183,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-crypto"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "argon2",
  "blake3",
@@ -1199,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-db"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
@@ -1213,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-engine"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1242,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-etw"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "bytes",
@@ -1255,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-fault-inject"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "mirage-db",
  "tempfile",
@@ -1263,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ffi"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1296,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-index"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "memmap2",
@@ -1312,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-integration-tests"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1336,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ipc"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "mirage-types",
  "proptest",
@@ -1347,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-manifest"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "minicbor",
@@ -1362,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-observability"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "mirage-types",
  "serde",
@@ -1372,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-pack"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "bytes",
@@ -1393,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-predictor"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -1408,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-scheduler"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1430,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-service"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1465,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-simulator"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "mirage-cache",
  "mirage-predictor",
@@ -1476,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-trace-gen"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "clap",
  "mirage-predictor",
@@ -1485,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-types"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "proptest",
  "serde",
@@ -1494,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-ui-host"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "futures-executor",
  "getrandom 0.3.4",

@@ -111,6 +111,22 @@ export class ServiceClient {
 
   constructor(private readonly bridge: LocalBridge) {}
 
+  async gameStatus(): Promise<Record<string, unknown>> {
+    if (!this.bridge.apiGet) throw new Error('Game management requires the desktop app.');
+    const result = await this.bridge.apiGet('/api/game/status');
+    if (!record(result)) throw new Error('Invalid game status response.');
+    if (typeof result.error === 'string' && result.registered === undefined) throw new Error(result.error);
+    return result;
+  }
+
+  async gameAction(operation: string, spec?: unknown): Promise<void> {
+    if (!this.bridge.apiPost) throw new Error('Game management requires the desktop app.');
+    const result = await this.bridge.apiPost('/api/game/action', { operation, spec });
+    if (!record(result)) throw new Error('Invalid game action response.');
+    if (typeof result.error === 'string') throw new Error(result.error);
+    if (result.started !== true) throw new Error('The game operation did not start.');
+  }
+
   async snapshot(): Promise<ServiceSnapshot> {
     const value = await this.invoke({ command: 'status' });
     if (!record(value) || typeof value.service !== 'string' || typeof value.configured !== 'boolean' || !Array.isArray(value.repositories)) {

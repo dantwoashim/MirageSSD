@@ -19,6 +19,10 @@ use crate::handles::Entry;
 use crate::remote_cache::ByteLru;
 
 mod cache;
+pub mod install;
+mod learning;
+pub mod publisher;
+pub mod retention;
 #[cfg(test)]
 mod tests;
 
@@ -31,6 +35,8 @@ type ChunkResult = Result<Arc<[u8]>, MirageStatus>;
 pub struct Config {
     pub manifests: Vec<PathBuf>,
     pub export_prefixes: Vec<String>,
+    #[serde(default)]
+    pub export_files: Vec<String>,
     /// Roots of existing rclone VFS data trees, never modified by Mirage.
     #[serde(default)]
     pub seed_roots: Vec<PathBuf>,
@@ -38,14 +44,16 @@ pub struct Config {
     pub disk_budget_bytes: u64,
     pub disk_free_floor_bytes: u64,
     pub memory_budget_bytes: usize,
+    #[serde(default)]
+    pub retained_chunks: Vec<[u8; 32]>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Manifest {
     chunk_url_prefix: String,
     assets: Vec<Asset>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Asset {
     name: String,
     size: u64,
@@ -54,7 +62,7 @@ struct Asset {
     #[serde(skip)]
     prefix: String,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Chunk {
     name: String,
     md5: String,
@@ -83,6 +91,8 @@ pub struct Stats {
     pub shared_waiters: u64,
     pub memory_bytes: usize,
     pub managed_disk_bytes: u64,
+    pub retained_disk_bytes: u64,
+    pub learned_chunks: usize,
 }
 
 pub struct SophonSource {
@@ -100,6 +110,8 @@ pub struct SophonSource {
     local_capacity: Condvar,
     stats: Mutex<Stats>,
     last_report: Mutex<Instant>,
+    history: Mutex<learning::History>,
+    learning: std::sync::atomic::AtomicU32,
     // One process owns disk bookkeeping; immutable seed trees need no lock.
     _lock: File,
 }
@@ -141,7 +153,8 @@ impl SophonSource {
         let config: Config =
             serde_json::from_slice(bytes).map_err(|_| MirageStatus::InvalidArgument)?;
         if config.manifests.is_empty()
-            || config.export_prefixes.is_empty()
+            || (config.export_prefixes.is_empty() && config.export_files.is_empty())
+            || config.export_files.iter().any(|name| !valid_path(name))
             || config.memory_budget_bytes > 256 * 1024 * 1024
             || config
                 .export_prefixes
@@ -150,7 +163,9 @@ impl SophonSource {
         {
             return Err(MirageStatus::InvalidArgument);
         }
+        cache::ordinary_path(&config.cache_root)?;
         std::fs::create_dir_all(&config.cache_root).map_err(|_| MirageStatus::IoError)?;
+        cache::ordinary_path(&config.cache_root.join("owner.lock"))?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -159,6 +174,7 @@ impl SophonSource {
             .open(config.cache_root.join("owner.lock"))
             .map_err(|_| MirageStatus::IoError)?;
         lock.try_lock().map_err(|_| MirageStatus::Conflict)?;
+        retention::record_owner(&config.cache_root, path)?;
         let mut assets = BTreeMap::new();
         for path in &config.manifests {
             let bytes = std::fs::read(path).map_err(|_| MirageStatus::IoError)?;
@@ -180,6 +196,7 @@ impl SophonSource {
                     .export_prefixes
                     .iter()
                     .any(|p| asset.name.starts_with(p))
+                    && !config.export_files.contains(&asset.name)
                 {
                     continue;
                 }
@@ -270,7 +287,46 @@ impl SophonSource {
                 .children
                 .insert(path.rsplit('/').next().unwrap().into(), *index);
         }
-        let disk = cache::DiskCache::open(&config.cache_root, config.disk_budget_bytes)?;
+        let mut disk = cache::DiskCache::open(&config.cache_root, u64::MAX)?;
+        retention::recover(&config.cache_root, &mut disk)?;
+        if config.retained_chunks.len() > 8192 {
+            return Err(MirageStatus::InvalidArgument);
+        }
+        let selected: std::collections::HashSet<_> =
+            config.retained_chunks.iter().copied().collect();
+        let sizes: HashMap<_, _> = nodes
+            .iter()
+            .filter_map(|node| node.asset.as_ref())
+            .flat_map(|asset| {
+                asset
+                    .chunks
+                    .iter()
+                    .map(move |chunk| (chunk_key(asset, chunk), chunk.dsize))
+            })
+            .collect();
+        let mut retained_bytes = 0u64;
+        for key in selected {
+            retained_bytes = retained_bytes
+                .checked_add(
+                    disk.estimated_size(*sizes.get(&key).ok_or(MirageStatus::IntegrityFailure)?),
+                )
+                .ok_or(MirageStatus::IntegrityFailure)?;
+            if retained_bytes > config.disk_budget_bytes {
+                return Err(MirageStatus::DiskFull);
+            }
+            disk.pin(key);
+        }
+        disk.set_budget(config.disk_budget_bytes)?;
+        let mut identity = blake3::Hasher::new();
+        for node in &nodes {
+            if let Some(asset) = &node.asset {
+                identity.update(asset.name.as_bytes());
+                for chunk in &asset.chunks {
+                    identity.update(&chunk_key(asset, chunk));
+                }
+            }
+        }
+        let history = learning::History::open(&config.cache_root, *identity.finalize().as_bytes())?;
         Ok(Self {
             nodes,
             entries,
@@ -291,6 +347,8 @@ impl SophonSource {
             local_capacity: Condvar::new(),
             stats: Mutex::new(Stats::default()),
             last_report: Mutex::new(Instant::now() - Duration::from_secs(3)),
+            history: Mutex::new(history),
+            learning: std::sync::atomic::AtomicU32::new(0),
             _lock: lock,
         })
     }
@@ -323,6 +381,17 @@ impl SophonSource {
             .collect())
     }
     pub fn read(&self, index: u64, offset: u64, output: &mut [u8]) -> Result<usize, MirageStatus> {
+        self.read_for_process(index, offset, output, 0)
+    }
+    pub fn read_for_process(
+        &self,
+        index: u64,
+        offset: u64,
+        output: &mut [u8],
+        caller_pid: u32,
+    ) -> Result<usize, MirageStatus> {
+        let learning_pid = self.learning.load(std::sync::atomic::Ordering::Relaxed);
+        let observe = learning_pid == u32::MAX || (learning_pid != 0 && learning_pid == caller_pid);
         let asset = self
             .nodes
             .get(index as usize)
@@ -341,12 +410,12 @@ impl SophonSource {
         // no speculative queue can occupy foreground capacity.
         for wave in asset.chunks[first..last].chunks(4) {
             let results = if wave.len() == 1 {
-                vec![self.get_chunk(asset, &wave[0])]
+                vec![self.get_chunk(asset, &wave[0], observe)]
             } else {
                 std::thread::scope(|scope| {
                     let jobs: Vec<_> = wave
                         .iter()
-                        .map(|chunk| scope.spawn(move || self.get_chunk(asset, chunk)))
+                        .map(|chunk| scope.spawn(move || self.get_chunk(asset, chunk, observe)))
                         .collect();
                     jobs.into_iter()
                         .map(|job| job.join().unwrap_or(Err(MirageStatus::Internal)))
@@ -365,7 +434,18 @@ impl SophonSource {
         self.report();
         Ok(count)
     }
-    fn get_chunk(&self, asset: &Asset, chunk: &Chunk) -> ChunkResult {
+    fn get_chunk(&self, asset: &Asset, chunk: &Chunk, observe: bool) -> ChunkResult {
+        let started = Instant::now();
+        let result = self.get_chunk_inner(asset, chunk);
+        if result.is_ok() && observe {
+            self.history
+                .lock()
+                .map_err(|_| MirageStatus::Internal)?
+                .record(chunk_key(asset, chunk), chunk.dsize, started.elapsed());
+        }
+        result
+    }
+    fn get_chunk_inner(&self, asset: &Asset, chunk: &Chunk) -> ChunkResult {
         let key = chunk_key(asset, chunk);
         let (flight, owner) = {
             let mut flights = self.flights.lock().map_err(|_| MirageStatus::Internal)?;
@@ -531,7 +611,11 @@ impl SophonSource {
         // Lock ordering follows get_chunk: memory -> stats; never hold stats
         // while acquiring a residency lock.
         let memory_bytes = self.memory.lock().unwrap().used();
-        let managed_disk_bytes = self.disk.lock().unwrap().used();
+        let (managed_disk_bytes, retained_disk_bytes) = {
+            let disk = self.disk.lock().unwrap();
+            (disk.used(), disk.retained_bytes())
+        };
+        let learned_chunks = self.history.lock().unwrap().len();
         let s = self.stats.lock().unwrap();
         Stats {
             memory_hits: s.memory_hits,
@@ -543,6 +627,8 @@ impl SophonSource {
             shared_waiters: s.shared_waiters,
             memory_bytes,
             managed_disk_bytes,
+            retained_disk_bytes,
+            learned_chunks,
         }
     }
     fn report(&self) {
@@ -553,11 +639,79 @@ impl SophonSource {
             return;
         }
         *last = Instant::now();
+        if let Ok(history) = self.history.lock() {
+            let _ = history.save(&self.config.cache_root);
+        }
         if let Ok(bytes) = serde_json::to_vec_pretty(&self.statistics()) {
             let temp = self.config.cache_root.join("stats.tmp");
             if std::fs::write(&temp, bytes).is_ok() {
                 let _ = std::fs::rename(temp, self.config.cache_root.join("stats.json"));
             }
         }
+    }
+
+    /// The session controller enables this only after observing the exact game
+    /// process. Launcher verification and installation reads remain excluded.
+    pub fn set_gameplay_learning(&self, enabled: bool) -> Result<(), MirageStatus> {
+        self.set_gameplay_process(if enabled { u32::MAX } else { 0 })
+    }
+    pub fn set_gameplay_process(&self, pid: u32) -> Result<(), MirageStatus> {
+        self.learning
+            .store(pid, std::sync::atomic::Ordering::Relaxed);
+        if pid == 0 {
+            self.history
+                .lock()
+                .map_err(|_| MirageStatus::Internal)?
+                .save(&self.config.cache_root)?;
+        }
+        Ok(())
+    }
+
+    /// Prepare the learned set before handing off to the publisher launcher.
+    /// Explicit byte budget includes retained pins; no speculative work steals
+    /// foreground fetch slots. A seed is verified but never duplicated.
+    pub fn prepare_learned(&self, byte_budget: u64) -> Result<Vec<[u8; 32]>, MirageStatus> {
+        if byte_budget > self.config.disk_budget_bytes {
+            return Err(MirageStatus::InvalidArgument);
+        }
+        let selected = self
+            .history
+            .lock()
+            .map_err(|_| MirageStatus::Internal)?
+            .select(byte_budget);
+        let lookup: HashMap<_, _> = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.asset.as_ref())
+            .flat_map(|asset| {
+                asset
+                    .chunks
+                    .iter()
+                    .map(move |chunk| (chunk_key(asset, chunk), (asset, chunk)))
+            })
+            .collect();
+        let mut prepared = Vec::new();
+        let mut remaining = byte_budget;
+        for key in selected {
+            let Some((asset, chunk)) = lookup.get(&key) else {
+                continue;
+            };
+            let allocation = self
+                .disk
+                .lock()
+                .map_err(|_| MirageStatus::Internal)?
+                .estimated_size(chunk.dsize);
+            if allocation > remaining {
+                continue;
+            }
+            remaining -= allocation;
+            self.disk
+                .lock()
+                .map_err(|_| MirageStatus::Internal)?
+                .pin(key);
+            self.get_chunk_inner(asset, chunk)?;
+            prepared.push(key);
+        }
+        Ok(prepared)
     }
 }

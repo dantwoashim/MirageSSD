@@ -6,6 +6,30 @@ use super::mutation::hex16_decode;
 use super::mutation::now_ns_i64;
 use super::*;
 
+/// Enable observations only while an identified game session is active.
+/// # Safety
+/// `engine` must be a live handle not concurrently destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_sophon_gameplay(
+    engine: *const MirageEngineHandle,
+    pid: u32,
+) -> MirageStatus {
+    contained(|| {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return MirageStatus::InvalidArgument;
+        };
+        let Some(source) = &engine.sophon else {
+            return MirageStatus::InvalidArgument;
+        };
+        if pid == u32::MAX {
+            return MirageStatus::InvalidArgument;
+        }
+        source
+            .set_gameplay_process(pid)
+            .map_or_else(|s| s, |()| MirageStatus::Ok)
+    })
+}
+
 /// Read-only native publisher-chunk mount with verified cache reuse.
 /// # Safety
 /// The UTF-16 configuration path and output must be valid for their lengths.
