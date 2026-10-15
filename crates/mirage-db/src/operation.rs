@@ -590,11 +590,14 @@ pub fn namespace_rename_journaled(
     to_name: &str,
     now_ns: i64,
     journal: JournalEntry,
+    replace: bool,
+    retain_victim: bool,
+    expected_victim: Option<Option<InodeId>>,
 ) -> Result<(), MirageError> {
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin journaled namespace rename"))?;
-    crate::namespace::rename_in(
+    crate::namespace::rename_in_with_policy(
         &transaction,
         volume_id,
         from_parent,
@@ -602,6 +605,9 @@ pub fn namespace_rename_journaled(
         to_parent,
         to_name,
         now_ns,
+        replace,
+        retain_victim,
+        expected_victim,
     )?;
     journal_entry_commit_in(&transaction, volume_id, journal)?;
     transaction
@@ -617,11 +623,19 @@ pub fn namespace_delete_journaled(
     name: &str,
     now_ns: i64,
     journal: JournalEntry,
+    retain_inode: bool,
 ) -> Result<(), MirageError> {
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin journaled namespace delete"))?;
-    crate::namespace::delete_node_in(&transaction, volume_id, parent, name, now_ns)?;
+    crate::namespace::delete_node_with_lifetime_in(
+        &transaction,
+        volume_id,
+        parent,
+        name,
+        now_ns,
+        retain_inode,
+    )?;
     journal_entry_commit_in(&transaction, volume_id, journal)?;
     transaction
         .commit()

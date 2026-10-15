@@ -57,6 +57,7 @@ struct OpenRecord {
 /// Live handle state for one mounted volume.
 #[derive(Default)]
 pub struct HandleTable {
+    namespace_gate: Mutex<()>,
     inner: Mutex<HashMap<InodeId, OpenRecord>>,
 }
 
@@ -71,6 +72,29 @@ pub enum DeleteDisposition {
 }
 
 impl HandleTable {
+    pub fn namespace_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, MirageError> {
+        self.namespace_gate
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("namespace gate poisoned"))
+    }
+
+    /// Conservative replacement policy: refuse live victims and keep the
+    /// check atomic with the namespace transaction. Open-victim replacement
+    /// remains unsupported; it must never discard an active reader.
+    pub fn replace_closed_with(
+        &self,
+        victim: Option<InodeId>,
+        replace: impl FnOnce() -> Result<(), MirageError>,
+    ) -> Result<(), MirageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("handle table lock poisoned"))?;
+        if victim.is_some_and(|inode| inner.contains_key(&inode)) {
+            return Err(MirageError::repository_conflict("rename target is open"));
+        }
+        replace()
+    }
     /// Registers an open. Fails with `AccessDenied`-class conflicts when the
     /// requested access or granted share collides with live opens, or when the
     /// node is a delete-pending tombstone.
@@ -171,6 +195,16 @@ impl HandleTable {
     /// caller deletes the row now), `Pending` when handles hold it open —
     /// the tombstone persists until the last close returns `true`.
     pub fn request_delete(&self, inode: InodeId) -> Result<DeleteDisposition, MirageError> {
+        self.delete_with(inode, || Ok(()))
+    }
+
+    /// Hold open/share state through logical unlink. A failed transaction
+    /// must not mark existing handles delete-pending.
+    pub fn delete_with(
+        &self,
+        inode: InodeId,
+        unlink: impl FnOnce() -> Result<(), MirageError>,
+    ) -> Result<DeleteDisposition, MirageError> {
         let mut inner = self
             .inner
             .lock()
@@ -182,10 +216,14 @@ impl HandleTable {
                         "open handles did not grant delete sharing",
                     ));
                 }
+                unlink()?;
                 record.delete_pending = true;
                 Ok(DeleteDisposition::Pending)
             }
-            None => Ok(DeleteDisposition::Removed),
+            None => {
+                unlink()?;
+                Ok(DeleteDisposition::Removed)
+            }
         }
     }
 

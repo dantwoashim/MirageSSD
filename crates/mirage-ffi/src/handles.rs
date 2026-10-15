@@ -208,6 +208,8 @@ pub struct DirtyLedger {
     pub used: AtomicU64,
     pub next_slot: AtomicI64,
     pub mutex: Mutex<()>,
+    /// Serializes physical unlink and its charge update across cleanup paths.
+    pub reclaim_mutex: Mutex<()>,
 }
 impl DirtyLedger {
     /// Remaining budget, saturating at zero.

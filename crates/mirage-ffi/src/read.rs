@@ -30,6 +30,10 @@ pub unsafe extern "C" fn mirage_lookup(
             return MirageStatus::InvalidArgument;
         };
         let engine = unsafe { &*engine };
+        let _namespace = match engine.handles.namespace_guard() {
+            Ok(guard) => guard,
+            Err(_) => return MirageStatus::IoError,
+        };
         if let Some(index) = &engine.index {
             let Ok(path) = String::from_utf16(&key) else {
                 return MirageStatus::InvalidArgument;

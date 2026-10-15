@@ -68,12 +68,14 @@ MirageStatus mirage_read_speculative(const MirageFileHandle *handle,uint64_t off
 /* Durable namespace mutations; each applies offline and journals the operation for later publication. */
 MirageStatus mirage_namespace_create(MirageEngineHandle *engine,const uint16_t *path,size_t path_len,uint8_t directory);
 MirageStatus mirage_namespace_rename(MirageEngineHandle *engine,const uint16_t *from_path,size_t from_len,const uint16_t *to_path,size_t to_len);
+MirageStatus mirage_namespace_rename_ex(MirageEngineHandle *engine,const uint16_t *from_path,size_t from_len,const uint16_t *to_path,size_t to_len,uint8_t replace_if_exists);
 MirageStatus mirage_namespace_delete(MirageEngineHandle *engine,const uint16_t *path,size_t path_len);
-/* Versioned byte-extent write path: payloads are journaled and fsynced before the extent version commits. */
+/* Group writes acknowledge acceptance; explicit flush seals payloads and fences durable metadata. Strict writes sync before return. Neither acknowledges cloud publication. */
 MirageStatus mirage_write(MirageFileHandle *handle,uint64_t offset,const uint8_t *bytes,size_t bytes_len,size_t *transferred);
 MirageStatus mirage_truncate(MirageFileHandle *handle,uint64_t new_size);
 /* FlushFileBuffers: acknowledges local durability for committed operations; never a cloud signal. */
 MirageStatus mirage_flush(MirageFileHandle *handle);
+MirageStatus mirage_flush_volume(const MirageEngineHandle *engine);
 typedef uint8_t (*MirageEnumerateCallback)(void *context,const uint16_t *name,size_t name_len,MirageFileInfo info);
 MirageStatus mirage_enumerate(const MirageFileHandle *handle,const uint16_t *marker,size_t marker_len,size_t limit,void *context,MirageEnumerateCallback callback);
 #ifdef __cplusplus

@@ -21,6 +21,8 @@ use crate::remote_cache::ByteLru;
 mod cache;
 pub mod install;
 mod learning;
+#[cfg(windows)]
+mod process;
 pub mod publisher;
 pub mod retention;
 #[cfg(test)]
@@ -46,6 +48,9 @@ pub struct Config {
     pub memory_budget_bytes: usize,
     #[serde(default)]
     pub retained_chunks: Vec<[u8; 32]>,
+    /// Exact local executable eligible for access learning, independent of launcher polling.
+    #[serde(default)]
+    pub game_executable: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -112,6 +117,8 @@ pub struct SophonSource {
     last_report: Mutex<Instant>,
     history: Mutex<learning::History>,
     learning: std::sync::atomic::AtomicU32,
+    #[cfg(windows)]
+    processes: Mutex<process::Classifier>,
     // One process owns disk bookkeeping; immutable seed trees need no lock.
     _lock: File,
 }
@@ -327,6 +334,8 @@ impl SophonSource {
             }
         }
         let history = learning::History::open(&config.cache_root, *identity.finalize().as_bytes())?;
+        #[cfg(windows)]
+        let processes = Mutex::new(process::Classifier::new(config.game_executable.as_deref()));
         Ok(Self {
             nodes,
             entries,
@@ -349,6 +358,8 @@ impl SophonSource {
             last_report: Mutex::new(Instant::now() - Duration::from_secs(3)),
             history: Mutex::new(history),
             learning: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(windows)]
+            processes,
             _lock: lock,
         })
     }
@@ -392,6 +403,14 @@ impl SophonSource {
     ) -> Result<usize, MirageStatus> {
         let learning_pid = self.learning.load(std::sync::atomic::Ordering::Relaxed);
         let observe = learning_pid == u32::MAX || (learning_pid != 0 && learning_pid == caller_pid);
+        #[cfg(windows)]
+        let observe = if self.config.game_executable.is_some() {
+            self.processes
+                .lock()
+                .is_ok_and(|mut processes| processes.is_game(caller_pid))
+        } else {
+            observe
+        };
         let asset = self
             .nodes
             .get(index as usize)
@@ -650,8 +669,8 @@ impl SophonSource {
         }
     }
 
-    /// The session controller enables this only after observing the exact game
-    /// process. Launcher verification and installation reads remain excluded.
+    /// Explicit learning control for legacy sources and controlled fixtures.
+    /// Managed Windows sources instead verify each opener against game_executable.
     pub fn set_gameplay_learning(&self, enabled: bool) -> Result<(), MirageStatus> {
         self.set_gameplay_process(if enabled { u32::MAX } else { 0 })
     }

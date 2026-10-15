@@ -3,7 +3,9 @@
 use super::*;
 use std::{
     os::windows::{ffi::OsStrExt, process::CommandExt},
+    process::{Command, Stdio},
     ptr,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -116,7 +118,11 @@ pub(super) fn recover_orphan(root: &Path, state: &State) -> Result<(), MirageErr
         .join("mirage-fs.exe");
     if !same(&process.image, &record.executable)
         || !same(&process.image, &expected)
-        || !record.config.starts_with(root.join("generations"))
+        || !record
+            .config
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|parent| same(parent, &root.join("generations")))
         || record.config.file_name() != Some(std::ffi::OsStr::new("source.json"))
     {
         return Err(MirageError::repository_conflict(
@@ -210,6 +216,8 @@ fn processes() -> Result<Vec<Process>, MirageError> {
     }
 }
 fn same(a: &Path, b: &Path) -> bool {
+    let a = physical_parent_identity(a);
+    let b = physical_parent_identity(b);
     let normalize = |path: &Path| {
         path.to_string_lossy()
             .trim_start_matches(r"\\?\")
@@ -217,20 +225,59 @@ fn same(a: &Path, b: &Path) -> bool {
             .replace('/', "\\")
             .to_lowercase()
     };
-    normalize(a) == normalize(b)
+    normalize(&a) == normalize(&b)
+}
+
+fn physical_parent_identity(path: &Path) -> PathBuf {
+    use std::os::windows::fs::MetadataExt;
+    // GetFinalPathName on a virtual descendant can retain the mount's short
+    // spelling. Resolve the containing physical directory first, then append
+    // the mount component and virtual suffix without crossing the reparse.
+    for ancestor in path.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
+            && let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name())
+            && let Ok(parent) = std::fs::canonicalize(parent)
+            && let Ok(suffix) = path.strip_prefix(ancestor)
+        {
+            return parent.join(name).join(suffix);
+        }
+    }
+    // After unmount, the same registered target is dangling. Expand its
+    // nearest existing physical ancestor before appending the missing suffix.
+    for ancestor in path.ancestors() {
+        if let Ok(parent) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = path.strip_prefix(ancestor)
+        {
+            return parent.join(suffix);
+        }
+    }
+    path.to_path_buf()
 }
 pub(super) fn game_running(root: &Path) -> Result<bool, MirageError> {
-    let prefix = root.join("generations").to_string_lossy().to_lowercase();
-    Ok(processes()?.iter().any(|p| {
-        p.alive()
-            && p.image
-                .to_string_lossy()
-                .to_lowercase()
-                .starts_with(&format!("{prefix}\\"))
-            && p.image
+    ordinary(&root.join("generations"))?;
+    let generations = match std::fs::canonicalize(root.join("generations")) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for process in processes()? {
+        if process.alive()
+            && process
+                .image
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("GenshinImpact.exe"))
-    }))
+        {
+            let image = std::fs::canonicalize(&process.image).map_err(MirageError::from)?;
+            if image
+                .ancestors()
+                .any(|ancestor| same(ancestor, &generations))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 pub(super) fn available(root: &Path) -> Result<u64, MirageError> {
     let path = wide(root);
@@ -267,7 +314,7 @@ pub(super) fn physical_tree(root: &Path) -> Result<u64, MirageError> {
             let metadata = std::fs::symlink_metadata(&path).map_err(MirageError::from)?;
             if metadata.file_attributes() & 0x400 != 0 {
                 let allowed = managed.as_ref().is_some_and(|managed| {
-                    if path == managed.join("mount") {
+                    if same(&path, &managed.join("mount")) {
                         return true;
                     }
                     install::ASSET_PREFIXES.iter().any(|prefix| {
@@ -281,9 +328,10 @@ pub(super) fn physical_tree(root: &Path) -> Result<u64, MirageError> {
                     })
                 });
                 if !allowed {
-                    return Err(MirageError::invalid_argument(
-                        "physical accounting found an unregistered reparse target",
-                    ));
+                    return Err(MirageError::invalid_argument(format!(
+                        "physical accounting found an unregistered reparse target: path={path:?}, target={:?}, managed={managed:?}",
+                        std::fs::read_link(&path)
+                    )));
                 }
                 continue;
             }
@@ -317,20 +365,23 @@ fn junction(link: &Path, target: &Path) -> Result<(), MirageError> {
         quote(link),
         quote(target)
     );
-    let status = Command::new("powershell.exe")
+    let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
+        .output()
         .map_err(MirageError::from)?;
-    if !status.success()
+    if !output.status.success()
         || !same(
             &std::fs::read_link(link).map_err(MirageError::from)?,
             target,
         )
     {
-        return Err(MirageError::repository_conflict(
-            "asset junction creation failed",
-        ));
+        return Err(MirageError::repository_conflict(format!(
+            "asset junction creation failed: link={link:?}, expected={target:?}, actual={:?}, stdout={}, stderr={}",
+            std::fs::read_link(link),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(())
 }
@@ -373,6 +424,8 @@ pub(super) fn play(root: &Path) -> Result<(), MirageError> {
     let active = generation(root, &state)?;
     let config_path = active.join("source.json");
     let mut config: Value = read(&config_path)?;
+    let native = active.join("native");
+    config["game_executable"] = json!(native.join("GenshinImpact.exe"));
     config["retained_chunks"] = json!([]);
     write(&config_path, &config)?;
     phase(root, &mut state, "preparing")?;
@@ -384,7 +437,6 @@ pub(super) fn play(root: &Path) -> Result<(), MirageError> {
     }
     config["retained_chunks"] = json!(state.prepared);
     write(&config_path, &config)?;
-    let native = active.join("native");
     let mount = root.join("mount");
     let executable = std::env::current_exe().map_err(MirageError::from)?;
     let host_exe = executable

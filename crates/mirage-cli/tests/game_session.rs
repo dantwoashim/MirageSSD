@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(unsafe_code)]
 //! Real WinFsp + synthetic executable session. Proves controller handoff and
 //! cache lifecycle; does not constitute publisher title/gameplay acceptance.
 use md5::{Digest, Md5};
@@ -12,22 +13,45 @@ use std::{
 
 #[test]
 fn detached_game_handoff_outlives_launcher_and_cleans_only_owned_chunks() {
-    run_session(false, false);
+    run_session(false, false, false);
 }
 #[test]
 fn monitoring_failure_preserves_mount_through_detached_game_exit() {
-    run_session(true, false);
+    run_session(true, false, false);
 }
 #[test]
 fn crashed_worker_preserves_game_source_then_next_worker_recovers_cleanup() {
-    run_session(false, true);
+    run_session(false, true, false);
 }
-fn run_session(fail_monitor: bool, crash_worker: bool) {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("managed");
+#[test]
+fn short_path_root_matches_junction_and_process_identity() {
+    run_session(false, false, true);
+}
+fn run_session(fail_monitor: bool, crash_worker: bool, short_root: bool) {
+    let temporary = tempfile::Builder::new()
+        .prefix("mirage-audit-long-directory-")
+        .tempdir()
+        .unwrap();
+    let base = if short_root {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide: Vec<_> = temporary
+            .path()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut output = vec![0u16; 32768];
+        let length =
+            unsafe { GetShortPathNameW(wide.as_ptr(), output.as_mut_ptr(), output.len() as u32) };
+        assert!(length > 0 && length < output.len() as u32);
+        PathBuf::from(String::from_utf16(&output[..length as usize]).unwrap())
+    } else {
+        temporary.path().to_path_buf()
+    };
+    let root = base.join("managed");
     let active = root.join("generations/fixture");
     let native = active.join("native");
-    let bundle = temporary.path().join("bundle");
+    let bundle = base.join("bundle");
     fs::create_dir_all(&native).unwrap();
     fs::create_dir(&bundle).unwrap();
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -43,7 +67,7 @@ fn run_session(fail_monitor: bool, crash_worker: bool) {
     .unwrap();
     fs::copy(adapter.join("mirage-fs.exe"), bundle.join("mirage-fs.exe")).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_mirage"), bundle.join("mirage.exe")).unwrap();
-    let seeds = temporary.path().join("originals");
+    let seeds = base.join("originals");
     let name = "GenshinImpact_Data/StreamingAssets/AudioAssets/fixture.bnk";
     let bytes = b"verified synthetic publisher fixture";
     let md5 = format!("{:x}", Md5::digest(bytes));
@@ -89,8 +113,12 @@ fn run_session(fail_monitor: bool, crash_worker: bool) {
         .args(["game", "play", "--root"])
         .arg(&root)
         .env("PATH", search)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(
+            fs::File::create(temporary.path().join("worker.stdout.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(temporary.path().join("worker.stderr.log")).unwrap(),
+        ));
     if fail_monitor {
         command.env("MIRAGE_TEST_GAME_MONITOR_FAILURE", "1");
     }
@@ -124,25 +152,44 @@ fn run_session(fail_monitor: bool, crash_worker: bool) {
         result.status.success(),
         !fail_monitor && !crash_worker,
         "{}",
-        String::from_utf8_lossy(&result.stderr)
+        fs::read_to_string(temporary.path().join("worker.stderr.log")).unwrap()
     );
     if crash_worker {
         let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let owner = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(root.join("cache/owner.lock"))
-                .unwrap();
-            if owner.try_lock().is_ok() {
-                break;
+        let child_pid = loop {
+            if let Ok(text) = fs::read_to_string(native.join("fixture-child-pid.txt")) {
+                break text.parse::<u32>().unwrap();
             }
             assert!(
                 Instant::now() < deadline,
-                "fixture source must drain after known game handle exits"
+                "detached child identity not recorded"
             );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+        let child = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child_pid) };
+        assert!(!child.is_null(), "detached child must still be active");
+        assert!(
+            mirage_cli::commands::games::cleanup_game(&root).is_err(),
+            "recovery must refuse an active detached child"
+        );
+        assert_eq!(unsafe { WaitForSingleObject(child, 15000) }, WAIT_OBJECT_0);
+        unsafe { CloseHandle(child) };
+        // EOF must preserve an orphan source even if only the launcher was
+        // observed. Recovery, not that incomplete handle list, proves safety.
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("cache/owner.lock"))
+            .unwrap();
+        assert!(
+            owner.try_lock().is_err(),
+            "orphan source must remain owned until exclusive recovery"
+        );
+        drop(owner);
         let recovery = Command::new(bundle.join("mirage.exe"))
             .args(["game", "cleanup", "--root"])
             .arg(&root)

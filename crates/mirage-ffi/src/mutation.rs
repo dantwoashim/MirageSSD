@@ -53,41 +53,6 @@ fn fresh_journal_id() -> Result<[u8; 16], MirageStatus> {
     Ok(operation_id)
 }
 
-/// Journals a standalone namespace operation with no accompanying namespace
-/// change — used by the delete-pending finalize path on file close.
-pub(super) fn journal_namespace_operation(
-    db: &mirage_db::Database,
-    volume: RepositoryId,
-    kind: mirage_db::OperationKind,
-    payload: Vec<u8>,
-    now_ns: i64,
-) -> Result<(), MirageStatus> {
-    let operation_id = fresh_journal_id()?;
-    let device_seq = db
-        .next_operation_seq(volume)
-        .map_err(|_| MirageStatus::IoError)?;
-    db.writer()
-        .operation_begin(
-            mirage_db::OperationRecord {
-                operation_id,
-                device_seq,
-                volume_id: volume,
-                base_commit: None,
-                kind,
-                payload,
-                status: mirage_db::OperationStatus::Pending,
-                flush_group: None,
-                depends_on: None,
-                created_ns: now_ns,
-            },
-            Vec::new(),
-        )
-        .map_err(|_| MirageStatus::IoError)?;
-    db.writer()
-        .operation_commit(operation_id)
-        .map_err(|_| MirageStatus::IoError)
-}
-
 /// Physical-ledger file id for a managed volume's journal: one
 /// variable-length "file" tracks every staged dirty payload.
 pub(super) const JOURNAL_FILE_ID: [u8; 16] = mirage_db::payload_remote::MANAGED_JOURNAL_FILE_ID;
@@ -174,6 +139,10 @@ pub unsafe extern "C" fn mirage_namespace_create(
             return MirageStatus::InvalidArgument;
         }
         let engine = unsafe { &*engine };
+        let _namespace = match engine.handles.namespace_guard() {
+            Ok(guard) => guard,
+            Err(_) => return MirageStatus::IoError,
+        };
         let (parent_path, name) = match split_utf16_path(path, path_len) {
             Ok(parts) => parts,
             Err(status) => return status,
@@ -233,11 +202,32 @@ pub unsafe extern "C" fn mirage_namespace_rename(
     to_path: *const u16,
     to_len: usize,
 ) -> MirageStatus {
+    unsafe { mirage_namespace_rename_ex(engine, from_path, from_len, to_path, to_len, 1) }
+}
+
+/// Rename with an explicit replacement policy, checked in the namespace
+/// transaction. The legacy export retains its replacement-enabled behavior.
+///
+/// # Safety
+/// `engine` must be live; both paths must point to valid UTF-16 slices.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_namespace_rename_ex(
+    engine: *mut MirageEngineHandle,
+    from_path: *const u16,
+    from_len: usize,
+    to_path: *const u16,
+    to_len: usize,
+    replace: u8,
+) -> MirageStatus {
     contained(|| {
-        if engine.is_null() {
+        if engine.is_null() || replace > 1 {
             return MirageStatus::InvalidArgument;
         }
         let engine = unsafe { &*engine };
+        let _namespace = match engine.handles.namespace_guard() {
+            Ok(guard) => guard,
+            Err(_) => return MirageStatus::IoError,
+        };
         let (from_parent_path, from_name) = match split_utf16_path(from_path, from_len) {
             Ok(parts) => parts,
             Err(status) => return status,
@@ -268,10 +258,18 @@ pub unsafe extern "C" fn mirage_namespace_rename(
         match db.namespace_lookup(volume, to_parent, &to_name) {
             Ok(Some(victim)) => {
                 if Some(victim.inode) != source.map(|entry| entry.inode) {
+                    if replace == 0 {
+                        return MirageStatus::Conflict;
+                    }
                     if engine.handles.is_open(victim.inode) {
                         return MirageStatus::Conflict;
                     }
                     victim_inode = Some(victim.inode);
+                    if let Some(segments) = &engine.segments
+                        && segments.drain_inode(victim.inode).is_err()
+                    {
+                        return MirageStatus::IoError;
+                    }
                 }
             }
             Ok(_) => {}
@@ -283,21 +281,25 @@ pub unsafe extern "C" fn mirage_namespace_rename(
             Err(status) => return status,
         };
         let _ns = trace::Scope::new(trace::Slot::NsRename);
-        match db.namespace_rename_journaled(
-            volume,
-            from_parent,
-            &from_name,
-            to_parent,
-            &to_name,
-            now,
-            mirage_db::JournalEntry {
-                operation_id,
-                kind: mirage_db::OperationKind::Rename,
-                payload: format!("{from_parent_path}/{from_name}\n{to_parent_path}/{to_name}")
-                    .into_bytes(),
-                created_ns: now,
-            },
-        ) {
+        match engine.handles.replace_closed_with(victim_inode, || {
+            db.writer().namespace_rename_journaled_with_policy(
+                volume,
+                from_parent,
+                &from_name,
+                to_parent,
+                &to_name,
+                now,
+                mirage_db::JournalEntry {
+                    operation_id,
+                    kind: mirage_db::OperationKind::Rename,
+                    payload: format!("{from_parent_path}/{from_name}\n{to_parent_path}/{to_name}")
+                        .into_bytes(),
+                    created_ns: now,
+                },
+                replace != 0,
+                victim_inode,
+            )
+        }) {
             Ok(()) => {
                 // Rename-over-existing leaves the victim's payloads
                 // unreferenced: release them now under compaction's rule so
@@ -337,6 +339,10 @@ pub unsafe extern "C" fn mirage_namespace_delete(
             return MirageStatus::InvalidArgument;
         }
         let engine = unsafe { &*engine };
+        let _namespace = match engine.handles.namespace_guard() {
+            Ok(guard) => guard,
+            Err(_) => return MirageStatus::IoError,
+        };
         let (parent_path, name) = match split_utf16_path(path, path_len) {
             Ok(parts) => parts,
             Err(status) => return status,
@@ -360,17 +366,14 @@ pub unsafe extern "C" fn mirage_namespace_delete(
             Ok(None) => return MirageStatus::NotFound,
             Err(_) => return MirageStatus::IoError,
         };
-        if let Some(segments) = &engine.segments {
-            segments.discard_inode(inode);
+        if let Some(segments) = &engine.segments
+            && segments.drain_inode(inode).is_err()
+        {
+            return MirageStatus::IoError;
         }
         // Delete-pending semantics: the name unlinks now (the open-handle
         // tombstone keeps identity for existing readers), and the last close
         // finalizes — re-issuing the delete is then a harmless no-op.
-        let pending = match engine.handles.request_delete(inode) {
-            Ok(mirage_engine::handles::DeleteDisposition::Pending) => true,
-            Ok(mirage_engine::handles::DeleteDisposition::Removed) => false,
-            Err(_) => return MirageStatus::AccessDenied,
-        };
         let parent = match resolve_parent(db, volume, &parent_path) {
             Ok(inode) => inode,
             Err(status) => return status,
@@ -381,23 +384,26 @@ pub unsafe extern "C" fn mirage_namespace_delete(
             Err(status) => return status,
         };
         let _ns = trace::Scope::new(trace::Slot::NsDelete);
-        match db.namespace_delete_journaled(
-            volume,
-            parent,
-            &name,
-            now,
-            mirage_db::JournalEntry {
-                operation_id,
-                kind: mirage_db::OperationKind::Delete,
-                payload: full.into_bytes(),
-                created_ns: now,
-            },
-        ) {
-            Ok(()) => {
+        match engine.handles.delete_with(inode, || {
+            db.writer().namespace_unlink_journaled(
+                volume,
+                parent,
+                &name,
+                now,
+                mirage_db::JournalEntry {
+                    operation_id,
+                    kind: mirage_db::OperationKind::Delete,
+                    payload: full.into_bytes(),
+                    created_ns: now,
+                },
+            )
+        }) {
+            Ok(disposition) => {
+                let pending = disposition == mirage_engine::handles::DeleteDisposition::Pending;
                 // Delete-pending releases at last close; an unopened file's
                 // sealed payloads free immediately under compaction's rule.
                 if !pending && let Some(dirty) = &engine.dirty {
-                    release_deleted_inode_payloads(
+                    let _ = release_deleted_inode_payloads(
                         db,
                         dirty,
                         &engine.payload_files,
@@ -426,7 +432,7 @@ pub(crate) fn release_deleted_inode_payloads(
     journal_dir: &Path,
     volume: RepositoryId,
     inode: InodeId,
-) {
+) -> bool {
     let dead =
         match db
             .writer()
@@ -435,18 +441,19 @@ pub(crate) fn release_deleted_inode_payloads(
             Ok(dead) => dead,
             Err(error) => {
                 eprintln!("payload release for deleted inode {inode:?} failed: {error}");
-                return;
+                return false;
             }
         };
-    if dead.is_empty() {
-        return;
-    }
     // Irreversible file deletes need the demotion durable first: a crash
     // between file delete and commit must not resurrect unreferenced bytes.
     if db.durability_barrier().is_err() {
         eprintln!("payload release for deleted inode {inode:?}: barrier failed");
-        return;
+        return false;
     }
+    let _reclaim = dirty
+        .reclaim_mutex
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     for (payload_id, length_bytes) in dead {
         let mut name = String::with_capacity(40);
         for byte in payload_id {
@@ -454,7 +461,18 @@ pub(crate) fn release_deleted_inode_payloads(
         }
         name.push_str(".payload");
         crate::handles::invalidate_payload_file(payload_files, &payload_id);
-        let _ = std::fs::remove_file(journal_dir.join(name));
+        let path = journal_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("deleted payload removal pending: {error}");
+                continue;
+            }
+        }
         let length = u64::try_from(length_bytes).unwrap_or(0);
         let _ = dirty
             .used
@@ -462,6 +480,7 @@ pub(crate) fn release_deleted_inode_payloads(
                 Some(used.saturating_sub(length))
             });
     }
+    true
 }
 
 fn mutation_status(error: &MirageError) -> MirageStatus {

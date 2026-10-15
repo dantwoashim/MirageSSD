@@ -112,6 +112,9 @@ enum Command {
         String,
         i64,
         crate::operation::JournalEntry,
+        bool,
+        bool,
+        Option<Option<InodeId>>,
         Reply<()>,
     ),
     NamespaceDeleteJournaled(
@@ -120,6 +123,7 @@ enum Command {
         String,
         i64,
         crate::operation::JournalEntry,
+        bool,
         Reply<()>,
     ),
     SequencedMutationCommit(Box<crate::operation::SequencedMutation>, Reply<()>),
@@ -589,6 +593,9 @@ impl DbWriter {
                             to_name,
                             now_ns,
                             journal,
+                            replace,
+                            retain_victim,
+                            expected_victim,
                             reply,
                         ) => {
                             respond(
@@ -602,6 +609,9 @@ impl DbWriter {
                                     &to_name,
                                     now_ns,
                                     journal,
+                                    replace,
+                                    retain_victim,
+                                    expected_victim,
                                 ),
                             );
                         }
@@ -611,6 +621,7 @@ impl DbWriter {
                             name,
                             now_ns,
                             journal,
+                            retain_inode,
                             reply,
                         ) => {
                             respond(
@@ -622,6 +633,7 @@ impl DbWriter {
                                     &name,
                                     now_ns,
                                     journal,
+                                    retain_inode,
                                 ),
                             );
                         }
@@ -1373,6 +1385,39 @@ impl DbWriter {
                 to_name,
                 now_ns,
                 journal,
+                true,
+                false,
+                None,
+                reply,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn namespace_rename_journaled_with_policy(
+        &self,
+        volume: RepositoryId,
+        from_parent: InodeId,
+        from_name: &str,
+        to_parent: InodeId,
+        to_name: &str,
+        now: i64,
+        journal: crate::operation::JournalEntry,
+        replace: bool,
+        expected_victim: Option<InodeId>,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::NamespaceRenameJournaled(
+                volume,
+                from_parent,
+                from_name.to_owned(),
+                to_parent,
+                to_name.to_owned(),
+                now,
+                journal,
+                replace,
+                true,
+                Some(expected_victim),
                 reply,
             )
         })
@@ -1389,7 +1434,30 @@ impl DbWriter {
     ) -> Result<(), MirageError> {
         let name = name.to_owned();
         self.request(|reply| {
-            Command::NamespaceDeleteJournaled(volume_id, parent, name, now_ns, journal, reply)
+            Command::NamespaceDeleteJournaled(
+                volume_id, parent, name, now_ns, journal, false, reply,
+            )
+        })
+    }
+
+    pub fn namespace_unlink_journaled(
+        &self,
+        volume: RepositoryId,
+        parent: InodeId,
+        name: &str,
+        now: i64,
+        journal: crate::operation::JournalEntry,
+    ) -> Result<(), MirageError> {
+        self.request(|reply| {
+            Command::NamespaceDeleteJournaled(
+                volume,
+                parent,
+                name.to_owned(),
+                now,
+                journal,
+                true,
+                reply,
+            )
         })
     }
 

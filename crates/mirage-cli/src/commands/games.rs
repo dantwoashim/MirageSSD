@@ -9,10 +9,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 #[cfg(windows)]
 mod windows;
 
@@ -147,11 +147,16 @@ pub fn ordinary(path: &Path) -> Result<(), MirageError> {
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Ok(meta) => {
-                let mut reparse = meta.file_type().is_symlink();
+                let reparse = meta.file_type().is_symlink();
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
-                    reparse |= meta.file_attributes() & 0x400 != 0;
+                    let reparse = reparse || meta.file_attributes() & 0x400 != 0;
+                    if reparse {
+                        return Err(MirageError::invalid_argument(
+                            "owned game paths cannot traverse reparse points",
+                        ));
+                    }
                 }
                 if reparse {
                     return Err(MirageError::invalid_argument(

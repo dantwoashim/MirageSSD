@@ -237,9 +237,10 @@ pub(super) fn commit_extent_mutation_parts(
         .map_err(|_| MirageStatus::IoError)
 }
 
-/// Writes bytes at `offset` through the versioned extent store: the payload
-/// is staged and fsynced, the extent map advances one version, and a journal
-/// operation commits — all durable before this call returns success.
+/// Accepts bytes into the versioned extent store. Group mode can return
+/// success with an unsealed local segment; explicit file/volume flush is the
+/// durable acknowledgement. Strict mode syncs payload and metadata before
+/// returning. Neither mode acknowledges cloud publication.
 ///
 /// # Safety
 /// `handle` must be live; `bytes` must be readable for `bytes_len` bytes.
@@ -262,6 +263,9 @@ pub unsafe extern "C" fn mirage_write(
         };
         if handle.state_root.is_none() {
             return MirageStatus::BackendUnavailable;
+        }
+        if bytes_len == 0 {
+            return MirageStatus::Ok;
         }
         let data = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
         let now = now_ns_i64();
@@ -546,6 +550,33 @@ pub unsafe extern "C" fn mirage_flush(handle: *mut MirageFileHandle) -> MirageSt
             }
             Err(_) => MirageStatus::IoError,
         }
+    })
+}
+
+/// Durable barrier for all accepted writes on a volume. This does not stop
+/// the sealer or wait for cloud publication.
+///
+/// # Safety
+/// `engine` must point to a live engine for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirage_flush_volume(engine: *const MirageEngineHandle) -> MirageStatus {
+    contained(|| {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return MirageStatus::InvalidArgument;
+        };
+        if let Some(segments) = &engine.segments
+            && segments.drain_all_checked().is_err()
+        {
+            return MirageStatus::IoError;
+        }
+        if let (Some(db), Some(index)) = (&engine.db, &engine.index) {
+            let journal =
+                mirage_engine::journal::LocalJournal::new(db.clone(), index.header().repository_id);
+            if journal.flush_fence(now_ns_i64()).is_err() || db.durability_barrier().is_err() {
+                return MirageStatus::IoError;
+            }
+        }
+        MirageStatus::Ok
     })
 }
 

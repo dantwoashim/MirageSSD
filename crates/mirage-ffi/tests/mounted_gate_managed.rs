@@ -166,6 +166,16 @@ fn stop(host: &mut TestHost) {
 
 #[test]
 fn managed_mount_writes_survive_restart() {
+    managed_mount_writes_survive_restart_impl(false);
+}
+
+#[test]
+#[ignore = "requires elevated Windows volume-device handle access"]
+fn elevated_volume_flush_survives_restart() {
+    managed_mount_writes_survive_restart_impl(true);
+}
+
+fn managed_mount_writes_survive_restart_impl(volume_flush: bool) {
     let _mount_guard = MOUNT_LOCK.lock().unwrap();
     // A committed base file exercises index-backed reads; local mutations
     // exercise the durable namespace + extent journal.
@@ -282,6 +292,7 @@ fn managed_mount_writes_survive_restart() {
         .expect("patched read");
     assert_eq!(patched, expected);
 
+    audit_callback_contracts(&mount, state_root.path(), volume_flush);
     // Rename keeps content; delete removes the entry.
     let renamed = mount.join("renamed.txt");
     std::fs::rename(&created, &renamed).expect("rename");
@@ -749,4 +760,116 @@ fn managed_buffered_copy_reaches_journal_and_survives_restart() {
     );
     drop(copied);
     stop(&mut host);
+}
+
+fn audit_callback_contracts(
+    mount: &std::path::Path,
+    state_root: &std::path::Path,
+    volume_flush: bool,
+) {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
+            MOVEFILE_REPLACE_EXISTING, MoveFileExW, OPEN_EXISTING, SetFileTime,
+        },
+    };
+    let wide = |path: &std::path::Path| {
+        path.to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    let a = mount.join("audit-a.bin");
+    let b = mount.join("audit-b.bin");
+    std::fs::write(&a, vec![1u8; 1000]).unwrap();
+    std::fs::write(&a, b"source").unwrap(); // CREATE_ALWAYS existing-file path.
+    assert_eq!(std::fs::read(&a).unwrap(), b"source");
+    std::fs::write(&b, b"victim").unwrap();
+    let from = wide(&a);
+    let to = wide(&b);
+    assert_eq!(unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) }, 0);
+    assert_eq!(std::fs::read(&a).unwrap(), b"source");
+    assert_eq!(std::fs::read(&b).unwrap(), b"victim");
+    assert_ne!(
+        unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) },
+        0
+    );
+    assert_eq!(std::fs::read(&b).unwrap(), b"source");
+    let exclusive = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&b)
+        .unwrap();
+    assert_eq!(
+        std::fs::File::open(&b).unwrap_err().raw_os_error(),
+        Some(32)
+    );
+    assert!(std::fs::remove_file(&b).is_err());
+    drop(exclusive);
+    let file = std::fs::OpenOptions::new().write(true).open(&b).unwrap();
+    file.sync_all().unwrap();
+    let connection = rusqlite::Connection::open(state_root.join("control.db")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_timestamp BEFORE UPDATE OF created_ns,modified_ns ON inodes BEGIN SELECT RAISE(ABORT, 'injected timestamp failure'); END;").unwrap();
+    let ticks = 116444736000000000u64 + 123000000;
+    let stamp = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    assert_eq!(
+        unsafe {
+            SetFileTime(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &stamp,
+            )
+        },
+        0
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_timestamp")
+        .unwrap();
+    assert_ne!(
+        unsafe {
+            SetFileTime(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &stamp,
+            )
+        },
+        0
+    );
+    drop(file);
+    if !volume_flush {
+        return;
+    }
+    // Separately qualified elevated gate: normal users cannot open this device.
+    // A device-volume handle asks WinFsp for its null-context flush callback.
+    let letter = mount.to_string_lossy().chars().next().unwrap();
+    let device = wide(std::path::Path::new(&format!("\\\\.\\{letter}:")));
+    let volume = unsafe {
+        CreateFileW(
+            device.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        volume,
+        INVALID_HANDLE_VALUE,
+        "volume handle: {}",
+        std::io::Error::last_os_error()
+    );
+    let result = unsafe { FlushFileBuffers(volume) };
+    let error = std::io::Error::last_os_error();
+    unsafe { CloseHandle(volume) };
+    assert_ne!(result, 0, "whole-volume flush: {error}");
 }

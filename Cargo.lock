@@ -1287,6 +1287,7 @@ dependencies = [
  "mirage-scheduler",
  "mirage-types",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

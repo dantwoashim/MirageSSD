@@ -495,6 +495,33 @@ pub fn rename_in(
     to_name: &str,
     now_ns: i64,
 ) -> Result<(), MirageError> {
+    rename_in_with_policy(
+        transaction,
+        volume_id,
+        from_parent,
+        from_name,
+        to_parent,
+        to_name,
+        now_ns,
+        true,
+        false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rename_in_with_policy(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    from_parent: InodeId,
+    from_name: &str,
+    to_parent: InodeId,
+    to_name: &str,
+    now_ns: i64,
+    replace: bool,
+    retain_victim: bool,
+    expected_victim: Option<Option<InodeId>>,
+) -> Result<(), MirageError> {
     let from_folded = fold_name(from_name)?;
     let to_folded = fold_name(to_name)?;
     let entry = lookup(transaction, volume_id, from_parent, from_name)?
@@ -549,7 +576,19 @@ pub fn rename_in(
             }
         }
     }
-    if let Some(victim) = lookup(transaction, volume_id, to_parent, to_name)?
+    let victim = lookup(transaction, volume_id, to_parent, to_name)?;
+    if expected_victim.is_some_and(|expected| {
+        expected
+            != victim
+                .as_ref()
+                .filter(|victim| victim.inode != entry.inode)
+                .map(|victim| victim.inode)
+    }) {
+        return Err(MirageError::repository_conflict(
+            "rename target identity changed",
+        ));
+    }
+    if let Some(victim) = victim
         && victim.inode != entry.inode
     {
         let victim_stat = stat(transaction, volume_id, victim.inode)?
@@ -585,8 +624,17 @@ pub fn rename_in(
                 ],
             ))
             .map_err(|e| sqlite(e, "namespace victim dirent removal failed"))?;
+        if !replace {
+            return Err(MirageError::repository_conflict(
+                "namespace rename target already exists",
+            ));
+        }
         transaction
-            .prepare_cached("DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2")
+            .prepare_cached(if retain_victim {
+                "UPDATE inodes SET unlink_pending = 1 WHERE volume_id = ?1 AND inode = ?2"
+            } else {
+                "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2"
+            })
             .and_then(|mut stmt| {
                 stmt.execute(params![
                     volume_id.as_bytes().as_slice(),
@@ -594,6 +642,15 @@ pub fn rename_in(
                 ])
             })
             .map_err(|e| sqlite(e, "namespace victim inode removal failed"))?;
+        transaction
+            .execute(
+                "DELETE FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    victim.inode.as_bytes().as_slice()
+                ],
+            )
+            .map_err(|e| sqlite(e, "namespace victim pin removal failed"))?;
         record_delta(
             transaction,
             volume_id,
@@ -677,6 +734,17 @@ pub fn delete_node_in(
     name: &str,
     now_ns: i64,
 ) -> Result<(), MirageError> {
+    delete_node_with_lifetime_in(transaction, volume_id, parent, name, now_ns, false)
+}
+
+pub fn delete_node_with_lifetime_in(
+    transaction: &rusqlite::Transaction<'_>,
+    volume_id: RepositoryId,
+    parent: InodeId,
+    name: &str,
+    now_ns: i64,
+    retain_inode: bool,
+) -> Result<(), MirageError> {
     let folded = fold_name(name)?;
     let entry = lookup(transaction, volume_id, parent, name)?
         .ok_or_else(|| MirageError::invalid_argument("namespace delete target is missing"))?;
@@ -724,7 +792,11 @@ pub fn delete_node_in(
         })
         .map_err(|e| sqlite(e, "namespace legacy binding delete failed"))?;
     transaction
-        .prepare_cached("DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2")
+        .prepare_cached(if retain_inode {
+            "UPDATE inodes SET unlink_pending = 1 WHERE volume_id = ?1 AND inode = ?2"
+        } else {
+            "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2"
+        })
         .and_then(|mut stmt| {
             stmt.execute(params![
                 volume_id.as_bytes().as_slice(),
@@ -732,6 +804,15 @@ pub fn delete_node_in(
             ])
         })
         .map_err(|e| sqlite(e, "namespace inode delete failed"))?;
+    transaction
+        .execute(
+            "DELETE FROM namespace_pins WHERE volume_id = ?1 AND inode = ?2",
+            params![
+                volume_id.as_bytes().as_slice(),
+                entry.inode.as_bytes().as_slice()
+            ],
+        )
+        .map_err(|e| sqlite(e, "namespace pin delete failed"))?;
     record_delta(
         transaction,
         volume_id,
@@ -1066,6 +1147,34 @@ impl crate::Database {
     ) -> Result<(), MirageError> {
         self.writer()
             .namespace_delete_journaled(volume_id, parent, name, now_ns, journal)
+    }
+
+    pub fn namespace_pending_unlinks(
+        &self,
+        volume: RepositoryId,
+    ) -> Result<Vec<InodeId>, MirageError> {
+        self.reads.with_connection(|connection| {
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT inode FROM inodes WHERE volume_id = ?1 AND unlink_pending = 1",
+                )
+                .map_err(|e| sqlite(e, "pending unlink scan failed"))?;
+            let rows = statement
+                .query_map([volume.as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|e| sqlite(e, "pending unlink query failed"))?;
+            rows.map(|row| {
+                row.map_err(|e| sqlite(e, "pending unlink decode failed"))
+                    .and_then(|bytes| {
+                        bytes
+                            .try_into()
+                            .map(InodeId::from_bytes)
+                            .map_err(|_| MirageError::integrity_mismatch("pending inode id length"))
+                    })
+            })
+            .collect()
+        })
     }
 
     /// Pins an inode (file or directory); descendants of a pinned directory

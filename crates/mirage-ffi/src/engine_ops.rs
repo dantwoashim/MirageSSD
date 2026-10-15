@@ -322,22 +322,36 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
             return MirageStatus::IntegrityFailure;
         };
         let now = now_ns_i64();
-        let dead = match db
+        match db
             .writer()
             .extent_compact_volume(volume, dirty.file_id, now)
         {
-            Ok(dead) => dead,
+            Ok(_) => {}
             Err(_) => return MirageStatus::IntegrityFailure,
         };
         let journal_dir = engine_journal_dir(engine);
-        if !dead.is_empty() {
+        {
             // Irreversible deletes: the extent-demotion commit that marked
             // these payloads dead must be power-loss durable first.
             if db.durability_barrier().is_err() {
                 return MirageStatus::IoError;
             }
         }
-        for (payload_id, length_bytes) in dead {
+        // Dead ledger rows remain durable retry records after an unlink
+        // failure. Revisit them, including rows demoted by a prior cleanup.
+        let (_, extents, _) = match db.load_physical_state() {
+            Ok(state) => state,
+            Err(_) => return MirageStatus::IoError,
+        };
+        let _reclaim = dirty
+            .reclaim_mutex
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for extent in extents.into_iter().filter(|extent| {
+            extent.file_id == dirty.file_id && extent.state == mirage_db::PhysicalExtentState::Dead
+        }) {
+            let payload_id = extent.extent_id;
+            let length_bytes = extent.length_bytes;
             // Only after the ledger commit does the file go; a failed delete
             // is left for the startup orphan sweep.
             let mut name = String::with_capacity(40);
@@ -346,7 +360,15 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
             }
             name.push_str(".payload");
             crate::handles::invalidate_payload_file(&engine.payload_files, &payload_id);
-            let _ = std::fs::remove_file(journal_dir.join(name));
+            let path = journal_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
             let length = u64::try_from(length_bytes).unwrap_or(0);
             let _ = dirty
                 .used
@@ -354,6 +376,7 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
                     Some(used.saturating_sub(length))
                 });
         }
+        drop(_reclaim);
         // Over-high-watermark published payloads become remote-only so the
         // next mount starts under budget; unpublished payloads stay local.
         let used = dirty.used.load(Ordering::Acquire);
@@ -408,7 +431,9 @@ pub unsafe extern "C" fn mirage_engine_quiesce(
         }
         let engine_ref = unsafe { &*engine };
         if let Some(segments) = &engine_ref.segments {
-            segments.drain_all();
+            if segments.drain_all_checked().is_err() {
+                return MirageStatus::IoError;
+            }
             segments.stop();
         }
         if let Some(publisher) = &engine_ref.publisher {

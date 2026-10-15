@@ -5,6 +5,7 @@
 #include <string>
 int wmain(int argc, wchar_t**) {
     if (argc > 1) {
+        std::ofstream("fixture-child-pid.txt") << GetCurrentProcessId();
         Sleep(600); // Controller must identify the detached game first.
         std::ifstream input(std::filesystem::path(L"GenshinImpact_Data/StreamingAssets/AudioAssets/fixture.bnk"), std::ios::binary);
         std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());

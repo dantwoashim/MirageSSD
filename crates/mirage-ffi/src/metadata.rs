@@ -1,7 +1,5 @@
 //! File metadata, enumeration, and handle-close exports.
 
-use super::mutation::journal_namespace_operation;
-use super::mutation::now_ns_i64;
 use super::read::inode_stable_index;
 use super::*;
 
@@ -63,7 +61,14 @@ pub unsafe extern "C" fn mirage_file_stat(
                 } else {
                     created
                 };
-                (created, modified)
+                (
+                    created,
+                    if modified == 0 {
+                        handle.modified_ns.load(Ordering::Acquire)
+                    } else {
+                        modified
+                    },
+                )
             })
             .unwrap_or((
                 handle.created_ns,
@@ -121,15 +126,16 @@ pub unsafe extern "C" fn mirage_set_times(
         };
         let created = (created_ns != 0).then_some(created_ns);
         let modified = (modified_ns != 0).then_some(modified_ns);
-        if db
+        if let Some(segments) = &handle.segments {
+            if segments.set_times(inode, created, modified).is_err() {
+                return MirageStatus::IoError;
+            }
+        } else if db
             .writer()
             .namespace_set_times(volume, inode, created, modified)
             .is_err()
         {
             return MirageStatus::IoError;
-        }
-        if let Some(segments) = &handle.segments {
-            segments.set_times(inode, created, modified);
         }
         if let Some(modified) = modified {
             handle.modified_ns.store(modified, Ordering::Release);
@@ -338,46 +344,31 @@ pub unsafe extern "C" fn mirage_file_close(handle: *mut MirageFileHandle) -> Mir
                     .close(inode, file.desired_access, file.share_access)
             };
             if let Ok(true) = closed {
-                if let Some(segments) = &file.segments {
-                    segments.discard_inode(inode);
-                }
+                let _finalize = trace::Scope::new(trace::Slot::CloseDeleteFinalize);
                 let volume = index.header().repository_id;
-                // Finalize by inode identity: the open-time path may be stale
-                // after a rename, and a delete-without-read never populated it.
-                let finalized = match db.namespace_entry(volume, inode) {
-                    Ok(None) => true, // already unlinked by the delete-pending request
-                    Ok(Some((parent, name))) => {
-                        let now = now_ns_i64();
-                        let _finalize = trace::Scope::new(trace::Slot::CloseDeleteFinalize);
-                        if db.namespace_delete(volume, parent, &name, now).is_ok() {
-                            let _ = journal_namespace_operation(
-                                db,
-                                volume,
-                                mirage_db::OperationKind::Delete,
-                                name.as_bytes().to_vec(),
-                                now,
-                            );
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    Err(_) => false,
-                };
-                // Last close of a finalized tombstone: no handle can read the
-                // inode again, so its sealed payloads release under
-                // compaction's rule instead of pinning the dirty budget until
-                // quiesce. A failed finalize keeps the extents — the file is
-                // still visible.
-                if finalized && let Some(dirty) = &file.dirty {
-                    super::mutation::release_deleted_inode_payloads(
+                // Logical unlink is already committed. First drain every
+                // in-flight seal, then atomically finalize inode/extents and
+                // make that metadata durable before dropping payloads.
+                if let Some(segments) = &file.segments {
+                    let _ = segments.drain_inode(inode);
+                }
+                if let Some(dirty) = &file.dirty
+                    && super::mutation::release_deleted_inode_payloads(
                         db,
                         dirty,
                         &file.payload_files,
                         &crate::write::handle_journal_dir(&file),
                         volume,
                         inode,
-                    );
+                    )
+                {
+                    if let Some(segments) = &file.segments {
+                        segments.discard_inode(inode);
+                    }
+                    file.extents
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&inode);
                 }
             }
         }

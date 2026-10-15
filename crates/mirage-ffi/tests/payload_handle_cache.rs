@@ -190,13 +190,17 @@ fn discarded_payload_leaves_no_cached_handle_pinning_the_name() {
     let before = payload_files(&journal_dir);
     assert_eq!(before.len(), 2, "two open-segment payloads on disk");
 
-    // Deleting A discards its open segment: the payload file is removed and
-    // its cached read handle must be dropped first.
+    // Unlink preserves A's data while its application handle remains open.
     let del = utf16("\\a.bin");
     assert_eq!(
         unsafe { mirage_namespace_delete(engine, del.as_ptr(), del.len()) },
         MirageStatus::Ok
     );
+    assert_eq!(payload_files(&journal_dir).len(), 2);
+    assert_eq!(read_exact(a, 0, payload_a.len()), payload_a);
+    // Final close releases the payload and must drop its cached read handle
+    // before removing the physical name.
+    assert_eq!(unsafe { mirage_file_close(a) }, MirageStatus::Ok);
     let after = payload_files(&journal_dir);
     assert_eq!(after.len(), 1, "deleted file's payload must be gone");
     let removed = before
@@ -220,7 +224,6 @@ fn discarded_payload_leaves_no_cached_handle_pinning_the_name() {
 
     // The surviving file still reads the right bytes through the cache.
     assert_eq!(read_exact(b, 0, payload_b.len()), payload_b);
-    assert_eq!(unsafe { mirage_file_close(a) }, MirageStatus::Ok);
     assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }

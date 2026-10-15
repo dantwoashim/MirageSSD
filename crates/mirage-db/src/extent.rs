@@ -512,6 +512,15 @@ pub fn release_inode_extents(
     let transaction = connection
         .transaction()
         .map_err(|e| sqlite(e, "failed to begin inode extent release"))?;
+    // Final-close/recovery owns this inode's lifetime. Finalize the durable
+    // tombstone and its extent references in the same transaction; callers
+    // fence this commit before irreversible payload removal.
+    transaction
+        .execute(
+            "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2 AND unlink_pending = 1",
+            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+        )
+        .map_err(|e| sqlite(e, "pending inode finalization failed"))?;
     let candidates: std::collections::BTreeSet<Vec<u8>> = {
         let mut statement = transaction
             .prepare_cached(

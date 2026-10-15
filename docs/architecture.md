@@ -31,7 +31,11 @@ Reads of data already on this PC are served locally; other data is fetched from 
 
 ### Durability
 
-Every operation is atomic and ordered. Closing a file does not wait for the disk — committed changes reach the disk within about a quarter second, or when an application calls `FlushFileBuffers` (which returns only once that file is durable). A crash or power loss can lose writes from roughly the last quarter second, including files whose close was still being sealed, but never leaves corrupted or half-applied state. Local payload files are deleted only after the state that allows the deletion is durable. Setting `MIRAGE_DURABILITY=strict` in the `mirage-fs.exe` environment restores per-operation durability: every commit is fsynced and close waits for the seal.
+Default group-mode writes acknowledge acceptance into a local segment, not durability. Closing a file queues sealing and can return before payload sync and metadata commit. Open segments normally seal after two seconds without writes; continuously active segments can remain unsealed longer. The database's approximately quarter-second group barrier covers metadata already committed to SQLite, not those open payloads, so it does not establish an end-to-end maximum loss window.
+
+A successful file or volume `FlushFileBuffers` drains the relevant segments and fences their metadata for local durability. A failed seal remains an error until an ordered retry actually commits it; a repeated flush cannot consume the failure and falsely succeed. Setting `MIRAGE_DURABILITY=strict` in the native host environment syncs payloads and commits before write acknowledgement and makes close wait for sealing. Local durability, remotely verified publication, and eligibility for eviction are separate states.
+
+Payload reclamation follows a durable logical unlink and the final open-handle lifetime. An unlinked inode remains recoverable until final close or exclusive-owner recovery. Failed physical unlink stays charged. Committed payloads are retried from durable dead ledger rows; failed removal of an uncommitted discarded segment currently waits for the next exclusive startup sweep. Tests distinguish explicit flush, clean shutdown, and forced process termination; they do not establish power-loss behavior at every interruption boundary.
 
 ### Publication and eviction
 

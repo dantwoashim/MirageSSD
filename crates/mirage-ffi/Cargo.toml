@@ -35,6 +35,7 @@ reqwest.workspace=true
 md-5 = "0.10.6"
 zstd = "0.13.3"
 [dev-dependencies]
+rusqlite.workspace=true
 mirage-manifest.workspace=true
 mirage-cache.workspace=true
 mirage-db.workspace=true

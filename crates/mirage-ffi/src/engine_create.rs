@@ -842,6 +842,25 @@ fn create_managed_impl(
         // the configured budget across restarts. Registration is idempotent
         // — the extents referencing it forbid a replace.
         let now = now_ns_i64();
+        // The repository coordinator above holds exclusive cross-process
+        // ownership: no old process can retain an open inode now. Complete
+        // durable unlinks before physical-state accounting and orphan sweep.
+        let pending = match db.namespace_pending_unlinks(volume) {
+            Ok(pending) => pending,
+            Err(_) => return MirageStatus::IoError,
+        };
+        for inode in pending {
+            if db
+                .writer()
+                .physical_release_unreferenced(volume, inode, JOURNAL_FILE_ID, now)
+                .is_err()
+            {
+                return MirageStatus::IoError;
+            }
+        }
+        if db.durability_barrier().is_err() {
+            return MirageStatus::IoError;
+        }
         if db.writer().physical_reap_reservations(now).is_err() {
             return debug_stage(
                 "if db.writer().physical_reap_reservations(now).is_err() {",
@@ -907,8 +926,13 @@ fn create_managed_impl(
                     let Ok(payload_id) = hex16_decode(stem) else {
                         continue;
                     };
-                    if !live_payloads.contains(&payload_id) && !referenced.contains(&payload_id) {
-                        let _ = std::fs::remove_file(entry.path());
+                    if !live_payloads.contains(&payload_id)
+                        && !referenced.contains(&payload_id)
+                        && let Err(error) = std::fs::remove_file(entry.path())
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        dirty_used = dirty_used
+                            .saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
                     }
                 }
             }
@@ -919,6 +943,7 @@ fn create_managed_impl(
             used: AtomicU64::new(dirty_used),
             next_slot: AtomicI64::new(next_slot),
             mutex: std::sync::Mutex::new(()),
+            reclaim_mutex: std::sync::Mutex::new(()),
         }));
         // Optional cache shard: a managed volume is correct without resident
         // pages — misses go to the provider hook.

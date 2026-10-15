@@ -89,11 +89,13 @@ NTSTATUS create(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, 
     auto* opened=new (std::nothrow) FileContext{}; if(!opened){tr::mirage_file_close(file);return STATUS_INSUFFICIENT_RESOURCES;} opened->rust_handle=file; opened->info=stat; opened->opener_pid=FspFileSystemOperationProcessId();
     *context=opened; fill_info(stat,info,host(fs)->writable()); return STATUS_SUCCESS;
 }
-NTSTATUS rename_file(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, PWSTR new_name, BOOLEAN) {
+NTSTATUS rename_file(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, PWSTR new_name, BOOLEAN replace) {
     tr::Scope trace_scope(tr::cb_Rename);
     auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
     if(!host(fs)->writable()) return STATUS_MEDIA_WRITE_PROTECTED;
-    return mirage_status_to_ntstatus(tr::mirage_namespace_rename(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name),reinterpret_cast<const uint16_t*>(new_name),std::wcslen(new_name)));
+    const auto status=::mirage_namespace_rename_ex(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name),reinterpret_cast<const uint16_t*>(new_name),std::wcslen(new_name),replace?1:0);
+    if(!replace&&status==MIRAGE_CONFLICT)return STATUS_OBJECT_NAME_COLLISION;
+    return mirage_status_to_ntstatus(status);
 }
 NTSTATUS set_delete(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR, BOOLEAN delete_file) {
     tr::Scope trace_scope(tr::cb_SetDelete);
@@ -164,8 +166,8 @@ NTSTATUS set_basic_info(FSP_FILE_SYSTEM* fs,PVOID context,UINT32,UINT64 creation
     };
     int64_t created_ns = ft_to_ns(creation_time);
     int64_t modified_ns = ft_to_ns(last_write_time);
-    if (created_ns || modified_ns) tr::mirage_set_times(opened->rust_handle, created_ns, modified_ns);
-    MirageFileInfo refreshed{}; if(tr::mirage_file_stat(opened->rust_handle,&refreshed)==MIRAGE_OK) opened->info=refreshed;
+    if (created_ns || modified_ns) { const auto status=tr::mirage_set_times(opened->rust_handle, created_ns, modified_ns); if(status!=MIRAGE_OK)return mirage_status_to_ntstatus(status); }
+    MirageFileInfo refreshed{}; const auto stat_status=tr::mirage_file_stat(opened->rust_handle,&refreshed); if(stat_status!=MIRAGE_OK)return mirage_status_to_ntstatus(stat_status); opened->info=refreshed;
     fill_info(opened->info,info,host(fs)->writable());
     return STATUS_SUCCESS;
 }
@@ -216,7 +218,7 @@ NTSTATUS set_file_size(FSP_FILE_SYSTEM* fs,PVOID context,UINT64 new_size,BOOLEAN
 }
 NTSTATUS flush_file(FSP_FILE_SYSTEM* fs,PVOID context,FSP_FSCTL_FILE_INFO* info){
     tr::Scope trace_scope(tr::cb_Flush);
-    auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
+    auto* opened=static_cast<FileContext*>(context); if(!opened) return mirage_status_to_ntstatus(::mirage_flush_volume(host(fs)->engine()));
     const auto status=tr::mirage_flush(opened->rust_handle);
     if(status==MIRAGE_OK&&info){ MirageFileInfo refreshed{}; if(tr::mirage_file_stat(opened->rust_handle,&refreshed)==MIRAGE_OK) opened->info=refreshed; fill_info(opened->info,info,host(fs)->writable()); }
     return mirage_status_to_ntstatus(status);

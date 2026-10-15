@@ -271,3 +271,351 @@ fn crash_after_async_close_is_atomic_and_swept() {
     assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
     assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
 }
+
+#[test]
+fn failed_seals_stay_failed_until_ordered_retry_is_durable() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\retry.bin");
+    let connection = rusqlite::Connection::open(root.path().join("control.db")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_seal BEFORE INSERT ON byte_extent_heads WHEN NEW.eof = 5 BEGIN SELECT RAISE(ABORT, 'injected seal failure'); END;").unwrap();
+    assert_eq!(write(file, 0, b"first"), MirageStatus::Ok);
+    assert_eq!(write(file, 4096, b"second"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::IoError);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::IoError);
+    // A failed retry cannot commit the newer snapshot around the older job.
+    let heads: i64 = connection
+        .query_row("SELECT COUNT(*) FROM byte_extent_heads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(heads, 0);
+    assert_eq!(read_exact(file, 0, 5), b"first");
+    assert_eq!(read_exact(file, 4096, 6), b"second");
+    connection.execute_batch("DROP TRIGGER fail_seal").unwrap();
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+    let reopened = managed_engine(&index, root.path(), 64 << 20, true);
+    let path = utf16("\\retry.bin");
+    let mut file = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(reopened, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    assert_eq!(read_exact(file, 0, 5), b"first");
+    assert_eq!(read_exact(file, 4096, 6), b"second");
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(reopened) }, MirageStatus::Ok);
+}
+
+#[test]
+fn timestamp_set_after_failed_enqueue_survives_close_and_retry() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\stamp.bin");
+    let connection = rusqlite::Connection::open(root.path().join("control.db")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_seal BEFORE INSERT ON byte_extent_heads BEGIN SELECT RAISE(ABORT, 'injected seal failure'); END;").unwrap();
+    assert_eq!(write(file, 0, b"preserved"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::IoError);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_set_times(file, 0, 123456789) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_flush_volume(engine) },
+        MirageStatus::IoError
+    );
+    connection.execute_batch("DROP TRIGGER fail_seal").unwrap();
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_flush_volume(engine) },
+        MirageStatus::Ok
+    );
+    let modified: i64 = connection
+        .query_row("SELECT i.modified_ns FROM inodes i JOIN dirents d ON i.volume_id=d.volume_id AND i.inode=d.child_inode WHERE d.display_name='stamp.bin'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(modified, 123456789);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn null_zero_write_and_volume_barrier_are_supported() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let a = create_and_open(engine, "\\a.bin");
+    let b = create_and_open(engine, "\\b.bin");
+    let mut transferred = usize::MAX;
+    assert_eq!(
+        unsafe { mirage_write(a, 0, std::ptr::null(), 0, &mut transferred) },
+        MirageStatus::Ok
+    );
+    assert_eq!(transferred, 0);
+    assert_eq!(write(a, 0, b"a"), MirageStatus::Ok);
+    assert_eq!(write(b, 0, b"b"), MirageStatus::Ok);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_flush_volume(engine) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_file_close(a) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn rejected_unlink_preserves_open_handle_bytes_and_share_state() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\guard.bin");
+    assert_eq!(write(file, 0, b"accepted"), MirageStatus::Ok);
+    let connection = rusqlite::Connection::open(root.path().join("control.db")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_unlink BEFORE DELETE ON dirents WHEN OLD.display_name = 'guard.bin' BEGIN SELECT RAISE(ABORT, 'injected unlink failure'); END;").unwrap();
+    let path = utf16("\\guard.bin");
+    assert_eq!(
+        unsafe { mirage_namespace_delete(engine, path.as_ptr(), path.len()) },
+        MirageStatus::IoError
+    );
+    assert_eq!(read_exact(file, 0, 8), b"accepted");
+    let mut again = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut again) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_file_close(again) }, MirageStatus::Ok);
+    connection
+        .execute_batch("DROP TRIGGER fail_unlink")
+        .unwrap();
+    assert_eq!(
+        unsafe { mirage_namespace_delete(engine, path.as_ptr(), path.len()) },
+        MirageStatus::Ok
+    );
+    assert_eq!(write(file, 8, b" after unlink"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    assert_eq!(read_exact(file, 0, 21), b"accepted after unlink");
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    let pending: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM inodes WHERE unlink_pending=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 0);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+#[ignore = "child-process fixture invoked by abrupt_unlink_recovery"]
+fn storage_crash_child() {
+    let root = PathBuf::from(std::env::var_os("MIRAGE_STORAGE_CHILD_ROOT").unwrap());
+    let index = PathBuf::from(std::env::var_os("MIRAGE_STORAGE_CHILD_INDEX").unwrap());
+    let engine = managed_engine(&index, &root, 64 << 20, true);
+    let persisted = create_and_open(engine, "\\persisted.bin");
+    assert_eq!(write(persisted, 0, b"durably flushed"), MirageStatus::Ok);
+    let deleted = create_and_open(engine, "\\deleted.bin");
+    assert_eq!(write(deleted, 0, b"still open"), MirageStatus::Ok);
+    let path = utf16("\\deleted.bin");
+    assert_eq!(
+        unsafe { mirage_namespace_delete(engine, path.as_ptr(), path.len()) },
+        MirageStatus::Ok
+    );
+    assert_eq!(write(deleted, 10, b" and writable"), MirageStatus::Ok);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_flush_volume(engine) },
+        MirageStatus::Ok
+    );
+    std::fs::write(root.join("child-ready"), b"flushed").unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn abrupt_unlink_recovery_keeps_flushed_files_and_reclaims_tombstones() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "storage_crash_child", "--ignored", "--nocapture"])
+        .env("MIRAGE_STORAGE_CHILD_ROOT", root.path())
+        .env("MIRAGE_STORAGE_CHILD_INDEX", &index)
+        .stdout(std::fs::File::create(root.path().join("child.stdout")).unwrap())
+        .stderr(std::fs::File::create(root.path().join("child.stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !root.path().join("child-ready").is_file() {
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "storage child failed: {}",
+                std::fs::read_to_string(root.path().join("child.stderr")).unwrap()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap(); // Actual process termination; no abandon/drain helper.
+    child.wait().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let path = utf16("\\persisted.bin");
+    let mut file = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    assert_eq!(read_exact(file, 0, 15), b"durably flushed");
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    let path = utf16("\\deleted.bin");
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::NotFound
+    );
+    assert_eq!(payload_files(&root.path().join("journal")).len(), 1);
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 15);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn rename_replacement_policy_preserves_collision_then_replaces() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let a = create_and_open(engine, "\\a.bin");
+    let b = create_and_open(engine, "\\b.bin");
+    assert_eq!(write(a, 0, b"source"), MirageStatus::Ok);
+    assert_eq!(write(b, 0, b"victim"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(a) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
+    let from = utf16("\\a.bin");
+    let to = utf16("\\b.bin");
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_namespace_rename_ex(
+                engine,
+                from.as_ptr(),
+                from.len(),
+                to.as_ptr(),
+                to.len(),
+                0,
+            )
+        },
+        MirageStatus::Conflict
+    );
+    let mut b = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, to.as_ptr(), to.len(), &mut b) },
+        MirageStatus::Ok
+    );
+    assert_eq!(read_exact(b, 0, 6), b"victim");
+    assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_namespace_rename_ex(
+                engine,
+                from.as_ptr(),
+                from.len(),
+                to.as_ptr(),
+                to.len(),
+                1,
+            )
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(
+        unsafe { mirage_lookup(engine, to.as_ptr(), to.len(), &mut b) },
+        MirageStatus::Ok
+    );
+    assert_eq!(read_exact(b, 0, 6), b"source");
+    assert_eq!(unsafe { mirage_file_close(b) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_deleted_payload_stays_charged_until_compaction_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\locked.bin");
+    assert_eq!(write(file, 0, b"locked payload"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    let payload = root
+        .path()
+        .join("journal")
+        .join(&payload_files(&root.path().join("journal"))[0]);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&payload)
+        .unwrap();
+    let path = utf16("\\locked.bin");
+    assert_eq!(
+        unsafe { mirage_namespace_delete(engine, path.as_ptr(), path.len()) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 14);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_compact(engine) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 14);
+    assert!(payload.is_file());
+    drop(lock);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_compact(engine) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 0);
+    assert!(!payload.exists());
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn creation_only_timestamp_preserves_reopened_modification_time() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\created.bin");
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_set_times(file, 0, 123456789) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let path = utf16("\\created.bin");
+    let mut file = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_set_times(file, 987654321, 0) },
+        MirageStatus::Ok
+    );
+    let mut info = mirage_ffi::MirageFileInfo {
+        stable_index: 0,
+        size: 0,
+        directory: 0,
+        reserved: [0; 7],
+        created_ns: 0,
+        modified_ns: 0,
+    };
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_file_stat(file, &mut info) },
+        MirageStatus::Ok
+    );
+    assert_eq!(info.created_ns, 987654321);
+    assert_eq!(info.modified_ns, 123456789);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}

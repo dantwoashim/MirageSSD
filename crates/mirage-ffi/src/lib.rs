@@ -59,6 +59,7 @@ pub use metadata::mirage_set_times;
 pub use mutation::mirage_namespace_create;
 pub use mutation::mirage_namespace_delete;
 pub use mutation::mirage_namespace_rename;
+pub use mutation::mirage_namespace_rename_ex;
 use mutation::now_ns_i64;
 pub use read::mirage_lookup;
 pub use read::mirage_read;
@@ -66,6 +67,7 @@ pub use read::mirage_read_ex;
 pub use read::mirage_read_speculative;
 use write::build_extent_mutation_commit;
 pub use write::mirage_flush;
+pub use write::mirage_flush_volume;
 pub use write::mirage_truncate;
 pub use write::mirage_write;
 

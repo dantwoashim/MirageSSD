@@ -163,6 +163,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0030_payload_member_offset.sql",
         sql: include_str!("../../../migrations/0030_payload_member_offset.sql"),
     },
+    Migration {
+        version: 31,
+        name: "0031_unlink_pending.sql",
+        sql: include_str!("../../../migrations/0031_unlink_pending.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(connection: &mut Connection) -> Result<(), MirageError> {

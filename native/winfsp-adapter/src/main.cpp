@@ -117,15 +117,11 @@ int wmain(int argc, wchar_t** argv) {
                 if (command == "PINS-RELOAD") { tr::mirage_engine_reload_pins(host.engine()); continue; }
                 if (!command.empty()) std::cerr << "ignoring unknown control command\n";
             }
-            // Broken controller pipe is a recovery event. Preserve the source
-            // through every known actual game handle, then drain normally.
-            // No observed game handle cannot prove no launch/handoff occurred.
-            // Leave an orphan source mounted for exclusive recovery rather
-            // than unmount underneath an unidentified game.
-            if (games.empty()) return;
-            for (const auto game : games) WaitForSingleObject(game, INFINITE);
+            // Known handles cannot prove that an unobserved detached child
+            // no longer needs this source. EOF always leaves an orphan mount;
+            // exclusive controller recovery proves all game processes exited
+            // before stopping this exact source owner.
             release_games();
-            host.stop();
         });
     }
     const auto result = host.run(); active = nullptr;

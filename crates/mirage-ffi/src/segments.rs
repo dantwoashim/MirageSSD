@@ -119,6 +119,9 @@ struct SealJob {
     snapshot: ExtentMap,
     /// Enqueue time — dev trace measures queue latency into seal().
     enqueued: Instant,
+    modified_ns: Option<i64>,
+    retry: bool,
+    time_version: u64,
 }
 
 #[derive(Default)]
@@ -126,6 +129,8 @@ struct Shared {
     queue: VecDeque<SealJob>,
     pending: HashMap<InodeId, usize>,
     failed: HashSet<InodeId>,
+    failed_jobs: HashMap<InodeId, VecDeque<SealJob>>,
+    blocked_retry: HashSet<InodeId>,
     /// Inodes deleted while a seal job is in flight — a seal that fails on a
     /// discarded inode is cleaned up, not recorded as a failure.
     discarded: HashSet<InodeId>,
@@ -134,6 +139,7 @@ struct Shared {
     explicit_mtime: HashSet<InodeId>,
     /// Live mtimes for the read path (file stat / enumerate).
     mtimes: HashMap<InodeId, (i64, i64)>,
+    time_versions: HashMap<InodeId, u64>,
 }
 
 /// Close-time seal enqueues block only above this queue depth — bounds both
@@ -353,11 +359,20 @@ impl SegmentWriter {
             .cloned()
             .ok_or(MirageStatus::IntegrityFailure)?;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let modified_ns = if state.explicit_mtime.contains(&inode) {
+            state.mtimes.get(&inode).map(|times| times.1)
+        } else {
+            Some(segment.last_write_ns)
+        };
+        let time_version = state.time_versions.get(&inode).copied().unwrap_or(0);
         state.queue.push_back(SealJob {
             inode,
             segment,
             snapshot,
             enqueued: Instant::now(),
+            modified_ns,
+            retry: false,
+            time_version,
         });
         *state.pending.entry(inode).or_insert(0) += 1;
         drop(state);
@@ -396,6 +411,7 @@ impl SegmentWriter {
     /// inode's pending seals finish. Returns `IoError` when a seal failed.
     /// Callers must NOT hold `dirty.mutex`, `extents`, `open`, or `state`.
     pub fn drain_inode(&self, inode: InodeId) -> Result<(), MirageStatus> {
+        self.retry_failed(Some(inode));
         {
             let mut maps = self.extents.lock().unwrap_or_else(|p| p.into_inner());
             let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
@@ -419,10 +435,37 @@ impl SegmentWriter {
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
-        if state.failed.remove(&inode) {
+        if state.failed.contains(&inode) {
             return Err(MirageStatus::IoError);
         }
         Ok(())
+    }
+
+    fn retry_failed(&self, only: Option<InodeId>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let inodes: Vec<_> = state
+            .failed_jobs
+            .keys()
+            .copied()
+            .filter(|inode| {
+                only.is_none_or(|only| only == *inode)
+                    && state.pending.get(inode).copied().unwrap_or(0) == 0
+            })
+            .collect();
+        for inode in inodes {
+            state.blocked_retry.remove(&inode);
+            let mut jobs = state
+                .failed_jobs
+                .remove(&inode)
+                .expect("retained failed jobs");
+            state.pending.insert(inode, jobs.len());
+            for job in &mut jobs {
+                job.retry = true;
+            }
+            state.queue.extend(jobs);
+        }
+        drop(state);
+        self.wake.notify_all();
     }
 
     /// Drops the inode's open segment AND any queued (not yet started) seal
@@ -433,9 +476,7 @@ impl SegmentWriter {
         {
             let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(segment) = open.remove(&inode) {
-                invalidate_payload_file(&self.payload_files, &segment.payload_id);
-                let _ = std::fs::remove_file(&segment.path);
-                self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+                self.reclaim_payload(&segment.payload_id, &segment.path, segment.len);
             }
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -444,9 +485,7 @@ impl SegmentWriter {
             if job.inode != inode {
                 return true;
             }
-            invalidate_payload_file(&self.payload_files, &job.segment.payload_id);
-            let _ = std::fs::remove_file(&job.segment.path);
-            self.dirty.used.fetch_sub(job.segment.len, Ordering::AcqRel);
+            self.reclaim_payload(&job.segment.payload_id, &job.segment.path, job.segment.len);
             dropped += 1;
             false
         });
@@ -463,26 +502,65 @@ impl SegmentWriter {
         if state.pending.contains_key(&inode) {
             state.discarded.insert(inode);
         }
+        if let Some(jobs) = state.failed_jobs.remove(&inode) {
+            for job in jobs {
+                self.reclaim_payload(&job.segment.payload_id, &job.segment.path, job.segment.len);
+            }
+        }
         state.failed.remove(&inode);
+        state.blocked_retry.remove(&inode);
+        state.time_versions.remove(&inode);
         state.explicit_mtime.remove(&inode);
         state.mtimes.remove(&inode);
         drop(state);
         self.wake.notify_all();
     }
 
+    fn reclaim_payload(&self, id: &[u8; 16], path: &std::path::Path, length: u64) {
+        let _reclaim = self
+            .dirty
+            .reclaim_mutex
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !path.exists() {
+            return;
+        }
+        invalidate_payload_file(&self.payload_files, id);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("payload removal pending: {error}");
+                return;
+            }
+        }
+        let _ = self
+            .dirty
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(length))
+            });
+    }
     /// Seals every open segment and waits for the queue to empty (quiesce /
     /// destroy). Failures are logged, not raised — the mount-time orphan
     /// sweep and the pending-scan keep state consistent.
     pub fn drain_all(&self) {
-        if self.stop.load(Ordering::Acquire) {
-            return;
+        if let Err(error) = self.drain_all_checked() {
+            eprintln!("volume segment drain failed: {error:?}");
         }
+    }
+
+    pub fn drain_all_checked(&self) -> Result<(), MirageStatus> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(MirageStatus::IoError);
+        }
+        self.retry_failed(None);
         {
             let mut maps = self.extents.lock().unwrap_or_else(|p| p.into_inner());
             let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
             let inodes: Vec<InodeId> = open.keys().copied().collect();
             for inode in inodes {
-                let _ = self.enqueue_open(inode, &mut open, &mut maps);
+                self.enqueue_open(inode, &mut open, &mut maps)?;
             }
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -491,13 +569,18 @@ impl SegmentWriter {
                 break;
             }
             if self.stop.load(Ordering::Acquire) {
-                return;
+                return Err(MirageStatus::IoError);
             }
             state = self
                 .wake
                 .wait_timeout(state, Duration::from_secs(30))
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
+        }
+        if state.failed.is_empty() {
+            Ok(())
+        } else {
+            Err(MirageStatus::IoError)
         }
     }
 
@@ -529,8 +612,21 @@ impl SegmentWriter {
 
     /// Records an explicit mtime; the sealer stops touching this inode's
     /// `modified_ns` until `clear_explicit` (delete/discard) runs.
-    pub fn set_times(&self, inode: InodeId, created: Option<i64>, modified: Option<i64>) {
+    pub fn set_times(
+        &self,
+        inode: InodeId,
+        created: Option<i64>,
+        modified: Option<i64>,
+    ) -> Result<(), MirageStatus> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.db
+            .writer()
+            .namespace_set_times(self.volume, inode, created, modified)
+            .map_err(|_| MirageStatus::IoError)?;
+        if modified.is_some() {
+            let version = state.time_versions.entry(inode).or_default();
+            *version = version.saturating_add(1);
+        }
         let entry = state.mtimes.entry(inode).or_insert((0, 0));
         if let Some(created) = created {
             entry.0 = created;
@@ -539,6 +635,7 @@ impl SegmentWriter {
             entry.1 = modified;
             state.explicit_mtime.insert(inode);
         }
+        Ok(())
     }
 
     /// Drops the explicit-mtime flag (file close / discard).
@@ -598,13 +695,18 @@ impl SegmentWriter {
     /// bump the durable mtime unless the user set it explicitly.
     fn seal(&self, job: SealJob) {
         trace::record_elapsed(trace::Slot::SealQueueLatency, job.enqueued);
-        let SealJob {
-            inode,
-            segment,
-            snapshot,
-            enqueued: _,
-        } = job;
+        let inode = job.inode;
+        let retry = job.retry;
+        let segment = &job.segment;
+        let snapshot = &job.snapshot;
         let result = (|| -> Result<(), MirageStatus> {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let blocked =
+                state.failed.contains(&inode) && (!retry || state.blocked_retry.contains(&inode));
+            drop(state);
+            if blocked {
+                return Err(MirageStatus::IoError);
+            }
             {
                 let _fsync = trace::Scope::new(trace::Slot::SealFsync);
                 segment
@@ -617,12 +719,10 @@ impl SegmentWriter {
             // extents for a gone inode would reference a payload nobody can
             // reach — discard it instead. `delete_node_in` removes the inode
             // row, so namespace_entry is the definitive existence check.
-            match self.db.namespace_entry(self.volume, inode) {
+            match self.db.namespace_stat(self.volume, inode) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    invalidate_payload_file(&self.payload_files, &segment.payload_id);
-                    let _ = std::fs::remove_file(&segment.path);
-                    self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+                    self.reclaim_payload(&segment.payload_id, &segment.path, segment.len);
                     return Ok(());
                 }
                 Err(_) => return Err(MirageStatus::IoError),
@@ -639,25 +739,13 @@ impl SegmentWriter {
                     .unwrap_or(0)
                     .to_le_bytes(),
             );
-            let (explicit, explicit_mtime) = {
-                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    state.explicit_mtime.contains(&inode),
-                    state.mtimes.get(&inode).map(|times| times.1),
-                )
-            };
             // The mutation commit touches inodes.modified_ns itself, so the
             // truthful stamp lands after the commit body — inside the same
             // transaction.
-            let modified = if explicit {
-                explicit_mtime
-            } else {
-                Some(segment.last_write_ns)
-            };
             let mut mutation = crate::build_extent_mutation_commit(
                 self.volume,
                 inode,
-                &snapshot,
+                snapshot,
                 mirage_db::OperationKind::Write,
                 segment.payload_id,
                 segment
@@ -694,6 +782,15 @@ impl SegmentWriter {
                     expires_ns: now.saturating_add(60_000_000_000),
                 },
             ));
+            // Serialize explicit timestamp persistence with this commit. A
+            // setter after enqueue wins even when close cleared its live flag.
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let modified =
+                if state.time_versions.get(&inode).copied().unwrap_or(0) > job.time_version {
+                    state.mtimes.get(&inode).map(|times| times.1)
+                } else {
+                    job.modified_ns
+                };
             mutation.modified_ns = modified.map(|stamp| (inode, stamp));
             let _commit = trace::Scope::new(trace::Slot::SealCommit);
             self.db
@@ -706,12 +803,14 @@ impl SegmentWriter {
             if state.discarded.contains(&inode) {
                 // A delete landed while this seal was in flight — the same
                 // cleanup discard_inode runs for queued jobs, not a failure.
-                invalidate_payload_file(&self.payload_files, &segment.payload_id);
-                let _ = std::fs::remove_file(&segment.path);
-                self.dirty.used.fetch_sub(segment.len, Ordering::AcqRel);
+                self.reclaim_payload(&segment.payload_id, &segment.path, segment.len);
             } else {
                 eprintln!("segment seal failed for inode {inode:?}: {error:?}");
                 state.failed.insert(inode);
+                if retry {
+                    state.blocked_retry.insert(inode);
+                }
+                state.failed_jobs.entry(inode).or_default().push_back(job);
             }
         }
         if let Some(count) = state.pending.get_mut(&inode) {
@@ -719,6 +818,10 @@ impl SegmentWriter {
             if *count == 0 {
                 state.pending.remove(&inode);
                 state.discarded.remove(&inode);
+                if retry && !state.failed_jobs.contains_key(&inode) {
+                    state.failed.remove(&inode);
+                    state.blocked_retry.remove(&inode);
+                }
             }
         }
         drop(state);
