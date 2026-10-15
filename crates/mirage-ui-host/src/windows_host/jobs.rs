@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) fn drive_status(
     shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+    drive_token_store: Option<&Path>,
 ) -> serde_json::Value {
     let login = shared
         .lock()
@@ -16,8 +17,7 @@ pub(super) fn drive_status(
             LoginState::Failed { message } => serde_json::json!({"failed": message}),
         })
         .unwrap_or(serde_json::json!("idle"));
-    let store = mirage_cli::commands::backend_login::default_token_store_path()
-        .map(mirage_backend_drive::token_store::TokenStore::new);
+    let store = token_store(drive_token_store);
     let metadata = store.ok().and_then(|store| store.metadata().ok());
     serde_json::json!({
         "authenticated": metadata.is_some(),
@@ -29,6 +29,7 @@ pub(super) fn drive_status(
 
 pub(super) fn start_drive_login(
     shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+    drive_token_store: Option<&Path>,
 ) -> serde_json::Value {
     {
         let mut state = match shared.lock() {
@@ -44,6 +45,7 @@ pub(super) fn start_drive_login(
         )));
     }
     let cancel = shared.lock().ok().and_then(|s| s.login_cancel.clone());
+    let token_path = drive_token_store.map(Path::to_path_buf);
     std::thread::spawn({
         // The handler thread is parked on a socket; spawn a worker for
         // the blocking OAuth exchange.
@@ -51,7 +53,11 @@ pub(super) fn start_drive_login(
         move || {
             let flag = cancel.clone();
             let result = mirage_cli::commands::backend_login::authenticate_cancellable(
-                None, None, None, 600, cancel,
+                None,
+                None,
+                token_path.as_deref(),
+                600,
+                cancel,
             );
             if let Ok(mut state) = shared.lock() {
                 let cancelled =
@@ -237,6 +243,7 @@ pub(super) fn start_volume_set_cache(
 pub(super) fn start_volume_create(
     shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
     payload: &serde_json::Value,
+    drive_token_store: Option<&Path>,
 ) -> Result<serde_json::Value, MirageError> {
     {
         let mut state = shared
@@ -273,6 +280,7 @@ pub(super) fn start_volume_create(
         }),
         ..spec
     };
+    let token_path = drive_token_store.map(Path::to_path_buf);
     std::thread::spawn({
         let shared = shared.clone();
         move || {
@@ -284,7 +292,13 @@ pub(super) fn start_volume_create(
             };
             let credentials = mirage_cli::commands::backend_login::oauth_client_credentials(None);
             let result = credentials.and_then(|credentials| {
-                mirage_cli::commands::volume::create(&spec, &credentials, None, &mut progress, None)
+                mirage_cli::commands::volume::create(
+                    &spec,
+                    &credentials,
+                    token_path.as_deref(),
+                    &mut progress,
+                    None,
+                )
             });
             if let Ok(mut state) = shared.lock() {
                 state.create = match result {
@@ -308,4 +322,40 @@ pub(super) fn start_volume_create(
         }
     });
     Ok(serde_json::json!({"started": true}))
+}
+
+/// Resolve every UI account operation against the same configured store.
+pub(crate) fn token_store(
+    path: Option<&Path>,
+) -> Result<mirage_backend_drive::token_store::TokenStore, MirageError> {
+    path.map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(mirage_cli::commands::backend_login::default_token_store_path)
+        .map(mirage_backend_drive::token_store::TokenStore::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_token_store_is_used_for_status_and_logout() {
+        let path = std::env::temp_dir().join(format!(
+            "mirage-ui-store-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(token_store(Some(&path)).unwrap().path(), path);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SharedState::default()));
+        assert_eq!(drive_status(&shared, Some(&path))["authenticated"], false);
+        std::fs::write(&path, br#"{"format_version":1,"account_id":"fixture-account","scopes":["https://www.googleapis.com/auth/drive.file"],"issued_unix_seconds":42,"ciphertext_base64":"fixture-only"}"#).unwrap();
+        assert_eq!(
+            drive_status(&shared, Some(&path))["account_id"],
+            "fixture-account"
+        );
+        assert!(token_store(Some(&path)).unwrap().delete().unwrap());
+        assert_eq!(drive_status(&shared, Some(&path))["authenticated"], false);
+    }
 }

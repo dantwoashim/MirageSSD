@@ -889,7 +889,7 @@ pub(crate) fn open_cache(
             "cache budget is smaller than one repository page",
         ));
     }
-    let layout = CacheLayout {
+    let mut layout = CacheLayout {
         page_size: ByteCount::from_u64(u64::from(page_size)),
         slot_count,
         db_journal_allowance: ByteCount::ZERO,
@@ -930,11 +930,14 @@ pub(crate) fn open_cache(
             ));
         }
     };
-    if spec.page_size != layout.page_size || spec.slot_count != layout.slot_count {
+    if spec.page_size != layout.page_size {
         return Err(MirageError::repository_conflict(
             "configured cache layout differs from the existing service cache",
         ));
     }
+    // Capacity belongs to the established service-wide arena. A repository's
+    // admission budget must not resize another mounted generation's backing file.
+    layout.slot_count = spec.slot_count;
     let shard = Arc::new(ArenaShard::open(
         &cache_root.join(&spec.relative_path),
         layout,

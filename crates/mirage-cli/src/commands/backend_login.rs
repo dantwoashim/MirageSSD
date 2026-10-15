@@ -143,7 +143,7 @@ pub fn authenticate_cancellable(
     )?;
     // A signed-in user expects their volumes to reconnect at logon; register
     // the per-user agent (HKCU Run, no elevation) idempotently.
-    let _ = super::agent::install_logon_registration();
+    let _ = super::agent::install_logon_registration(token_path);
     Ok(AuthOutcome {
         account_id: account,
         scopes: grant.scopes,

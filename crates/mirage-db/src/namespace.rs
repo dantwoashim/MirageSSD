@@ -630,6 +630,15 @@ pub fn rename_in_with_policy(
             ));
         }
         transaction
+            .execute(
+                "DELETE FROM legacy_inode_map WHERE volume_id = ?1 AND inode = ?2",
+                params![
+                    volume_id.as_bytes().as_slice(),
+                    victim.inode.as_bytes().as_slice()
+                ],
+            )
+            .map_err(|e| sqlite(e, "namespace victim legacy binding removal failed"))?;
+        transaction
             .prepare_cached(if retain_victim {
                 "UPDATE inodes SET unlink_pending = 1 WHERE volume_id = ?1 AND inode = ?2"
             } else {
@@ -1820,7 +1829,7 @@ pub fn create_checkpoint(
              FROM inodes i
              LEFT JOIN dirents d
                ON d.volume_id = i.volume_id AND d.child_inode = i.inode
-             WHERE i.volume_id = ?1
+             WHERE i.volume_id = ?1 AND i.unlink_pending = 0
              ORDER BY i.inode",
         )
         .map_err(|e| sqlite(e, "namespace checkpoint scan failed"))?;

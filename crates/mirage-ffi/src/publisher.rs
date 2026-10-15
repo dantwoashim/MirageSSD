@@ -730,7 +730,30 @@ pub fn evict_published(
     pins: &std::collections::HashSet<mirage_types::InodeId>,
     target: u64,
 ) -> Result<(u64, u64), MirageError> {
-    let evictable = db.published_payloads_evictable(volume)?;
+    // Serialize candidate snapshots too: a second eviction must not act on a
+    // stale alive row and release an already-reclaimed charge.
+    let _reclaim = dirty
+        .reclaim_mutex
+        .lock()
+        .map_err(|_| MirageError::internal_invariant("payload reclaim lock poisoned"))?;
+    let mut evictable: Vec<_> = db
+        .published_payloads_evictable(volume)?
+        .into_iter()
+        .map(|(id, length, published)| (id, length, published, false))
+        .collect();
+    // A previous attempt may have durably marked a published row dead but
+    // failed its physical unlink. Keep EVICT itself retryable, not only compact.
+    for (id, length, published) in db.published_payloads_pending_cleanup(volume)? {
+        let name = id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            + ".payload";
+        if journal_dir.join(name).is_file() {
+            evictable.push((id, length, published, true));
+        }
+    }
+    evictable.sort_by_key(|(_, _, published, _)| *published);
     if !evictable.is_empty() {
         // Deleting a payload is irreversible — the committed state that
         // justifies it (the remote publication record) must be power-loss
@@ -740,7 +763,7 @@ pub fn evict_published(
     }
     let mut freed = 0_u64;
     let mut pinned_blocked = 0_u64;
-    for (payload_id, plaintext_length, _published_ns) in evictable {
+    for (payload_id, plaintext_length, _published_ns, already_dead) in evictable {
         if freed >= target {
             break;
         }
@@ -752,32 +775,35 @@ pub fn evict_published(
             pinned_blocked += u64::try_from(plaintext_length).unwrap_or(0);
             continue;
         }
-        if inodes.iter().any(|inode| handles.is_open(*inode)) {
-            continue;
-        }
         let mut name = String::with_capacity(40);
         for byte in payload_id {
             name.push_str(&format!("{byte:02x}"));
         }
         name.push_str(".payload");
-        // Never release the physical charge before deletion succeeds. If a
-        // later ledger update fails, the missing, remotely recoverable file
-        // stays conservatively charged until another eviction pass finishes.
-        crate::handles::invalidate_payload_file(payload_files, &payload_id);
-        match std::fs::remove_file(journal_dir.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(MirageError::from(error)),
-        }
-        db.writer()
-            .physical_mark_extent_dead(payload_id, now_ns_i64_pub())?;
         let length = u64::try_from(plaintext_length).unwrap_or(0);
-        let _ = dirty
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(length))
-            });
-        freed += length;
+        let reclaimed = handles.with_closed_inodes(&inodes, || -> Result<bool, MirageError> {
+            if !already_dead {
+                db.writer()
+                    .physical_mark_extent_dead(payload_id, now_ns_i64_pub())?;
+            }
+            db.durability_barrier()?;
+            // Failed unlink leaves a durable Dead row for EVICT/compaction retry.
+            crate::handles::invalidate_payload_file(payload_files, &payload_id);
+            match std::fs::remove_file(journal_dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+            let _ = dirty
+                .used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    Some(used.saturating_sub(length))
+                });
+            Ok(true)
+        })?;
+        if reclaimed.transpose()?.unwrap_or(false) {
+            freed += length;
+        }
     }
     Ok((freed, pinned_blocked))
 }

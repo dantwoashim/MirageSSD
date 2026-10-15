@@ -775,7 +775,8 @@ fn failed_file_deletion_keeps_payload_charged_and_retryable() {
     let (status, freed) = evict(engine, u64::MAX);
     assert_eq!(status, MirageStatus::IoError);
     assert_eq!(freed, 0);
-    assert_eq!(stats(engine).evicted_payloads, 0);
+    // Logical eviction is committed before physical unlink; charge is retained.
+    assert_eq!(stats(engine).evicted_payloads, 1);
     assert_eq!(
         unsafe { &*engine }
             .dirty
@@ -786,6 +787,10 @@ fn failed_file_deletion_keeps_payload_charged_and_retryable() {
         before
     );
     assert!(payload.exists());
+    assert_eq!(
+        read_path(engine, "locked.bin", 4096),
+        (MirageStatus::Ok, vec![0x71; 4096])
+    );
     drop(held);
     let (status, freed) = evict(engine, u64::MAX);
     assert_eq!(status, MirageStatus::Ok);

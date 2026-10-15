@@ -10,9 +10,6 @@ struct FileContext {
     std::uint32_t opener_pid{};
     MirageFileHandle* rust_handle{};
     MirageFileInfo info{};
-    // Set by SetDelete; the durable delete runs at cleanup when the flag and
-    // FspCleanupDelete agree, matching Windows delete-pending semantics.
-    bool delete_pending{};
 };
 class FileSystemHost {
 public:

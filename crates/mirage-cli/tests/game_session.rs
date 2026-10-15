@@ -53,6 +53,13 @@ fn run_session(fail_monitor: bool, crash_worker: bool, short_root: bool) {
     let native = active.join("native");
     let bundle = base.join("bundle");
     fs::create_dir_all(&native).unwrap();
+    if crash_worker {
+        fs::write(
+            native.join("fixture-hold-child.txt"),
+            b"bounded post-read hold",
+        )
+        .unwrap();
+    }
     fs::create_dir(&bundle).unwrap();
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let adapter = repository.join("build/windows-msvc-debug/native/winfsp-adapter/Debug");
@@ -176,6 +183,11 @@ fn run_session(fail_monitor: bool, crash_worker: bool, short_root: bool) {
             mirage_cli::commands::games::cleanup_game(&root).is_err(),
             "recovery must refuse an active detached child"
         );
+        fs::write(
+            native.join("fixture-release-child.txt"),
+            b"cleanup refusal verified",
+        )
+        .unwrap();
         assert_eq!(unsafe { WaitForSingleObject(child, 15000) }, WAIT_OBJECT_0);
         unsafe { CloseHandle(child) };
         // EOF must preserve an orphan source even if only the launcher was

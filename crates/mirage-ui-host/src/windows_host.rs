@@ -133,19 +133,25 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(store) = token_store_path.as_deref()
         && store.is_file()
     {
-        if let Err(error) = mirage_cli::commands::agent::install_logon_registration() {
+        if let Err(error) =
+            mirage_cli::commands::agent::install_logon_registration(drive_token_store.as_deref())
+        {
             log_event("agent.registration_failed", &error.to_string());
         }
         // An upgrade or a service restart leaves mounted drives without a
         // Drive token until the agent runs; start it now if it is not
         // already running (a second instance exits on the agent mutex).
-        if let Err(error) = mirage_cli::commands::agent::spawn_detached() {
+        if let Err(error) =
+            mirage_cli::commands::agent::spawn_detached(drive_token_store.as_deref())
+        {
             log_event("agent.spawn_failed", &error.to_string());
         }
     }
     // The tray companion keeps the host alive after the browser tab
     // closes; re-register on every start so updates repair the path.
-    if let Err(error) = mirage_cli::commands::agent::install_tray_registration() {
+    if let Err(error) =
+        mirage_cli::commands::agent::install_tray_registration(drive_token_store.as_deref())
+    {
         log_event("tray.registration_failed", &error.to_string());
     }
     let page_url = format!("{origin}/#{token}");
@@ -168,7 +174,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &worker_shared,
             );
         });
-        crate::tray::run(url);
+        crate::tray::run(url, drive_token_store.clone());
     }
     if print_url {
         // Diagnostics: lets a script drive this host's page URL (the
@@ -196,32 +202,86 @@ fn serve(
     drive_token_store: Option<&Path>,
     shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for connection in listener.incoming() {
-        match connection {
-            Ok(mut stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-                if let Err(error) = handle_connection(
-                    &mut stream,
-                    ui_root,
-                    origin,
-                    token,
-                    drive_token_store,
-                    shared,
-                ) {
-                    let _ = write_response(
+    serve_until(
+        listener,
+        ui_root,
+        origin,
+        token,
+        drive_token_store,
+        shared,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// Fixed workers and a bounded queue keep browser preconnections from blocking
+/// the listener or growing an unbounded number of threads. Closing the queue
+/// joins all workers; socket deadlines bound idle connections during shutdown.
+fn serve_until(
+    listener: TcpListener,
+    ui_root: &Path,
+    origin: &str,
+    token: &str,
+    drive_token_store: Option<&Path>,
+    shared: &std::sync::Arc<std::sync::Mutex<SharedState>>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    listener.set_nonblocking(true)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(16);
+    let receiver = std::sync::Mutex::new(receiver);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let receiver = &receiver;
+            scope.spawn(move || {
+                loop {
+                    let stream = receiver.lock().expect("HTTP queue lock").recv();
+                    let Ok(mut stream) = stream else { break };
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    let result = stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))));
+                    if result.is_err() {
+                        continue;
+                    }
+                    if let Err(error) = handle_connection(
                         &mut stream,
-                        500,
-                        "application/json; charset=utf-8",
-                        br#"{"error":"local UI bridge failed"}"#,
-                        false,
-                    );
-                    log_event("request.failed", &error.to_string());
+                        ui_root,
+                        origin,
+                        token,
+                        drive_token_store,
+                        shared,
+                    ) {
+                        let _ = write_response(
+                            &mut stream,
+                            500,
+                            "application/json; charset=utf-8",
+                            br#"{"error":"local UI bridge failed"}"#,
+                            false,
+                        );
+                        log_event("request.failed", &error.to_string());
+                    }
                 }
-            }
-            Err(error) => log_event("accept.failed", &error.to_string()),
+            });
         }
-    }
+        let result = loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break Ok(());
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Full queues reject promptly; never stall the accept loop.
+                    let _ = sender.try_send(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        drop(sender);
+        result
+    })?;
     Ok(())
 }
 
@@ -381,7 +441,7 @@ fn handle_connection(
                 )?;
                 return Ok(());
             }
-            let body = drive_status(shared);
+            let body = drive_status(shared, drive_token_store);
             write_response(
                 stream,
                 200,
@@ -401,7 +461,7 @@ fn handle_connection(
                 )?;
                 return Ok(());
             }
-            let body = start_drive_login(shared);
+            let body = start_drive_login(shared, drive_token_store);
             write_response(
                 stream,
                 200,
@@ -566,8 +626,7 @@ fn handle_connection(
                 )?;
                 return Ok(());
             }
-            let result = mirage_cli::commands::backend_login::default_token_store_path()
-                .and_then(|path| mirage_backend_drive::token_store::TokenStore::new(path).delete());
+            let result = jobs::token_store(drive_token_store).and_then(|store| store.delete());
             let body = serde_json::json!({"signed_out": result.unwrap_or(false)});
             write_response(
                 stream,
@@ -590,7 +649,7 @@ fn handle_connection(
             }
             let body = match serde_json::from_slice::<serde_json::Value>(&request.body)
                 .ok()
-                .and_then(|payload| start_volume_create(shared, &payload).ok())
+                .and_then(|payload| start_volume_create(shared, &payload, drive_token_store).ok())
             {
                 Some(body) => body,
                 None => serde_json::json!({"error": "volume creation could not be started"}),
@@ -838,4 +897,42 @@ fn handle_connection(
         )?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    #[test]
+    fn idle_connection_does_not_block_a_following_request_and_workers_stop() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            serve_until(
+                listener,
+                Path::new("."),
+                "http://localhost",
+                "test",
+                None,
+                &std::sync::Arc::new(std::sync::Mutex::new(SharedState::default())),
+                &worker_stop,
+            )
+            .unwrap();
+        });
+        let idle = TcpStream::connect(address).unwrap();
+        let mut request = TcpStream::connect(address).unwrap();
+        request
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        request
+            .write_all(b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        request.read_to_string(&mut response).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(idle);
+        server.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
 }

@@ -365,7 +365,9 @@ pub fn create(
 ) -> Result<VolumeCreated, MirageError> {
     progress("Connecting to Google Drive");
     let session = drive_live::connect(client_credentials, token_store)?;
-    create_with_backend(spec, &LiveVolumeBackend { session }, progress, transport)
+    let created = create_with_backend(spec, &LiveVolumeBackend { session }, progress, transport)?;
+    let _ = super::agent::install_logon_registration(token_store);
+    Ok(created)
 }
 
 /// `create` with an injectable Drive backend (the local test seam).
@@ -408,10 +410,6 @@ fn create_in(
         progress,
     ) {
         Ok((mounted, applied_floor, floor_error)) => {
-            // Sign-in happened at volume creation, so ensure the per-user
-            // agent is registered to keep the volume mounted and
-            // authenticated after reboot.
-            let _ = super::agent::install_logon_registration();
             let mount_point = mounted["mount_point"]
                 .as_str()
                 .map(PathBuf::from)

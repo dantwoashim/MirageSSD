@@ -18,6 +18,11 @@ mod windows;
 
 #[derive(Debug, Subcommand)]
 pub enum GameCommand {
+    /// Select an existing completed managed installation for the desktop app.
+    Select {
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Install official native files plus streamed asset presentation in a new managed root.
     Install {
         #[arg(long)]
@@ -225,9 +230,27 @@ fn phase(root: &Path, state: &mut State, value: &str) -> Result<(), MirageError>
 
 pub fn run(command: GameCommand, json_output: bool) -> Result<(), MirageError> {
     let result = match command {
+        GameCommand::Select { root } => {
+            let bridge = bridge_root()?;
+            let _owner = lock(&bridge)?;
+            if read::<Job>(&bridge.join("job.json"))
+                .ok()
+                .as_ref()
+                .is_some_and(job_active)
+            {
+                return Err(MirageError::repository_conflict(
+                    "a game task is already running",
+                ));
+            }
+            select_installation(&bridge, &root)?;
+            status(&root)?
+        }
         GameCommand::Install { spec } => {
             let spec: Spec = read(&spec)?;
             install_game(&spec)?;
+            let bridge = bridge_root()?;
+            let _owner = lock(&bridge)?;
+            select_installation(&bridge, &spec.root)?;
             status(&spec.root)?
         }
         GameCommand::Status { root } => status(&root)?,
@@ -740,6 +763,60 @@ fn bridge_root() -> Result<PathBuf, MirageError> {
     Ok(path)
 }
 
+/// Persist only a validated, completed installation. Older CLI installations
+/// can be selected explicitly without scanning drives or relying on job logs.
+fn select_installation(bridge: &Path, root: &Path) -> Result<(), MirageError> {
+    ordinary(root)?;
+    let _owner = lock(root)?;
+    let spec: Spec = read(&root.join("game.json"))?;
+    spec.validate()?;
+    if spec.root != root {
+        return Err(MirageError::invalid_argument(
+            "game registration root mismatch",
+        ));
+    }
+    let state: State = read(&root.join("session.json"))?;
+    if state.phase != "ready" {
+        return Err(MirageError::repository_conflict(
+            "installation is not ready",
+        ));
+    }
+    if !generation(root, &state)?.is_dir() {
+        return Err(MirageError::repository_conflict(
+            "active game generation is missing",
+        ));
+    }
+    write(&bridge.join("selected-installation.json"), &root)
+}
+
+fn job_active(job: &Job) -> bool {
+    #[cfg(windows)]
+    {
+        windows::pid_alive(job.pid, job.creation)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = job;
+        false
+    }
+}
+
+fn resolve_installation(bridge: &Path) -> Result<Option<PathBuf>, MirageError> {
+    let selected = bridge.join("selected-installation.json");
+    let job = read::<Job>(&bridge.join("job.json")).ok();
+    let root = if let Some(job) = job.as_ref().filter(|job| job_active(job)) {
+        job.root.clone()
+    } else if selected.is_file() {
+        read::<PathBuf>(&selected)?
+    } else if let Ok(job) = read::<Job>(&bridge.join("job.json")) {
+        job.root
+    } else {
+        return Ok(None);
+    };
+    ordinary(&root)?;
+    Ok(Some(root))
+}
+
 /// Token-authenticated desktop bridge uses a detached interactive-user helper.
 /// Ownership is enforced again by the worker lock, so UI closure or a second
 /// app window cannot race a playing session with maintenance/cleanup.
@@ -779,9 +856,12 @@ pub fn start_job(operation: &str, payload: Value) -> Result<Value, MirageError> 
         {
             return Err(MirageError::invalid_argument("unknown game operation"));
         }
-        let job: Job = read(&bridge.join("job.json"))?;
-        ordinary(&job.root)?;
-        arguments.extend(["--root".into(), job.root.to_string_lossy().into_owned()]);
+        let root = resolve_installation(&bridge)?.ok_or_else(|| {
+            MirageError::repository_conflict(
+                "no managed game selected; run game select --root <managed folder>",
+            )
+        })?;
+        arguments.extend(["--root".into(), root.to_string_lossy().into_owned()]);
         if operation == "policy" {
             let retention = payload["retention"]
                 .as_str()
@@ -789,7 +869,7 @@ pub fn start_job(operation: &str, payload: Value) -> Result<Value, MirageError> 
                 .ok_or_else(|| MirageError::invalid_argument("unknown retention policy"))?;
             arguments.extend(["--retention".into(), retention.into()]);
         }
-        job.root
+        root
     };
     let executable = std::env::current_exe().map_err(MirageError::from)?;
     let worker = executable
@@ -826,26 +906,32 @@ pub fn start_job(_operation: &str, _payload: Value) -> Result<Value, MirageError
 
 pub fn bridge_status() -> Result<Value, MirageError> {
     let bridge = bridge_root()?;
-    let job = match read::<Job>(&bridge.join("job.json")) {
-        Ok(job) => job,
-        Err(_) => return Ok(json!({"registered": false, "busy": false})),
+    bridge_status_at(&bridge)
+}
+
+fn bridge_status_at(bridge: &Path) -> Result<Value, MirageError> {
+    let job = read::<Job>(&bridge.join("job.json")).ok();
+    let Some(root) = resolve_installation(bridge)? else {
+        return Ok(json!({"registered": false, "busy": false}));
     };
-    let mut value = status(&job.root)?;
-    #[cfg(windows)]
-    {
-        value["busy"] = json!(
-            value["busy"].as_bool() == Some(true) || windows::pid_alive(job.pid, job.creation)
-        );
-    }
-    value["operation"] = json!(job.operation);
-    if value["busy"] != true && value["registered"] != true {
-        let mut text = String::new();
-        File::open(&job.log)
-            .map_err(MirageError::from)?
-            .take(8192)
-            .read_to_string(&mut text)
-            .map_err(MirageError::from)?;
-        value["error"] = json!(text);
+    let mut value = status(&root)?;
+    if let Some(job) = job.filter(|job| job.root == root) {
+        #[cfg(windows)]
+        {
+            value["busy"] = json!(
+                value["busy"].as_bool() == Some(true) || windows::pid_alive(job.pid, job.creation)
+            );
+        }
+        value["operation"] = json!(job.operation);
+        if value["busy"] != true && value["registered"] != true {
+            let mut text = String::new();
+            if let Ok(file) = File::open(&job.log) {
+                file.take(8192)
+                    .read_to_string(&mut text)
+                    .map_err(MirageError::from)?;
+            }
+            value["error"] = json!(text);
+        }
     }
     Ok(value)
 }
@@ -881,6 +967,54 @@ mod tests {
             reclaimed_bytes: 0,
         }
     }
+    #[test]
+    fn selected_installation_survives_missing_job_and_legacy_jobs_remain_visible() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("game");
+        let bridge = temporary.path().join("bridge");
+        std::fs::create_dir_all(root.join("generations/active")).unwrap();
+        std::fs::create_dir(&bridge).unwrap();
+        write(&root.join("game.json"), &spec(&root)).unwrap();
+        let mut state = empty_state(
+            root.join("generations/active"),
+            root.join("generations/previous"),
+        );
+        state.previous_generation = None;
+        save(&root, &state).unwrap();
+        let job = Job {
+            root: root.clone(),
+            pid: 0,
+            creation: None,
+            operation: "install".into(),
+            log: bridge.join("log"),
+        };
+        write(&bridge.join("job.json"), &job).unwrap();
+        assert_eq!(resolve_installation(&bridge).unwrap(), Some(root.clone()));
+        select_installation(&bridge, &root).unwrap();
+        std::fs::remove_file(bridge.join("job.json")).unwrap();
+        assert_eq!(resolve_installation(&bridge).unwrap(), Some(root.clone()));
+        assert_eq!(bridge_status_at(&bridge).unwrap()["registered"], true);
+        let pending_root = temporary.path().join("new-installation");
+        let mut pending = Job {
+            root: pending_root.clone(),
+            pid: std::process::id(),
+            creation: windows::creation(std::process::id()),
+            operation: "install".into(),
+            log: bridge.join("pending.log"),
+        };
+        write(&bridge.join("job.json"), &pending).unwrap();
+        assert_eq!(resolve_installation(&bridge).unwrap(), Some(pending_root));
+        assert_eq!(bridge_status_at(&bridge).unwrap()["busy"], true);
+        // A failed new task must not replace the durable completed selection.
+        pending.pid = 0;
+        pending.creation = None;
+        write(&bridge.join("job.json"), &pending).unwrap();
+        assert_eq!(resolve_installation(&bridge).unwrap(), Some(root.clone()));
+        state.phase = "installation_failed".into();
+        save(&root, &state).unwrap();
+        assert!(select_installation(&bridge, &root).is_err());
+    }
+
     #[test]
     fn locks_paths_and_registration_budgets_fail_closed() {
         let root = tempfile::tempdir().unwrap();

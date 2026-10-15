@@ -178,6 +178,8 @@ pub enum Command {
         /// Run one mount/refresh cycle and exit (for tests).
         #[arg(long, hide = true)]
         once: bool,
+        #[arg(long)]
+        drive_token_store: Option<std::path::PathBuf>,
     },
     /// Unmount a repository.
     Unmount {
@@ -1550,7 +1552,10 @@ pub fn dispatch(command: Command, json: bool) -> Result<(), MirageError> {
             },
             json,
         ),
-        Command::Agent { once } => agent::run(once),
+        Command::Agent {
+            once,
+            drive_token_store,
+        } => agent::run(once, drive_token_store.as_deref()),
         Command::Unmount { repository_id } => {
             service::run(mirage_ipc::Command::Unmount { repository_id }, json)
         }

@@ -395,6 +395,30 @@ pub fn referenced_payload_ids(
         .map_err(|e| sqlite(e, "referenced payload row decode failed"))
 }
 
+/// Locally owned journal payloads, including superseded operation payloads.
+/// A payload still shared by another volume must survive unregister.
+pub fn journal_payload_ids(
+    connection: &Connection,
+    volume_id: RepositoryId,
+) -> Result<std::collections::BTreeSet<[u8; 16]>, MirageError> {
+    let mut statement = connection.prepare_cached(
+        "SELECT payload_id FROM byte_extents WHERE volume_id=?1 AND payload_id IS NOT NULL
+         UNION SELECT p.payload_id FROM operation_payloads p JOIN local_operations o ON o.operation_id=p.operation_id WHERE o.volume_id=?1
+         EXCEPT SELECT payload_id FROM byte_extents WHERE volume_id<>?1 AND payload_id IS NOT NULL
+         EXCEPT SELECT p.payload_id FROM operation_payloads p JOIN local_operations o ON o.operation_id=p.operation_id WHERE o.volume_id<>?1"
+    ).map_err(|e| sqlite(e, "owned journal payload scan prepare failed"))?;
+    let rows = statement
+        .query_map([volume_id.as_bytes().as_slice()], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            bytes
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 16))
+        })
+        .map_err(|e| sqlite(e, "owned journal payload scan failed"))?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|e| sqlite(e, "owned journal payload decode failed"))
+}
+
 /// Quiesce-time compaction for one volume: drops every `byte_extents` row
 /// strictly older than its inode's durable head, then marks physical
 /// extents of `journal_file_id` dead once no remaining row references their
@@ -438,13 +462,11 @@ pub fn compact_volume(
         let mut statement = transaction
             .prepare_cached(
                 "SELECT DISTINCT payload_id FROM byte_extents
-                 WHERE volume_id = ?1 AND payload_id IS NOT NULL",
+                 WHERE payload_id IS NOT NULL",
             )
             .map_err(|e| sqlite(e, "referenced payload scan prepare failed"))?;
         let rows = statement
-            .query_map([volume_id.as_bytes().as_slice()], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| sqlite(e, "referenced payload scan failed"))?;
         rows.collect::<Result<std::collections::BTreeSet<_>, _>>()
             .map_err(|e| sqlite(e, "referenced payload row decode failed"))?
@@ -515,6 +537,15 @@ pub fn release_inode_extents(
     // Final-close/recovery owns this inode's lifetime. Finalize the durable
     // tombstone and its extent references in the same transaction; callers
     // fence this commit before irreversible payload removal.
+    // Also recover tombstones created by older replacement code that left
+    // restrictive legacy references behind. Never alter a live inode's map.
+    transaction
+        .execute(
+            "DELETE FROM legacy_inode_map WHERE volume_id = ?1 AND inode = ?2
+             AND EXISTS (SELECT 1 FROM inodes WHERE volume_id = ?1 AND inode = ?2 AND unlink_pending = 1)",
+            params![volume_id.as_bytes().as_slice(), inode.as_bytes().as_slice()],
+        )
+        .map_err(|e| sqlite(e, "pending inode legacy cleanup failed"))?;
     transaction
         .execute(
             "DELETE FROM inodes WHERE volume_id = ?1 AND inode = ?2 AND unlink_pending = 1",
@@ -563,15 +594,13 @@ pub fn release_inode_extents(
             .prepare_cached(
                 "UPDATE physical_extents SET state = 'dead', updated_ns = ?1
                  WHERE file_id = ?2 AND extent_id = ?3 AND state = 'alive' AND pin_count = 0
-                   AND NOT EXISTS (SELECT 1 FROM byte_extents
-                                   WHERE volume_id = ?4 AND payload_id = ?3)",
+                   AND NOT EXISTS (SELECT 1 FROM byte_extents WHERE payload_id = ?3)",
             )
             .and_then(|mut stmt| {
                 stmt.execute(params![
                     now_ns,
                     journal_file_id.as_slice(),
-                    payload_id.as_slice(),
-                    volume_id.as_bytes().as_slice()
+                    payload_id.as_slice()
                 ])
             })
             .map_err(|e| sqlite(e, "deleted-inode extent dead mark failed"))?;
@@ -619,6 +648,13 @@ pub fn drop_versions_before(
 }
 
 impl Database {
+    pub fn journal_payload_ids(
+        &self,
+        volume_id: RepositoryId,
+    ) -> Result<std::collections::BTreeSet<[u8; 16]>, MirageError> {
+        self.reads()
+            .with_connection(|connection| journal_payload_ids(connection, volume_id))
+    }
     /// Payload ids referenced by any extent row of the volume.
     pub fn referenced_payload_ids(
         &self,

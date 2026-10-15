@@ -19,6 +19,177 @@ use mirage_types::{GenerationId, RepositoryId};
 
 const VOLUME: RepositoryId = RepositoryId::from_bytes([9; 16]);
 
+#[test]
+fn sparse_extension_exceeds_budget_without_allocating_payload_but_writes_stay_bounded() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 4096, true);
+    let file = create_and_open(engine, "\\sparse.bin");
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_truncate(file, 1024 * 1024) },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_engine_dirty_used_for_tests(engine) }, 0);
+    assert_eq!(read_exact(file, 1024 * 1024 - 16, 16), vec![0; 16]);
+    assert_eq!(write(file, 0, &[7; 4096]), MirageStatus::Ok);
+    assert_eq!(write(file, 8192, &[8]), MirageStatus::DiskFull);
+    assert_eq!(read_exact(file, 0, 4096), vec![7; 4096]);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn seeded_identity_matches_enumeration_and_stays_stable_across_rename() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let mut directory = std::ptr::null_mut();
+    let path = utf16("\\");
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut directory) },
+        MirageStatus::Ok
+    );
+    unsafe extern "C" fn collect(
+        context: *mut std::ffi::c_void,
+        name: *const u16,
+        length: usize,
+        info: mirage_ffi::MirageFileInfo,
+    ) -> u8 {
+        let entries = unsafe { &mut *(context as *mut Vec<(String, u64)>) };
+        entries.push((
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, length) }),
+            info.stable_index,
+        ));
+        1
+    }
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_enumerate(
+                directory,
+                std::ptr::null(),
+                0,
+                10,
+                &mut entries as *mut _ as *mut std::ffi::c_void,
+                Some(collect),
+            )
+        },
+        MirageStatus::Ok
+    );
+    let enumerated = entries
+        .iter()
+        .find(|(name, _)| name == "base.dat")
+        .unwrap()
+        .1;
+    let old = utf16("\\base.dat");
+    let new = utf16("\\renamed.dat");
+    let mut file = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, old.as_ptr(), old.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    let mut info = mirage_ffi::MirageFileInfo {
+        stable_index: 0,
+        size: 0,
+        directory: 0,
+        reserved: [0; 7],
+        created_ns: 0,
+        modified_ns: 0,
+    };
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_file_stat(file, &mut info) },
+        MirageStatus::Ok
+    );
+    assert_eq!(info.stable_index, enumerated);
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_namespace_rename_ex(
+                engine,
+                old.as_ptr(),
+                old.len(),
+                new.as_ptr(),
+                new.len(),
+                0,
+            )
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_file_stat(file, &mut info) },
+        MirageStatus::Ok
+    );
+    assert_eq!(info.stable_index, enumerated);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(directory) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn replacement_of_seeded_file_survives_reopen() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let file = create_and_open(engine, "\\replacement.dat");
+    assert_eq!(write(file, 0, b"replacement"), MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_flush(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    let from = utf16("\\replacement.dat");
+    let to = utf16("\\base.dat");
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_namespace_rename_ex(
+                engine,
+                from.as_ptr(),
+                from.len(),
+                to.as_ptr(),
+                to.len(),
+                1,
+            )
+        },
+        MirageStatus::Ok
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let mut file = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, to.as_ptr(), to.len(), &mut file) },
+        MirageStatus::Ok
+    );
+    assert_eq!(read_exact(file, 0, 11), b"replacement");
+    assert_eq!(unsafe { mirage_file_close(file) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[test]
+fn startup_recovers_older_pending_seed_with_legacy_binding() {
+    let (_objects, index) = build_index();
+    let root = tempfile::tempdir().unwrap();
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+    let connection = rusqlite::Connection::open(root.path().join("control.db")).unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON;
+        BEGIN;
+        DELETE FROM dirents WHERE child_inode IN (SELECT inode FROM legacy_inode_map WHERE legacy_path='base.dat');
+        UPDATE inodes SET unlink_pending=1 WHERE inode IN (SELECT inode FROM legacy_inode_map WHERE legacy_path='base.dat');
+        COMMIT;").unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM inodes WHERE unlink_pending=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let engine = managed_engine(&index, root.path(), 64 << 20, true);
+    let db = mirage_db::Database::open(&root.path().join("control.db")).unwrap();
+    assert!(db.namespace_pending_unlinks(VOLUME).unwrap().is_empty());
+    drop(db);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
 fn build_index() -> (tempfile::TempDir, PathBuf) {
     let source = tempfile::tempdir().expect("source");
     std::fs::write(source.path().join("base.dat"), b"seed").expect("seed file");

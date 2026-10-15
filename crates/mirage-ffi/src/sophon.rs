@@ -93,6 +93,7 @@ pub struct Stats {
     pub cdn_chunks: u64,
     pub cdn_bytes: u64,
     pub failures: u64,
+    pub cache_failures: u64,
     pub shared_waiters: u64,
     pub memory_bytes: usize,
     pub managed_disk_bytes: u64,
@@ -520,14 +521,17 @@ impl SophonSource {
     }
     fn load_chunk(&self, asset: &Asset, chunk: &Chunk, key: Key) -> ChunkResult {
         let local_permit = self.permit(false)?;
-        if let Some(bytes) = self
+        let cached = self
             .disk
             .lock()
-            .map_err(|_| MirageStatus::Internal)?
-            .get(key, chunk)?
-        {
+            .map_err(|_| MirageStatus::Internal)
+            .and_then(|mut disk| disk.get(key, chunk));
+        if let Ok(Some(bytes)) = cached {
             self.stats.lock().unwrap().disk_hits += 1;
             return Ok(bytes.into());
+        }
+        if cached.is_err() {
+            self.stats.lock().unwrap().cache_failures += 1;
         }
         for root in &self.config.seed_roots {
             let path = root.join(&asset.name);
@@ -603,11 +607,15 @@ impl SophonSource {
             stats.cdn_chunks += 1;
             stats.cdn_bytes += compressed.len() as u64;
         }
-        self.disk.lock().map_err(|_| MirageStatus::Internal)?.put(
-            key,
-            &bytes,
-            self.config.disk_free_floor_bytes,
-        )?;
+        if self
+            .disk
+            .lock()
+            .map_err(|_| MirageStatus::Internal)
+            .and_then(|mut disk| disk.put(key, &bytes, self.config.disk_free_floor_bytes))
+            .is_err()
+        {
+            self.stats.lock().unwrap().cache_failures += 1;
+        }
         Ok(bytes.into())
     }
     fn permit(&self, remote: bool) -> Result<cache::Permit<'_>, MirageStatus> {
@@ -643,6 +651,7 @@ impl SophonSource {
             cdn_chunks: s.cdn_chunks,
             cdn_bytes: s.cdn_bytes,
             failures: s.failures,
+            cache_failures: s.cache_failures,
             shared_waiters: s.shared_waiters,
             memory_bytes,
             managed_disk_bytes,

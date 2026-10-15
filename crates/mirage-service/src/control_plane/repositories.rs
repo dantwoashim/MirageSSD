@@ -288,27 +288,17 @@ impl ControlPlaneHandler {
         // Payload ids that belonged to this volume â€” after the rows are gone
         // their journal files are pure orphans, so delete them now rather
         // than waiting for the next startup sweep.
-        let owned_payloads = self
-            .database
-            .referenced_payload_ids(repository_id)
-            .unwrap_or_default();
+        let owned_payloads = self.database.journal_payload_ids(repository_id)?;
+        // Capture configured placement before unregister removes its row.
+        let journal =
+            runtime::repository_cache_root(&self.database, repository_id)?.join("journal");
         let removed = self.database.unregister_repository(repository_id)?;
-        let mut journal_files_removed = 0_u64;
-        if let Ok(state_root) = runtime::service_state_root(&self.database) {
-            let journal = state_root.join("journal");
-            for payload in owned_payloads {
-                let mut name = String::with_capacity(40);
-                for byte in payload {
-                    name.push_str(&format!("{byte:02x}"));
-                }
-                name.push_str(".payload");
-                if journal.join(&name).is_file()
-                    && std::fs::remove_file(journal.join(&name)).is_ok()
-                {
-                    journal_files_removed += 1;
-                }
-            }
-        }
+        self.database.durability_barrier()?;
+        let (journal_files_removed, journal_files_pending) = if removed {
+            remove_owned_journal_files(&journal, &owned_payloads)
+        } else {
+            (0, 0)
+        };
         crate::logging::log_event(
             "repository.unregistered",
             &format!("{repository_id} journal_files={journal_files_removed}"),
@@ -318,8 +308,29 @@ impl ControlPlaneHandler {
             "was_mounted": was_mounted,
             "discarded_pending_bytes": if discard_unpublished { publication.pending_bytes } else { 0 },
             "journal_files_removed": journal_files_removed,
+            "journal_files_pending": journal_files_pending,
         })))
     }
+}
+
+fn remove_owned_journal_files(
+    journal: &Path,
+    payloads: &std::collections::BTreeSet<[u8; 16]>,
+) -> (u64, u64) {
+    let (mut removed, mut pending) = (0, 0);
+    for payload in payloads {
+        let name = payload
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            + ".payload";
+        match std::fs::remove_file(journal.join(name)) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => pending += 1,
+        }
+    }
+    (removed, pending)
 }
 
 pub(super) fn summary_json(repository: &RepositorySummary) -> serde_json::Value {
@@ -398,5 +409,35 @@ pub(super) fn repository_id(command: &Command) -> Option<RepositoryId> {
         | Command::DiskReclaimNow
         | Command::RepositoryRegister { .. }
         | Command::RepositoryAdopt { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod unregister_cleanup_tests {
+    use super::*;
+    #[test]
+    fn cleanup_uses_captured_journal_and_only_owned_payload_names() {
+        let service = tempfile::tempdir().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        let name = "07".repeat(16) + ".payload";
+        std::fs::write(service.path().join(&name), b"other location").unwrap();
+        std::fs::write(configured.path().join(&name), b"owned").unwrap();
+        std::fs::write(configured.path().join("unknown.payload"), b"preserve").unwrap();
+        assert_eq!(
+            remove_owned_journal_files(configured.path(), &[[7; 16]].into()),
+            (1, 0)
+        );
+        assert_eq!(
+            std::fs::read(service.path().join(name)).unwrap(),
+            b"other location"
+        );
+        assert_eq!(
+            std::fs::read(configured.path().join("unknown.payload")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(
+            remove_owned_journal_files(configured.path(), &[[7; 16]].into()),
+            (0, 0)
+        );
     }
 }

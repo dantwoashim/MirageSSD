@@ -458,26 +458,11 @@ pub unsafe extern "C" fn mirage_truncate(
         // Mutate a scratch copy: the live map only publishes after the
         // durable commit lands.
         let mut next_map = maps.get(&inode).expect("map just inserted").clone();
-        // Growing a file is how the kernel cache manager pre-allocates before
-        // a cached write, so the disk-full answer has to come from here: a
-        // file that can never fit the local staging budget, or that would
-        // breach the cache disk's free-space floor, is refused up front.
-        let current = next_map.file_size();
-        if new_size > current
-            && let Some(dirty) = &handle.dirty
-        {
-            let growth = new_size - current;
-            if new_size > dirty.budget_bytes {
-                return MirageStatus::DiskFull;
-            }
-            let floor = handle.disk_floor.load(Ordering::Acquire);
-            if floor > 0 {
-                let journal_dir = handle_journal_dir(handle);
-                let free = floor_free_space(&handle.floor_free_cache, &journal_dir, true);
-                if free.is_some_and(|free| free < growth.saturating_add(floor)) {
-                    return MirageStatus::DiskFull;
-                }
-            }
+        // Logical extension creates a hole, not payload allocation. Actual
+        // writes enforce dirty-budget/floor admission and upload backpressure.
+        // SQLite's signed EOF representation is the logical-size bound.
+        if new_size > i64::MAX as u64 {
+            return MirageStatus::InvalidArgument;
         }
         if next_map.truncate(new_size).is_err() {
             return MirageStatus::InvalidArgument;
@@ -683,6 +668,11 @@ pub(super) fn restage_evicted_payload(
         .mutex
         .lock()
         .map_err(|_| MirageError::internal_invariant("dirty ledger lock poisoned"))?;
+    let _reclaim = ctx
+        .dirty
+        .reclaim_mutex
+        .lock()
+        .map_err(|_| MirageError::internal_invariant("payload reclaim lock poisoned"))?;
     let floor = ctx.disk_floor.load(Ordering::Acquire);
     if floor > 0 {
         let free = floor_free_space(&ctx.floor_free_cache, &ctx.journal_dir, false)

@@ -122,12 +122,15 @@ pub unsafe extern "C" fn mirage_lookup(
             }
             // Index ordinals identify committed content; inode-derived ids
             // keep identity stable for namespace-only files across renames.
-            let stable_index = node
-                .map(|node| match node {
+            let stable_index = if engine.managed {
+                namespace_inode.map(inode_stable_index).unwrap_or(0)
+            } else {
+                node.map(|node| match node {
                     NodeIndex::Directory(ordinal) | NodeIndex::File(ordinal) => u64::from(ordinal),
                 })
                 .or_else(|| namespace_inode.map(|inode: InodeId| inode_stable_index(inode)))
-                .unwrap_or(0);
+                .unwrap_or(0)
+            };
             let entry = if directory {
                 Entry {
                     index: stable_index,

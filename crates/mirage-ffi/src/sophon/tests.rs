@@ -37,6 +37,43 @@ fn fixture(root: &Path, seed: bool, memory: usize, budget: u64) -> (PathBuf, Vec
 fn index(source: &SophonSource) -> u64 {
     source.entries[&"data\\mixed.blk".encode_utf16().collect::<Vec<_>>()].index
 }
+
+#[cfg(windows)]
+#[test]
+fn failed_corrupt_cache_removal_serves_verified_remote_bytes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (config, bytes) = fixture(root.path(), false, 0, 8192);
+    let mut source = SophonSource::open(&config).unwrap();
+    let (requests, server) = origin(&mut source, bytes.clone(), 2, false);
+    let mut output = vec![0; 4096];
+    source.read(index(&source), 0, &mut output).unwrap();
+    assert_eq!(output, bytes[..4096]);
+    let cache = std::fs::read_dir(source.config.cache_root.join("chunks-v1"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "chunk")
+        })
+        .unwrap()
+        .path();
+    std::fs::write(&cache, b"corrupt").unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&cache)
+        .unwrap();
+    output.fill(0);
+    source.read(index(&source), 0, &mut output).unwrap();
+    assert_eq!(output, bytes[..4096]);
+    assert_eq!(source.statistics().cache_failures, 1);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    drop(locked);
+    server.join().unwrap();
+}
 fn origin(
     source: &mut SophonSource,
     bytes: Vec<u8>,

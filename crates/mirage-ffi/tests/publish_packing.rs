@@ -20,6 +20,157 @@ use mirage_types::{GenerationId, RepositoryId};
 const BUDGET: u64 = 64 * 1024 * 1024;
 const VOLUME: RepositoryId = RepositoryId::from_bytes([9; 16]);
 
+#[test]
+fn concurrent_evictions_release_each_payload_charge_once() {
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state(64 * 1024, 8);
+    let engine = managed_local(&index, state.path(), objects.path(), BUDGET, true);
+    create_write(engine, "published.bin", &[7; 4096]);
+    wait_for(engine, |s| s.published_payloads == 1);
+    let path = utf16("held.bin");
+    assert_eq!(
+        unsafe { mirage_namespace_create(engine, path.as_ptr(), path.len(), 0) },
+        MirageStatus::Ok
+    );
+    let mut held = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { mirage_lookup(engine, path.as_ptr(), path.len(), &mut held) },
+        MirageStatus::Ok
+    );
+    let mut written = 0;
+    assert_eq!(
+        unsafe { mirage_write(held, 0, [9u8; 4096].as_ptr(), 4096, &mut written) },
+        MirageStatus::Ok
+    );
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let start = start.clone();
+            let address = engine as usize;
+            std::thread::spawn(move || {
+                start.wait();
+                let mut freed = 0;
+                let mut blocked = 0;
+                assert_eq!(
+                    unsafe {
+                        mirage_ffi::mirage_engine_evict_published(
+                            address as *mut MirageEngineHandle,
+                            4096,
+                            &mut freed,
+                            &mut blocked,
+                        )
+                    },
+                    MirageStatus::Ok
+                );
+                freed
+            })
+        })
+        .collect();
+    start.wait();
+    assert_eq!(
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum::<u64>(),
+        4096
+    );
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_dirty_used_for_tests(engine) },
+        4096
+    );
+    assert_eq!(
+        read_path(engine, "published.bin", 4096),
+        (MirageStatus::Ok, vec![7; 4096])
+    );
+    assert_eq!(unsafe { mirage_file_close(held) }, MirageStatus::Ok);
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
+#[cfg(windows)]
+#[test]
+fn eviction_commit_failure_preserves_file_and_locked_unlink_has_durable_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (_source, objects, index) = build_index();
+    let state = provisioned_state(64 * 1024, 8);
+    let engine = managed_local(&index, state.path(), objects.path(), BUDGET, true);
+    create_write(engine, "published.bin", &[7; 4096]);
+    wait_for(engine, |s| s.published_payloads == 1);
+    let db = control_db(state.path());
+    let id = payload_id_of(&db, "published.bin");
+    let payload = state
+        .path()
+        .join("journal")
+        .join(format!("{}.payload", hex16(id)));
+    let sql = rusqlite::Connection::open(state.path().join("control.db")).unwrap();
+    sql.execute_batch("CREATE TRIGGER refuse_eviction BEFORE UPDATE OF state ON physical_extents WHEN NEW.state='dead' BEGIN SELECT RAISE(ABORT, 'injected eviction failure'); END;").unwrap();
+    let mut freed = 0;
+    let mut blocked = 0;
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_engine_evict_published(engine, 4096, &mut freed, &mut blocked)
+        },
+        MirageStatus::IoError
+    );
+    assert!(payload.is_file());
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_dirty_used_for_tests(engine) },
+        4096
+    );
+    sql.execute_batch("DROP TRIGGER refuse_eviction").unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&payload)
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            mirage_ffi::mirage_engine_evict_published(engine, 4096, &mut freed, &mut blocked)
+        },
+        MirageStatus::IoError
+    );
+    assert_eq!(
+        db.load_physical_state()
+            .unwrap()
+            .1
+            .iter()
+            .find(|row| row.extent_id == id)
+            .unwrap()
+            .state,
+        mirage_db::PhysicalExtentState::Dead
+    );
+    let publication = db
+        .payload_publication_stats(VOLUME, &mirage_db::payload_remote::MANAGED_JOURNAL_FILE_ID)
+        .unwrap();
+    assert_eq!(
+        (
+            publication.published_bytes,
+            publication.published_payloads,
+            publication.evicted_payloads
+        ),
+        (4096, 1, 1)
+    );
+    assert!(payload.is_file());
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_dirty_used_for_tests(engine) },
+        4096
+    );
+    drop(locked);
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_compact(engine) },
+        MirageStatus::Ok
+    );
+    assert!(!payload.exists());
+    assert_eq!(
+        unsafe { mirage_ffi::mirage_engine_dirty_used_for_tests(engine) },
+        0
+    );
+    assert_eq!(
+        read_path(engine, "published.bin", 4096),
+        (MirageStatus::Ok, vec![7; 4096])
+    );
+    assert_eq!(unsafe { mirage_engine_destroy(engine) }, MirageStatus::Ok);
+}
+
 fn build_index() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let source = tempfile::tempdir().expect("source");
     std::fs::write(source.path().join("base.dat"), vec![0x5Au8; 100 * 1024]).expect("seed");

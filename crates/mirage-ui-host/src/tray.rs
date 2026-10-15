@@ -89,6 +89,7 @@ struct Tray {
     url: String,
     mounted: Vec<String>,
     account: Option<String>,
+    token_store: Option<std::path::PathBuf>,
     service_down_announced: bool,
     last_mount_count: usize,
 }
@@ -130,6 +131,10 @@ impl Tray {
     }
 
     fn refresh_state(&mut self) {
+        self.account = super::windows_host::jobs::token_store(self.token_store.as_deref())
+            .ok()
+            .and_then(|store| store.metadata().ok())
+            .map(|metadata| metadata.account_id);
         match mirage_cli::commands::service::request_json(mirage_ipc::Command::Status) {
             Ok(status) => {
                 self.service_down_announced = false;
@@ -140,15 +145,7 @@ impl Tray {
                 self.mounted = repos
                     .iter()
                     .filter(|r| r["state"].as_str() == Some("ready_mounted"))
-                    .filter_map(|r| {
-                        // mounted letters come back in the mount record — use
-                        // display_name fallback when the letter is absent.
-                        r["mount_path"]
-                            .as_str()
-                            .map(|s| s.trim_end_matches(['\\', '/']).to_owned())
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| r["display_name"].as_str().map(|s| s.to_owned()))
-                    })
+                    .filter_map(|r| r["mount_path"].as_str().and_then(drive_root))
                     .collect();
                 if self.last_mount_count > 0 && self.mounted.len() > self.last_mount_count {
                     self.balloon("Drive mounted", "A MirageSSD drive is ready in Explorer.");
@@ -317,7 +314,7 @@ unsafe extern "system" fn wnd_proc(
 
 /// Runs the tray loop on this thread (the host's accept loop runs elsewhere).
 /// Never returns except via Quit.
-pub fn run(url: String) -> ! {
+pub fn run(url: String, token_store: Option<std::path::PathBuf>) -> ! {
     unsafe {
         let class_name = wide("MirageSSD.Tray");
         let class = WNDCLASSW {
@@ -355,15 +352,13 @@ pub fn run(url: String) -> ! {
         }
         Shell_NotifyIconW(NIM_ADD, &nid);
 
-        let account = mirage_cli::commands::service::request_json(mirage_ipc::Command::Status)
-            .ok()
-            .and_then(|s| s["account_id"].as_str().map(str::to_owned));
         let tray = Box::new(Tray {
             hwnd,
             nid,
             url,
             mounted: Vec::new(),
-            account,
+            account: None,
+            token_store,
             service_down_announced: false,
             last_mount_count: 0,
         });
@@ -425,5 +420,26 @@ pub fn run(url: String) -> ! {
                 next_refresh = Instant::now() + Duration::from_secs(30);
             }
         }
+    }
+}
+
+/// Only drive-letter roots may become Explorer commands. Display names and
+/// directory mount points cannot be converted by taking their first character.
+fn drive_root(path: &str) -> Option<String> {
+    let root = path.trim_end_matches(['\\', '/']);
+    let bytes = root.as_bytes();
+    (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| root.to_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explorer_roots_require_an_actual_drive_letter() {
+        assert_eq!(drive_root("m:\\"), Some("M:".into()));
+        assert_eq!(drive_root("My volume"), None);
+        assert_eq!(drive_root("C:\\mounts\\game"), None);
+        assert_eq!(drive_root(""), None);
     }
 }

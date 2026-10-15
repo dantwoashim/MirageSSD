@@ -222,13 +222,14 @@ impl DiskCache {
         if !space_available(&self.root, floor.saturating_add(length)) {
             // Pressure response: reclaim eligible entries before deciding that
             // verified bytes must remain transient. Pinned launch data survives.
-            let keys: Vec<_> = self
+            let mut keys: Vec<_> = self
                 .entries
-                .keys()
-                .filter(|key| !self.pinned.contains(*key))
-                .copied()
+                .iter()
+                .filter(|(key, _)| !self.pinned.contains(*key))
+                .map(|(key, (_, tick))| (*tick, *key))
                 .collect();
-            for key in keys {
+            keys.sort_unstable();
+            for (_, key) in keys {
                 self.remove(key)?;
                 if space_available(&self.root, floor.saturating_add(length)) {
                     break;

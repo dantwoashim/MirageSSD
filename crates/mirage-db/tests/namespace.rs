@@ -53,6 +53,44 @@ fn create_lookup_and_stat_round_trip() {
 }
 
 #[test]
+fn checkpoint_excludes_unlinked_file_and_directory_without_finalizing_them() {
+    let (_dir, db) = open();
+    let volume = vol(41);
+    let root = db.namespace_create_volume(volume, 1).unwrap();
+    for (index, kind) in [NamespaceNodeKind::File, NamespaceNodeKind::Directory]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("removed-{index}");
+        let entry = db.namespace_create(volume, root, &name, kind, 2).unwrap();
+        db.writer()
+            .namespace_unlink_journaled(
+                volume,
+                root,
+                &name,
+                3,
+                mirage_db::JournalEntry {
+                    operation_id: [index as u8 + 50; 16],
+                    kind: mirage_db::OperationKind::Delete,
+                    payload: name.as_bytes().to_vec(),
+                    created_ns: 3,
+                },
+            )
+            .unwrap();
+        assert!(db.namespace_stat(volume, entry.inode).unwrap().is_some());
+    }
+    db.namespace_checkpoint(volume, 4).unwrap();
+    let document = db
+        .namespace_latest_checkpoint_document(volume)
+        .unwrap()
+        .unwrap();
+    let checkpoint = mirage_manifest::namespace::decode_checkpoint(&document).unwrap();
+    assert_eq!(checkpoint.nodes.len(), 1);
+    assert_eq!(checkpoint.nodes[0].inode, root);
+    assert_eq!(db.namespace_pending_unlinks(volume).unwrap().len(), 2);
+}
+
+#[test]
 fn rename_preserves_inode_identity_across_directories() {
     let (_dir, db) = open();
     let volume = vol(2);

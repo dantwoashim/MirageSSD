@@ -6,6 +6,70 @@ use mirage_types::{InodeId, PageHash, RepositoryId};
 
 const JOURNAL_FILE: [u8; 16] = [0x4a; 16];
 
+#[test]
+fn compaction_never_demotes_another_volumes_live_journal_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("control.db")).unwrap();
+    db.writer()
+        .physical_register_file(PhysicalFileRecord {
+            file_id: JOURNAL_FILE,
+            path: "journal".into(),
+            zone: 1,
+            extent_bytes: 0,
+            extent_count: 0,
+            created_ns: 1,
+        })
+        .unwrap();
+    let volumes = [
+        RepositoryId::from_bytes([71; 16]),
+        RepositoryId::from_bytes([72; 16]),
+    ];
+    let inode = InodeId::from_bytes([73; 16]);
+    for (index, volume) in volumes.into_iter().enumerate() {
+        let payload = [index as u8 + 81; 16];
+        live_payload(&db, payload, index as i64);
+        db.writer()
+            .extent_replace(
+                volume,
+                inode,
+                1,
+                vec![dirty_extent(
+                    [index as u8 + 91; 16],
+                    volume,
+                    inode,
+                    1,
+                    0,
+                    4096,
+                    payload,
+                    0,
+                )],
+                2,
+            )
+            .unwrap();
+    }
+    db.writer()
+        .extent_replace(volumes[0], inode, 2, vec![], 3)
+        .unwrap();
+    let dead = db
+        .writer()
+        .extent_compact_volume(volumes[0], JOURNAL_FILE, 4)
+        .unwrap();
+    assert_eq!(dead, vec![([81; 16], 4096)]);
+    let (_, physical, _) = db.load_physical_state().unwrap();
+    assert_eq!(
+        physical
+            .iter()
+            .find(|row| row.extent_id == [82; 16])
+            .unwrap()
+            .state,
+        PhysicalExtentState::Alive
+    );
+    assert_eq!(
+        db.extents_at(volumes[1], inode, 1).unwrap()[0].payload_id,
+        Some([82; 16])
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dirty_extent(
     extent_id: [u8; 16],

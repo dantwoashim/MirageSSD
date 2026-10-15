@@ -433,6 +433,11 @@ pub(crate) fn release_deleted_inode_payloads(
     volume: RepositoryId,
     inode: InodeId,
 ) -> bool {
+    // Include demotion and its snapshot in the same exclusion as restaging.
+    let _reclaim = dirty
+        .reclaim_mutex
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let dead =
         match db
             .writer()
@@ -450,10 +455,6 @@ pub(crate) fn release_deleted_inode_payloads(
         eprintln!("payload release for deleted inode {inode:?}: barrier failed");
         return false;
     }
-    let _reclaim = dirty
-        .reclaim_mutex
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
     for (payload_id, length_bytes) in dead {
         let mut name = String::with_capacity(40);
         for byte in payload_id {

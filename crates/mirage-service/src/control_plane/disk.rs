@@ -77,12 +77,6 @@ impl ControlPlaneHandler {
             let mut cache_pages = 0_u64;
             let mut shadow_packs = 0_u64;
             let mut published_payloads = 0_u64;
-            // Managed journal payloads physically live under the service
-            // state root â€” attribute them to that volume like reclaim does,
-            // not to each repository's native_root.
-            let state_root_volume = runtime::service_state_root(&self.database)
-                .ok()
-                .and_then(|root| disk_space::volume_root_of(&root).ok());
             for repository in self.repositories()? {
                 if let Some(native_root) = self
                     .database
@@ -99,7 +93,11 @@ impl ControlPlaneHandler {
                     cache_pages += pages;
                     shadow_packs += shadow;
                 }
-                if state_root_volume.as_deref() == Some(floor.volume_root.as_str())
+                if runtime::repository_cache_root(&self.database, repository.repository_id)
+                    .ok()
+                    .and_then(|root| disk_space::volume_root_of(&root).ok())
+                    .as_deref()
+                    == Some(floor.volume_root.as_str())
                     && let Ok(evictable) = self
                         .database
                         .published_payloads_evictable(repository.repository_id)

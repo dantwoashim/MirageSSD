@@ -38,15 +38,31 @@ pub(super) struct HttpRequest {
     pub(super) body: Vec<u8>,
 }
 
+fn set_request_read_deadline(
+    stream: &TcpStream,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP request deadline exceeded",
+        ));
+    }
+    stream.set_read_timeout(Some(remaining))
+}
+
 pub(super) fn read_http_request(
     stream: &mut TcpStream,
 ) -> Result<HttpRequest, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut bytes = Vec::with_capacity(4096);
     let header_end = loop {
         if bytes.len() >= MAX_HTTP_HEADER_BYTES {
             return Err("HTTP request headers exceed the bridge limit".into());
         }
         let mut chunk = [0_u8; 4096];
+        set_request_read_deadline(stream, deadline)?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err("HTTP request ended before its headers".into());
@@ -99,6 +115,7 @@ pub(super) fn read_http_request(
         .ok_or("HTTP request length overflow")?;
     while bytes.len() < total {
         let mut chunk = [0_u8; 4096];
+        set_request_read_deadline(stream, deadline)?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err("HTTP request body ended early".into());

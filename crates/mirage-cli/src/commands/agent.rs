@@ -5,7 +5,6 @@
 //! and never logs tokens.
 
 use std::io::Write;
-#[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,7 +22,7 @@ const REFRESH_SECONDS: u64 = 45 * 60;
 const SUPPLY_SECONDS: u64 = 60;
 const LOG_MAX_BYTES: u64 = 512 * 1024;
 
-pub fn run(once: bool) -> Result<(), MirageError> {
+pub fn run(once: bool, token_store: Option<&Path>) -> Result<(), MirageError> {
     let _guard = match AgentMutex::acquire()? {
         Some(guard) => guard,
         None => return Ok(()),
@@ -31,7 +30,7 @@ pub fn run(once: bool) -> Result<(), MirageError> {
     let log = AgentLog::open();
     let mut state = AgentState::default();
     loop {
-        if let Err(error) = cycle(&log, &mut state) {
+        if let Err(error) = cycle(&log, &mut state, token_store) {
             log.line(&format!("cycle failed: {error}"));
         }
         if once {
@@ -51,7 +50,11 @@ struct AgentState {
     supplied: std::collections::HashSet<RepositoryId>,
 }
 
-fn cycle(log: &AgentLog, state: &mut AgentState) -> Result<(), MirageError> {
+fn cycle(
+    log: &AgentLog,
+    state: &mut AgentState,
+    token_store: Option<&Path>,
+) -> Result<(), MirageError> {
     let stale = state
         .session
         .as_ref()
@@ -64,7 +67,7 @@ fn cycle(log: &AgentLog, state: &mut AgentState) -> Result<(), MirageError> {
                 return Ok(());
             }
         };
-        match drive_live::connect(&credentials, None) {
+        match drive_live::connect(&credentials, token_store) {
             Ok(session) => {
                 state.session = Some((std::time::Instant::now(), session));
                 state.supplied.clear();
@@ -165,11 +168,10 @@ fn cycle(log: &AgentLog, state: &mut AgentState) -> Result<(), MirageError> {
 
 /// The Explorer letter recorded by the volume's last mount, if any.
 fn recorded_letter(detail: &serde_json::Value) -> Option<String> {
-    detail["mount_point"]
-        .as_str()
-        .and_then(|point| point.chars().next())
-        .filter(|letter| letter.is_ascii_alphabetic())
-        .map(|letter| letter.to_ascii_uppercase().to_string())
+    let point = detail["mount_path"].as_str()?.trim_end_matches(['\\', '/']);
+    let bytes = point.as_bytes();
+    (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| (bytes[0] as char).to_ascii_uppercase().to_string())
 }
 
 /// Registers `mirage.exe agent` under the per-user Run key so volumes
@@ -178,7 +180,10 @@ fn recorded_letter(detail: &serde_json::Value) -> Option<String> {
 /// sibling binary (mirage-ui.exe), resolve `mirage.exe` next to it rather
 /// than registering the UI executable — it ignores arguments.
 #[cfg(windows)]
-fn agent_command_line(current_exe: &Path) -> Result<String, MirageError> {
+fn agent_command_line(
+    current_exe: &Path,
+    token_store: Option<&Path>,
+) -> Result<String, MirageError> {
     let executable = if current_exe.file_stem().is_some_and(|stem| stem == "mirage") {
         current_exe.to_path_buf()
     } else {
@@ -194,16 +199,38 @@ fn agent_command_line(current_exe: &Path) -> Result<String, MirageError> {
             executable.display()
         )));
     }
-    Ok(format!("\"{}\" agent", executable.display()))
+    with_token_store(format!("\"{}\" agent", executable.display()), token_store)
+}
+
+#[cfg(windows)]
+fn with_token_store(
+    mut command: String,
+    token_store: Option<&Path>,
+) -> Result<String, MirageError> {
+    if let Some(path) = token_store {
+        if !path.is_absolute() || path.to_string_lossy().contains('"') {
+            return Err(MirageError::invalid_argument(
+                "agent token store must be an absolute path",
+            ));
+        }
+        // A store is a file, so its quoted path cannot end in a backslash.
+        if path.file_name().is_none() || path.to_string_lossy().ends_with('\\') {
+            return Err(MirageError::invalid_argument(
+                "agent token store must name a file",
+            ));
+        }
+        command.push_str(&format!(" --drive-token-store \"{}\"", path.display()));
+    }
+    Ok(command)
 }
 
 /// Starts `mirage.exe agent` (the sibling binary) as a detached background
 /// process. Idempotent: a running agent holds the agent mutex, so the new
 /// instance exits immediately.
 #[cfg(windows)]
-pub fn spawn_detached() -> Result<(), MirageError> {
+pub fn spawn_detached(token_store: Option<&Path>) -> Result<(), MirageError> {
     let current_exe = std::env::current_exe().map_err(MirageError::from)?;
-    let command_line = agent_command_line(&current_exe)?;
+    let command_line = agent_command_line(&current_exe, token_store)?;
     // The command line is `"<path>\mirage.exe" agent`; recover the path.
     let executable = command_line
         .trim_start_matches('"')
@@ -213,6 +240,9 @@ pub fn spawn_detached() -> Result<(), MirageError> {
         .ok_or_else(|| MirageError::internal_invariant("agent command line is malformed"))?;
     let mut command = std::process::Command::new(executable);
     command.arg("agent");
+    if let Some(path) = token_store {
+        command.arg("--drive-token-store").arg(path);
+    }
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -229,19 +259,20 @@ pub fn spawn_detached() -> Result<(), MirageError> {
 }
 
 #[cfg(not(windows))]
-pub fn spawn_detached() -> Result<(), MirageError> {
+pub fn spawn_detached(_token_store: Option<&Path>) -> Result<(), MirageError> {
     Err(MirageError::provider_unavailable(
         "the background agent requires Windows",
     ))
 }
 
-pub fn install_logon_registration() -> Result<(), MirageError> {
+pub fn install_logon_registration(token_store: Option<&Path>) -> Result<(), MirageError> {
     #[cfg(windows)]
     {
-        install_logon_registration_windows()
+        install_logon_registration_windows(token_store)
     }
     #[cfg(not(windows))]
     {
+        let _ = token_store;
         Err(MirageError::provider_unavailable(
             "logon registration requires Windows",
         ))
@@ -249,7 +280,7 @@ pub fn install_logon_registration() -> Result<(), MirageError> {
 }
 
 #[cfg(windows)]
-fn install_logon_registration_windows() -> Result<(), MirageError> {
+fn install_logon_registration_windows(token_store: Option<&Path>) -> Result<(), MirageError> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::{
@@ -257,7 +288,7 @@ fn install_logon_registration_windows() -> Result<(), MirageError> {
     };
 
     let executable = std::env::current_exe().map_err(MirageError::from)?;
-    let command = agent_command_line(&executable)?;
+    let command = agent_command_line(&executable, token_store)?;
     let subkey: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\Run")
         .encode_wide()
         .chain(std::iter::once(0))
@@ -371,17 +402,18 @@ fn run_key_set(value_name: &str, command: &str) -> Result<(), MirageError> {
 
 /// `HKCU Run\MirageSSD Tray` = `"<mirage-ui.exe>" --tray`, written by the UI
 /// host on every start so updates repair stale paths.
-pub fn install_tray_registration() -> Result<(), MirageError> {
+pub fn install_tray_registration(token_store: Option<&Path>) -> Result<(), MirageError> {
     #[cfg(windows)]
     {
         let executable = std::env::current_exe().map_err(MirageError::from)?;
         run_key_set(
             "MirageSSD Tray",
-            &format!("\"{}\" --tray", executable.display()),
+            &with_token_store(format!("\"{}\" --tray", executable.display()), token_store)?,
         )
     }
     #[cfg(not(windows))]
     {
+        let _ = token_store;
         Err(MirageError::provider_unavailable(
             "tray registration requires Windows",
         ))
@@ -485,12 +517,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recorded_letter_uses_service_mount_path() {
+        assert_eq!(
+            recorded_letter(&serde_json::json!({"mount_path": "m:\\"})),
+            Some("M".into())
+        );
+        assert_eq!(
+            recorded_letter(&serde_json::json!({"mount_path": null})),
+            None
+        );
+        assert_eq!(
+            recorded_letter(&serde_json::json!({"mount_path": "C:/mounted/game"})),
+            None
+        );
+    }
+
+    #[test]
     fn agent_command_line_prefers_mirage_exe_beside_the_host() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli = dir.path().join("mirage.exe");
         std::fs::write(&cli, b"x").expect("cli stub");
         let ui = dir.path().join("mirage-ui.exe");
-        let command = agent_command_line(&ui).expect("command");
+        let command = agent_command_line(&ui, None).expect("command");
         assert_eq!(command, format!("\"{}\" agent", cli.display()));
     }
 
@@ -499,15 +547,36 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli = dir.path().join("mirage.exe");
         std::fs::write(&cli, b"x").expect("cli stub");
-        let command = agent_command_line(&cli).expect("command");
+        let command = agent_command_line(&cli, None).expect("command");
         assert_eq!(command, format!("\"{}\" agent", cli.display()));
+    }
+
+    #[test]
+    fn agent_command_line_preserves_custom_store_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("mirage.exe");
+        std::fs::write(&cli, b"fixture").unwrap();
+        let store = dir.path().join("custom session.json");
+        assert_eq!(
+            agent_command_line(&cli, Some(&store)).unwrap(),
+            format!(
+                "\"{}\" agent --drive-token-store \"{}\"",
+                cli.display(),
+                store.display()
+            )
+        );
+        assert!(agent_command_line(&cli, Some(Path::new("relative.json"))).is_err());
+        assert_eq!(
+            with_token_store("ui --tray".into(), Some(&store)).unwrap(),
+            format!("ui --tray --drive-token-store \"{}\"", store.display())
+        );
     }
 
     #[test]
     fn agent_command_line_fails_when_mirage_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ui = dir.path().join("mirage-ui.exe");
-        let error = agent_command_line(&ui).expect_err("must fail without mirage.exe");
+        let error = agent_command_line(&ui, None).expect_err("must fail without mirage.exe");
         assert!(format!("{error}").contains("agent executable not found"));
     }
 }

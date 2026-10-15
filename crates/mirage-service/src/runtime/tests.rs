@@ -160,6 +160,17 @@ fn batched_materialization_repairs_a_corrupt_resident_on_resume() {
 }
 
 #[test]
+fn service_cache_reuses_established_capacity_across_repository_budgets() {
+    let (_directory, database, _repository, _capsule) = materialization_fixture();
+    let (_first, _) = open_cache(&database, 65536, 8 * 1024 * 1024).unwrap();
+    let before = database.load_cache_shards().unwrap();
+    let (_second, _) = open_cache(&database, 65536, 4 * 1024 * 1024).unwrap();
+    let after = database.load_cache_shards().unwrap();
+    assert_eq!(before[0].slot_count, after[0].slot_count);
+    assert!(open_cache(&database, 131072, 4 * 1024 * 1024).is_err());
+}
+
+#[test]
 fn subtree_conversion_is_dry_run_first_and_byte_reversible() {
     let directory = tempfile::tempdir().unwrap();
     let native_root = directory.path().join("game");

@@ -248,7 +248,7 @@ pub struct MiragePublicationStats {
     pub published_payloads: u64,
     /// Plaintext bytes of published payloads.
     pub published_bytes: u64,
-    /// Published payloads whose local copy was evicted.
+    /// Published payloads marked remote-only; pending physical unlink remains charged.
     pub evicted_payloads: u64,
     /// Payloads refused for checksum mismatch.
     pub integrity_refusals: u64,
@@ -339,14 +339,14 @@ pub unsafe extern "C" fn mirage_engine_compact(engine: *const MirageEngineHandle
         }
         // Dead ledger rows remain durable retry records after an unlink
         // failure. Revisit them, including rows demoted by a prior cleanup.
-        let (_, extents, _) = match db.load_physical_state() {
-            Ok(state) => state,
-            Err(_) => return MirageStatus::IoError,
-        };
         let _reclaim = dirty
             .reclaim_mutex
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let (_, extents, _) = match db.load_physical_state() {
+            Ok(state) => state,
+            Err(_) => return MirageStatus::IoError,
+        };
         for extent in extents.into_iter().filter(|extent| {
             extent.file_id == dirty.file_id && extent.state == mirage_db::PhysicalExtentState::Dead
         }) {

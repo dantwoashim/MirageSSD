@@ -11,6 +11,12 @@ int wmain(int argc, wchar_t**) {
         std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         if (bytes != "verified synthetic publisher fixture") return 9;
         std::ofstream("fixture-read-ok.txt") << "verified";
+        // Only the crash fixture requests this post-read hold. It does not
+        // delay launcher handoff or make the controller observe this child.
+        if (std::filesystem::exists("fixture-hold-child.txt")) {
+            const auto deadline = GetTickCount64() + 30000;
+            while (!std::filesystem::exists("fixture-release-child.txt") && GetTickCount64() < deadline) Sleep(10);
+        }
         Sleep(1000);
         return 0;
     }

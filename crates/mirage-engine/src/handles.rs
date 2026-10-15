@@ -72,6 +72,22 @@ pub enum DeleteDisposition {
 }
 
 impl HandleTable {
+    /// Keep payload eviction atomic with open registration. Unlike the
+    /// namespace gate this can be acquired while a writer holds extent maps.
+    pub fn with_closed_inodes<R>(
+        &self,
+        inodes: &[InodeId],
+        operation: impl FnOnce() -> R,
+    ) -> Result<Option<R>, MirageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| MirageError::internal_invariant("handle table lock poisoned"))?;
+        if inodes.iter().any(|inode| inner.contains_key(inode)) {
+            return Ok(None);
+        }
+        Ok(Some(operation()))
+    }
     pub fn namespace_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, MirageError> {
         self.namespace_gate
             .lock()

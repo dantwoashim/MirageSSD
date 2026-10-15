@@ -290,26 +290,49 @@ pub fn published_payloads_evictable(
     connection: &Connection,
     volume_id: RepositoryId,
 ) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
+    published_payloads_by_state(connection, volume_id, "alive")
+}
+
+/// Published dead rows may still have a local file after a failed unlink.
+pub fn published_payloads_pending_cleanup(
+    connection: &Connection,
+    volume_id: RepositoryId,
+) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
+    published_payloads_by_state(connection, volume_id, "dead")
+}
+
+fn published_payloads_by_state(
+    connection: &Connection,
+    volume_id: RepositoryId,
+    state: &str,
+) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
     let mut statement = connection
         .prepare_cached(
             "SELECT r.payload_id, r.plaintext_length, r.published_ns
              FROM payload_remote_objects r
              JOIN physical_extents x ON x.extent_id = r.payload_id
-             WHERE r.volume_id = ?1 AND x.state = 'alive' AND x.pin_count = 0
-               AND EXISTS (SELECT 1 FROM byte_extents e
+             WHERE r.volume_id = ?1 AND x.state = ?2 AND x.pin_count = 0 AND x.file_id = ?3
+               AND (?2 = 'dead' OR EXISTS (SELECT 1 FROM byte_extents e
                             WHERE e.volume_id = r.volume_id
-                              AND e.payload_id = r.payload_id)
+                              AND e.payload_id = r.payload_id))
              ORDER BY r.published_ns",
         )
         .map_err(|e| sqlite(e, "evictable payload scan prepare failed"))?;
     let rows = statement
-        .query_map([volume_id.as_bytes().as_slice()], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
+        .query_map(
+            params![
+                volume_id.as_bytes().as_slice(),
+                state,
+                MANAGED_JOURNAL_FILE_ID.as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
         .map_err(|e| sqlite(e, "evictable payload scan failed"))?;
     let mut out = Vec::new();
     for row in rows {
@@ -326,10 +349,13 @@ pub fn published_payloads_evictable(
 pub struct PayloadPublicationStats {
     pub pending_payloads: u64,
     pub pending_bytes: u64,
+    /// Referenced remote publications, including locally evicted payloads.
     pub published_payloads: u64,
-    /// Plaintext bytes whose local copy is published and still resident.
+    /// Published plaintext bytes, including remote-only payloads. This is
+    /// remote coverage, not physical residency or evictable disk space.
     pub published_bytes: u64,
-    /// Published payloads whose local copy was evicted.
+    /// Published payloads marked remote-only in the ledger. A failed physical
+    /// unlink can still occupy disk and remain charged until cleanup retries.
     pub evicted_payloads: u64,
     /// Journal-file id used to join the physical extent ledger.
     /// Filled by the caller; `journal_file_id` identifies payload extents.
@@ -461,6 +487,14 @@ impl Database {
     ) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
         self.reads()
             .with_connection(|connection| published_payloads_evictable(connection, volume_id))
+    }
+
+    pub fn published_payloads_pending_cleanup(
+        &self,
+        volume_id: RepositoryId,
+    ) -> Result<Vec<([u8; 16], i64, i64)>, MirageError> {
+        self.reads()
+            .with_connection(|connection| published_payloads_pending_cleanup(connection, volume_id))
     }
 
     /// Inodes referencing a payload in their current extent sets.

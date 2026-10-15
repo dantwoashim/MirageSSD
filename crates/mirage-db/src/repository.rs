@@ -406,14 +406,15 @@ pub fn unregister_repository(
     let transaction = connection
         .transaction()
         .map_err(|error| sqlite(error, "failed to begin unregister transaction"))?;
+    let payloads = crate::extent::journal_payload_ids(&transaction, repository_id)?;
     for statement in [
         "DELETE FROM operation_payloads WHERE operation_id IN (
              SELECT operation_id FROM local_operations WHERE volume_id = ?1)",
         "DELETE FROM local_operations WHERE volume_id = ?1",
         "DELETE FROM dirents WHERE volume_id = ?1",
-        "DELETE FROM inodes WHERE volume_id = ?1",
         "DELETE FROM legacy_inode_map WHERE volume_id = ?1",
         "DELETE FROM namespace_pins WHERE volume_id = ?1",
+        "DELETE FROM inodes WHERE volume_id = ?1",
         "DELETE FROM namespace_deltas WHERE volume_id = ?1",
         "DELETE FROM namespace_checkpoints WHERE volume_id = ?1",
         "DELETE FROM namespace_volumes WHERE volume_id = ?1",
@@ -422,7 +423,19 @@ pub fn unregister_repository(
         "DELETE FROM byte_extent_heads WHERE volume_id = ?1",
         "DELETE FROM publication_sessions WHERE volume_id = ?1",
         "DELETE FROM payload_remote_objects WHERE volume_id = ?1",
+        "DELETE FROM flush_groups WHERE volume_id = ?1",
+        "DELETE FROM journal_sequences WHERE volume_id = ?1",
+        "DELETE FROM remote_heads WHERE volume_id = ?1",
+        "DELETE FROM remote_changes WHERE volume_id = ?1",
+        "DELETE FROM remote_change_entries WHERE volume_id = ?1",
+        "DELETE FROM divergence_state WHERE volume_id = ?1",
+        "DELETE FROM workspace_leases WHERE volume_id = ?1",
+        "DELETE FROM gc_bounds WHERE volume_id = ?1",
+        "DELETE FROM gc_runs WHERE volume_id = ?1",
+        "DELETE FROM unreachable_candidates WHERE volume_id = ?1",
         "DELETE FROM space_leases WHERE repository_id = ?1",
+        "DELETE FROM sessions WHERE repository_id = ?1",
+        "DELETE FROM update_journals WHERE repository_id = ?1",
         "DELETE FROM generations WHERE repository_id = ?1",
         "DELETE FROM repositories WHERE repository_id = ?1",
     ] {
@@ -430,6 +443,23 @@ pub fn unregister_repository(
             .prepare_cached(statement)
             .and_then(|mut stmt| stmt.execute([repository_id.as_bytes().as_slice()]))
             .map_err(|error| sqlite(error, "failed to delete repository rows"))?;
+    }
+    for payload in payloads {
+        transaction
+            .execute(
+                "DELETE FROM physical_reservations WHERE extent_id=?1",
+                [payload.as_slice()],
+            )
+            .map_err(|error| sqlite(error, "unregister payload reservation cleanup failed"))?;
+        transaction
+            .execute(
+                "DELETE FROM physical_extents WHERE extent_id=?1 AND file_id=?2",
+                params![
+                    payload.as_slice(),
+                    crate::payload_remote::MANAGED_JOURNAL_FILE_ID.as_slice()
+                ],
+            )
+            .map_err(|error| sqlite(error, "unregister journal allocation cleanup failed"))?;
     }
     transaction
         .commit()

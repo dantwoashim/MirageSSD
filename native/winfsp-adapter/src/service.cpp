@@ -70,6 +70,14 @@ NTSTATUS security_by_name(FSP_FILE_SYSTEM* fs, PWSTR name, PUINT32 attributes, P
     if (size) { const auto required = static_cast<SIZE_T>(host(fs)->security_size()); if (required > *size) { *size = required; return STATUS_BUFFER_OVERFLOW; } *size = required; if (output) std::memcpy(output, host(fs)->security(), required); }
     return STATUS_SUCCESS;
 }
+NTSTATUS validate_delete(MirageFileHandle* file,bool directory){
+    if(!directory)return STATUS_SUCCESS;
+    bool nonempty=false;
+    const auto count=[](void* value,const uint16_t*,size_t,MirageFileInfo)->uint8_t{*static_cast<bool*>(value)=true;return 0;};
+    const auto status=tr::mirage_enumerate(file,nullptr,0,1,&nonempty,count);
+    if(status!=MIRAGE_OK)return mirage_status_to_ntstatus(status);
+    return nonempty?STATUS_DIRECTORY_NOT_EMPTY:STATUS_SUCCESS;
+}
 // WinFsp encodes the create disposition in the upper byte of CreateOptions.
 NTSTATUS create(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, UINT32, PSECURITY_DESCRIPTOR, UINT64, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
     tr::Scope trace_scope(tr::cb_Create);
@@ -86,6 +94,7 @@ NTSTATUS create(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, 
         if(status!=MIRAGE_OK&&!(disposition!=FILE_CREATE&&status==MIRAGE_CONFLICT))return mirage_status_to_ntstatus(status);
     }
     MirageFileHandle* file{}; MirageFileInfo stat{}; const auto status=lookup(fs,name,&file,&stat); if(!NT_SUCCESS(status)) return status;
+    if(create_options&FILE_DELETE_ON_CLOSE){const auto allowed=host(fs)->writable()?validate_delete(file,stat.directory!=0):STATUS_MEDIA_WRITE_PROTECTED;if(!NT_SUCCESS(allowed)){tr::mirage_file_close(file);return allowed;}}
     auto* opened=new (std::nothrow) FileContext{}; if(!opened){tr::mirage_file_close(file);return STATUS_INSUFFICIENT_RESOURCES;} opened->rust_handle=file; opened->info=stat; opened->opener_pid=FspFileSystemOperationProcessId();
     *context=opened; fill_info(stat,info,host(fs)->writable()); return STATUS_SUCCESS;
 }
@@ -101,7 +110,7 @@ NTSTATUS set_delete(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR, BOOLEAN delete_fi
     tr::Scope trace_scope(tr::cb_SetDelete);
     auto* opened=static_cast<FileContext*>(context); if(!opened) return STATUS_INVALID_HANDLE;
     if(delete_file&&!host(fs)->writable()) return STATUS_MEDIA_WRITE_PROTECTED;
-    opened->delete_pending=delete_file!=FALSE;
+    if(delete_file)return validate_delete(opened->rust_handle,opened->info.directory!=0);
     return STATUS_SUCCESS;
 }
 void cleanup(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, ULONG flags) {
@@ -115,9 +124,10 @@ void cleanup(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR name, ULONG flags) {
         tr::mirage_namespace_delete(host(fs)->engine(),reinterpret_cast<const uint16_t*>(name),std::wcslen(name));
     }
 }
-NTSTATUS open_file(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32, UINT32, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
+NTSTATUS open_file(FSP_FILE_SYSTEM* fs, PWSTR name, UINT32 create_options, UINT32, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
     tr::Scope trace_scope(tr::cb_Open);
     MirageFileHandle* file{}; MirageFileInfo stat{}; const auto status = lookup(fs, name, &file, &stat); if (!NT_SUCCESS(status)) return status;
+    if(create_options&FILE_DELETE_ON_CLOSE){const auto allowed=host(fs)->writable()?validate_delete(file,stat.directory!=0):STATUS_MEDIA_WRITE_PROTECTED;if(!NT_SUCCESS(allowed)){tr::mirage_file_close(file);return allowed;}}
     auto* opened = new (std::nothrow) FileContext{}; if (!opened) { tr::mirage_file_close(file); return STATUS_INSUFFICIENT_RESOURCES; } opened->rust_handle=file; opened->info=stat; opened->opener_pid=FspFileSystemOperationProcessId();
     *context = opened; fill_info(stat, info, host(fs)->writable()); return STATUS_SUCCESS;
 }

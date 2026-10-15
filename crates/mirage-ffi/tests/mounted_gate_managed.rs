@@ -356,6 +356,21 @@ fn managed_mount_writes_survive_restart_impl(volume_flush: bool) {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     assert!(d2_names.iter().any(|name| name == "f.txt"));
+    let nonempty_error = std::fs::remove_dir(mount.join("d1").join("d2"))
+        .expect_err("nonempty directory deletion must fail before cleanup");
+    assert_eq!(nonempty_error.raw_os_error(), Some(145));
+    assert_eq!(std::fs::read(&nested_file).unwrap(), nested_payload);
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let error = std::fs::OpenOptions::new()
+            .access_mode(0x10000)
+            .share_mode(7)
+            .custom_flags(0x06000000)
+            .open(mount.join("d1").join("d2"))
+            .expect_err("delete-on-close must reject a nonempty directory at open");
+        assert_eq!(error.raw_os_error(), Some(145));
+        assert_eq!(std::fs::read(&nested_file).unwrap(), nested_payload);
+    }
     let renamed_nested = mount.join("d1").join("g.txt");
     std::fs::rename(&nested_file, &renamed_nested).expect("nested rename");
     assert!(!nested_file.exists());
@@ -408,12 +423,23 @@ fn managed_mount_writes_survive_restart_impl(volume_flush: bool) {
     std::fs::create_dir_all(mount.join("twice").join("nested"))
         .expect("create_dir_all over existing");
 
+    let sparse = std::fs::File::create(mount.join("sparse.bin")).unwrap();
+    sparse
+        .set_len(1024 * 1024)
+        .expect("logical sparse EOF exceeds local budget");
+    sparse.sync_all().unwrap();
+    assert_eq!(sparse.metadata().unwrap().len(), 1024 * 1024);
+    drop(sparse);
     // The dirty-payload budget is 64 KiB: a write beyond it must surface the
     // OS disk-full error, not corrupt or wedge.
     let oversized = vec![0u8; 128 * 1024];
     let admission_started = Instant::now();
-    let error = std::fs::write(mount.join("too-big.bin"), &oversized)
+    let mut too_big = std::fs::File::create(mount.join("too-big.bin")).unwrap();
+    let error = too_big
+        .write_all(&oversized)
+        .and_then(|_| too_big.sync_all())
         .expect_err("over-budget write must fail");
+    drop(too_big);
     assert!(
         admission_started.elapsed() < Duration::from_secs(10),
         "offline full journal must fail promptly"
