@@ -128,7 +128,7 @@ $contracts = @($contractFiles | ForEach-Object {
   wix = (& wix --version).Trim()
   cmake = (& $cmake.Source --version | Select-Object -First 1).Trim()
   winfsp = '2.1.25156'
-  windows_minimum_build = 22000
+  windows_minimum_build = 19045
   signing_status = 'unsigned-development-artifact'
   persistent_contracts = $contracts
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Output 'RELEASE_METADATA.json') -Encoding utf8NoBOM

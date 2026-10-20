@@ -36,7 +36,7 @@ target_compile_definitions(mirage-fs PRIVATE MIRAGE_HOST_VERSION="${MIRAGE_HOST_
 target_include_directories(mirage-fs PRIVATE include ../../crates/mirage-ffi/include)
 target_include_directories(mirage-fs SYSTEM PRIVATE "${WINFSP_SDK_ROOT}/inc")
 target_link_libraries(mirage-fs PRIVATE "${WINFSP_SDK_ROOT}/lib/winfsp-x64.lib" "${MIRAGE_RUST_LIB}" advapi32 bcrypt ntdll userenv ws2_32)
-target_compile_definitions(mirage-fs PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_definitions(mirage-fs PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_compile_options(mirage-fs PRIVATE /W4 /WX /permissive- /EHsc /wd4324 /wd4815 /Zc:strictStrings-)
 target_compile_options(mirage-fs PRIVATE "$<$<CONFIG:Release>:/Zi>" "$<$<CONFIG:Release>:/Brepro>")
 target_link_options(mirage-fs PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>" "$<$<CONFIG:Release>:/Brepro>" "$<$<CONFIG:Release>:/INCREMENTAL:NO>" "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>" "$<$<CONFIG:Release>:/PDBALTPATH:%_PDB%>")

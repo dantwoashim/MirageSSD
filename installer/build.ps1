@@ -175,3 +175,4 @@ Set-CompoundFileRootModifiedTime -Path $msi -Timestamp $timestamp
 & $wix.Source msi validate $msi
 if ($LASTEXITCODE -ne 0) { throw "MSI validation failed with exit code $LASTEXITCODE" }
 & (Join-Path $repo 'scripts\test-msi-upgrade-contract.ps1') -MsiPath $msi
+& (Join-Path $repo 'scripts\test-windows-platform-contract.ps1') -MsiPath $msi

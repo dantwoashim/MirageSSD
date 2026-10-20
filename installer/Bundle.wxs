@@ -3,6 +3,8 @@
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Bundle Name="MirageSSD" Manufacturer="MirageSSD" Version="$(var.ProductVersion)"
           UpgradeCode="4E4C24F7-4A21-4A2B-8B8B-1E3E6E39A7C0">
+    <bal:Condition Condition="WixBundleInstalled OR (VersionNT64 AND WindowsBuildNumber &gt;= 19045)"
+                   Message="MirageSSD requires Windows 10 22H2 x64 (build 19045) or newer, including Windows 11." />
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication LicenseUrl="https://github.com/dantwoashim/MirageSSD/blob/main/LICENSE" LicenseFile="LICENSE.txt" Theme="hyperlinkLicense" SuppressOptionsUI="yes" SuppressRepair="yes"
                                               bal:LaunchTarget="[ProgramFiles64Folder]MirageSSD\mirage-ui.exe" />

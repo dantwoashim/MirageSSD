@@ -449,7 +449,7 @@ internal sealed class SetupWindow : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         Controls.Add(new Label { Text = "MirageSSD", Font = new Font("Segoe UI", 27, FontStyle.Bold), ForeColor = Color.FromArgb(30, 62, 113), Location = new Point(30, 24), AutoSize = true });
         Controls.Add(new Label { Text = "Your Google Drive. In This PC.", Font = new Font("Segoe UI", 14), Location = new Point(33, 85), AutoSize = true });
-        Controls.Add(new Label { Text = "Install once, sign in through Google, and your drive appears.\r\nA bounded local cache keeps repeat access fast.\r\nWindows 11 x64. At least 12 GiB free on a local NTFS disk.", Location = new Point(34, 128), Size = new Size(535, 75) });
+        Controls.Add(new Label { Text = "Install once, sign in through Google, and your drive appears.\r\nA bounded local cache keeps repeat access fast.\r\nWindows 10 22H2 x64 (build 19045) or Windows 11 x64. At least 12 GiB free on a local NTFS disk.", Location = new Point(34, 128), Size = new Size(535, 75) });
         status = new Label { Location = new Point(34, 215), Size = new Size(532, 60), ForeColor = Color.FromArgb(70, 80, 95) };
         Controls.Add(status);
         progress = new ProgressBar { Location = new Point(34, 280), Size = new Size(532, 5), Style = ProgressBarStyle.Marquee, Visible = false };

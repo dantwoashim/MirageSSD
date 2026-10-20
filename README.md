@@ -4,13 +4,18 @@
 
 MirageSSD gives your Google Drive a drive letter in File Explorer on Windows. Files you use live on this PC for speed; uploads to Drive run in the background, encrypted on your PC and verified before anything is evicted.
 
-**Engineering preview · Windows 11 x64 (macOS 12+ preview available)**
+**Engineering preview · Windows 10 22H2 x64 (build 19045) or Windows 11 x64 (macOS 12+ preview available)**
 
 [Download](#download) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Get started](#get-started) · [Known limitations](#known-limitations) · [Build from source](#build-from-source) · [Quick start guide](docs/quickstart.md)
 
 ## Download
 
 **Windows:** grab `MirageSSD-Setup-*.exe` from the [latest release](https://github.com/dantwoashim/MirageSSD/releases/latest). It's a WiX bundle that installs WinFsp 2.1.25156 only if it is missing (shared, permanent) and the MirageSSD MSI per-machine — administrator approval is required. The preview is unsigned, so Windows may warn before running it.
+
+Windows 10 compatibility starts with **0.1.22**. Earlier installers require
+Windows 11. The 0.1.22 candidate is currently local and unpublished; see
+[compatibility and qualification](docs/windows-compatibility.md) before choosing
+an older download for Windows 10.
 
 **macOS (Apple Silicon):** the DMG is on the [same release page](https://github.com/dantwoashim/MirageSSD/releases/latest); see the [macOS guide](docs/macos.md). Requires [macFUSE](https://macfuse.github.io/).
 
@@ -49,7 +54,7 @@ Reads of data on this PC are served locally; other data is fetched from Drive, h
 
 ## Get started
 
-Requirements: **Windows 11 x64**, internet, a local **NTFS or ReFS disk** with room for the cache, and **administrator approval** to install.
+Requirements: **Windows 10 22H2 x64 (build 19045) or Windows 11 x64**, internet, a local **NTFS or ReFS disk** with room for the cache, and **administrator approval** to install.
 
 1. Download `MirageSSD-Setup-*.exe` from [Releases](https://github.com/dantwoashim/MirageSSD/releases/latest).
 2. Run it and approve the administrator prompt — it installs WinFsp if missing, then the MirageSSD MSI per-machine.

@@ -108,8 +108,11 @@ function Test-BundleManifest {
 
 try {
   Test-BundleManifest
-  if (-not [Environment]::Is64BitOperatingSystem -or [Environment]::OSVersion.Version.Build -lt 22000) {
-    throw 'This MirageSSD build requires 64-bit Windows 11.'
+  # Registry detection is independent of the PowerShell host's compatibility
+  # manifest; Environment.OSVersion can report a compatibility version.
+  $windowsBuild = [int](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuildNumber)
+  if (-not [Environment]::Is64BitOperatingSystem -or $windowsBuild -lt 19045) {
+    throw 'This MirageSSD build requires Windows 10 22H2 x64 (build 19045) or newer, including Windows 11.'
   }
 
   $payload = Join-Path $PSScriptRoot 'payload'

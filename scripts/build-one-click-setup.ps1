@@ -136,7 +136,7 @@ MirageSSD then appears in This PC and reconnects automatically at Windows sign-i
 If M: is occupied, setup chooses another free drive letter. The supervisor retries
 within one minute if it stops. Setup detects your own Google Drive capacity.
 
-Requirements: Windows 11 x64, a local NTFS disk with at least 12 GiB free,
+Requirements: Windows 10 22H2 x64 (build 19045) or Windows 11 x64, a local NTFS disk with at least 12 GiB free,
 internet, and administrator approval for the signed WinFsp prerequisite.
 Google sign-in runs as your ordinary Windows user, not as administrator.
 

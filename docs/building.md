@@ -4,7 +4,7 @@ The shipping Windows product is the managed MirageSSD installer — a WiX bundle
 
 ## Prerequisites
 
-Windows 11 x64 with PowerShell and Git, plus:
+Windows 10 22H2 x64 (build 19045) or Windows 11 x64 with PowerShell and Git, plus:
 
 - Rust through rustup; `rust-toolchain.toml` selects 1.94.0.
 - Visual Studio 2022 Build Tools, **Desktop development with C++**, and the Windows SDK.
@@ -12,6 +12,13 @@ Windows 11 x64 with PowerShell and Git, plus:
 - Node.js 22.19 or newer.
 - WiX 4.0.6 in `.tools\wix` (`dotnet tool install wix --tool-path .tools/wix --version 4.0.6`).
 - [WinFsp 2.1.25156](https://github.com/winfsp/winfsp/releases/tag/v2.1) installed for mounted-volume tests. `installer\build-setup.ps1` downloads and checksum-verifies the WinFsp MSI it bundles.
+
+The installed application supports the same Windows baseline; recipients do not
+need Rust, Node, Visual Studio or PowerShell 7. The MSI and setup EXE accept
+Windows 10 22H2 x64 and Windows 11 x64. Older Windows 10 builds and 32-bit Windows
+are excluded. The UI uses installed Microsoft Edge in app mode, with a default
+browser fallback; it does not require WebView2. See [Windows compatibility and
+qualification](windows-compatibility.md) for the exact verification limits.
 
 ## 1. Build
 

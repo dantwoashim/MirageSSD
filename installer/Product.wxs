@@ -7,7 +7,7 @@
     <PropertyRef Id="WINDOWS_BUILD" />
     <PropertyRef Id="WINFSP_INSTALLED" />
     <PropertyRef Id="WINFSP_VERSION" />
-    <Launch Condition="WINDOWS_BUILD &gt;= 22000" Message="MirageSSD requires Windows 11 build 22000 or newer." />
+    <Launch Condition="Installed OR (VersionNT64 AND WINDOWS_BUILD &gt;= 19045)" Message="MirageSSD requires Windows 10 22H2 x64 (build 19045) or newer, including Windows 11." />
     <Launch Condition="WINFSP_INSTALLED AND WINFSP_VERSION = &quot;2.1.25156&quot;" Message="MirageSSD requires the signed WinFsp 2.1.25156 runtime." />
     <Feature Id="Main" Title="MirageSSD" Level="1">
       <ComponentGroupRef Id="MirageComponents" />
